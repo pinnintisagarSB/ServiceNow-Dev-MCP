@@ -1,0 +1,93 @@
+import { createRequire } from 'module';
+import { config } from '../config.js';
+import { logger } from './logger.js';
+
+const require = createRequire(import.meta.url);
+
+let _cachedToken  = null;
+let _cachedExpiry = 0;
+
+export async function getSnToken() {
+  const now = Math.floor(Date.now() / 1000);
+
+  if (_cachedToken && _cachedExpiry - now > 300) {
+    return { instanceUrl: config.servicenow.instanceUrl, token: _cachedToken, authType: 'bearer' };
+  }
+
+  // ── Basic auth (default — works for everyone) ──────────────────────────
+  if (!config.servicenow.useSdkAuth) {
+    if (!config.servicenow.username || !config.servicenow.password) {
+      throw new Error(
+        'ServiceNow auth not configured.\n' +
+        'Option A (recommended): Set SN_USERNAME and SN_PASSWORD in .env\n' +
+        'Option B (now-sdk OAuth): Set SN_USE_SDK_AUTH=true and run: npx @servicenow/sdk auth --add <instance>'
+      );
+    }
+    const token = Buffer.from(`${config.servicenow.username}:${config.servicenow.password}`).toString('base64');
+    return { instanceUrl: config.servicenow.instanceUrl, token, authType: 'basic' };
+  }
+
+  // ── OAuth via now-sdk Keychain (optional, for SDK users) ───────────────
+  let Entry, oAuthClient;
+  try {
+    ({ Entry } = require('@napi-rs/keyring'));
+  } catch {
+    throw new Error(
+      'SN_USE_SDK_AUTH=true but @napi-rs/keyring is not installed.\n' +
+      'Run: npm install @napi-rs/keyring\n' +
+      'Or switch to basic auth: set SN_USERNAME and SN_PASSWORD in .env and SN_USE_SDK_AUTH=false'
+    );
+  }
+
+  const raw = new Entry('ServiceNow', 'now-sdk').getPassword();
+  if (!raw) {
+    throw new Error(
+      'No now-sdk credentials found in keychain.\n' +
+      'Run: npx @servicenow/sdk auth --add <your-instance-url>\n' +
+      'Or switch to basic auth: set SN_USERNAME and SN_PASSWORD in .env and SN_USE_SDK_AUTH=false'
+    );
+  }
+
+  const store = JSON.parse(raw);
+  const cred  = Object.values(store).find(c => c.isDefault) ?? Object.values(store)[0];
+  if (!cred) throw new Error('No credentials found in now-sdk keychain store.');
+
+  const { creds } = cred;
+  const instanceUrl = config.servicenow.instanceUrl ?? creds.instanceUrl;
+
+  if (creds.type !== 'oauth') {
+    // Basic creds stored in SDK — convert to Basic auth header
+    const token = Buffer.from(`${creds.username}:${creds.password}`).toString('base64');
+    return { instanceUrl, token, authType: 'basic' };
+  }
+
+  // Refresh OAuth token if expiring within 15 min
+  if (creds.expires_at - now < 900) {
+    logger.info('OAuth token expiring soon, refreshing...');
+    try {
+      ({ oAuthClient } = require('@servicenow/sdk-cli/dist/auth/OAuth/CodeGrant'));
+      const client    = await oAuthClient(creds.instanceUrl);
+      const refreshed = await client.refresh(creds.refresh_token);
+      _cachedToken  = refreshed.access_token;
+      _cachedExpiry = refreshed.expires_at ?? (now + 3600);
+    } catch {
+      throw new Error(
+        'OAuth token refresh failed. Re-authenticate with:\n' +
+        '  npx @servicenow/sdk auth --add <instance>'
+      );
+    }
+  } else {
+    _cachedToken  = creds.access_token;
+    _cachedExpiry = creds.expires_at;
+  }
+
+  return { instanceUrl, token: _cachedToken, authType: 'bearer' };
+}
+
+export function buildSnHeaders(token, authType = 'bearer') {
+  return {
+    Authorization: authType === 'basic' ? `Basic ${token}` : `Bearer ${token}`,
+    'Content-Type': 'application/json',
+    Accept: 'application/json',
+  };
+}
