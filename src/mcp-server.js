@@ -473,6 +473,143 @@ server.tool(
   }
 );
 
+// ══════════════════════════════════════════════════════════════════════════
+// TOOL: get_report_data
+// ══════════════════════════════════════════════════════════════════════════
+server.tool(
+  'get_report_data',
+  `Collects all data needed to produce a customer-facing field mapping sign-off report.
+   Returns structured content (source schema, SN schema, approved mappings, staging definition,
+   artifact sys_ids, migration stats if available) ready for Claude to render as a Word document.
+   Call this after discover_schema and optionally after build_artifacts / run_full_migration.
+   Claude should then use the docx skill to produce a .docx file from the returned data.`,
+  {
+    platform:       z.enum(['salesforce', 'jira']),
+    object_name:    z.string(),
+    sn_table:       z.string(),
+    mappings:       z.array(z.object({
+      staging_field:    z.string(),
+      source_field:     z.string().optional(),
+      sn_target:        z.string().nullable(),
+      coalesce:         z.boolean().default(false),
+      is_reference:     z.boolean().default(false),
+      reference_value:  z.string().optional(),
+      transform_script: z.string().optional(),
+      excluded:         z.boolean().default(false),
+      notes:            z.string().optional(),
+    })).describe('Approved mappings from discover_schema or user-corrected'),
+    artifacts:      z.object({
+      stagingTable:  z.object({ name: z.string(), sys_id: z.string().nullable() }).optional(),
+      transformMap:  z.object({ name: z.string(), sys_id: z.string().nullable() }).optional(),
+      dataSource:    z.object({ name: z.string(), sys_id: z.string().nullable() }).optional(),
+      restMessage:   z.object({ name: z.string(), sys_id: z.string().nullable() }).optional(),
+    }).optional().describe('Artifact results from build_artifacts (include if already built)'),
+    migration_stats: z.object({
+      inserted: z.number(),
+      updated:  z.number(),
+      ignored:  z.number(),
+      errors:   z.number(),
+    }).optional().describe('Stats from run_full_migration (include if migration already ran)'),
+    customer_name:  z.string().optional().describe('Customer / project name for the report header'),
+    prepared_by:    z.string().optional().describe('Author name shown on the report'),
+  },
+  async ({ platform, object_name, sn_table, mappings, artifacts, migration_stats, customer_name, prepared_by }) => {
+    try {
+      const sn        = await getSn();
+      const discovery = new SchemaDiscovery(sn);
+      const source    = platform === 'salesforce' ? await getSf() : await getJira();
+
+      let sourceFields;
+      if (platform === 'salesforce') sourceFields = await discovery.discoverSalesforceSchema(source, object_name);
+      else                           sourceFields = await discovery.discoverJiraSchema(source, object_name);
+
+      const snFields   = await discovery.discoverSnSchema(sn_table);
+      const stagingDef = discovery.buildStagingDefinition(platform, object_name, sourceFields);
+
+      // Enrich mappings with source field labels and SN field labels
+      const snFieldIndex  = Object.fromEntries(snFields.map(f => [f.field, f]));
+      const srcFieldIndex = Object.fromEntries(sourceFields.map(f => [f.source_field, f]));
+
+      const enrichedMappings = mappings.map(m => ({
+        ...m,
+        source_label: srcFieldIndex[m.source_field]?.label ?? m.source_field ?? '—',
+        source_type:  srcFieldIndex[m.source_field]?.sf_type ?? srcFieldIndex[m.source_field]?.jira_type ?? '—',
+        sn_label:     m.sn_target ? (snFieldIndex[m.sn_target]?.label ?? m.sn_target) : '—',
+        sn_type:      m.sn_target ? (snFieldIndex[m.sn_target]?.type ?? '—') : '—',
+        mapping_type: m.excluded
+          ? 'Excluded'
+          : m.transform_script
+          ? 'Transform Script'
+          : m.is_reference
+          ? `Reference (by ${m.reference_value ?? 'display value'})`
+          : m.coalesce
+          ? 'Direct (Coalesce / Upsert Key)'
+          : 'Direct',
+      }));
+
+      const included = enrichedMappings.filter(m => !m.excluded);
+      const excluded = enrichedMappings.filter(m => m.excluded);
+
+      return ok({
+        instructions_for_claude: [
+          'Use the docx skill to create a Word document from this data.',
+          'The document is a customer sign-off report for field mapping review.',
+          'Structure: cover page → overview table → field mapping table → artifact details (if present) → migration results (if present) → sign-off section.',
+          'Save the file as "Migration_Field_Mapping_Report_<object_name>.docx" in the project folder.',
+          'After creating it, tell the user the file path and ask them to review it before sharing with the customer.',
+        ],
+        report: {
+          title:          `Data Migration Field Mapping Report`,
+          subtitle:       `${platform.charAt(0).toUpperCase() + platform.slice(1)} ${object_name} → ServiceNow ${sn_table}`,
+          customer_name:  customer_name ?? 'Customer',
+          prepared_by:    prepared_by ?? 'Migration Team',
+          prepared_date:  new Date().toLocaleDateString('en-US', { year: 'numeric', month: 'long', day: 'numeric' }),
+          sn_instance:    sn.baseUrl,
+
+          overview: {
+            source_platform:  platform.charAt(0).toUpperCase() + platform.slice(1),
+            source_object:    object_name,
+            source_fields_total: sourceFields.length,
+            sn_target_table:  sn_table,
+            sn_instance:      sn.baseUrl,
+            staging_table:    stagingDef.tableName,
+            mappings_included: included.length,
+            mappings_excluded: excluded.length,
+            mappings_with_transform: included.filter(m => m.transform_script).length,
+            mappings_reference: included.filter(m => m.is_reference).length,
+          },
+
+          field_mappings: {
+            included,
+            excluded,
+          },
+
+          transform_scripts: included
+            .filter(m => m.transform_script)
+            .map(m => ({
+              target_field: m.sn_target,
+              target_label: m.sn_label,
+              script:       m.transform_script,
+              notes:        m.notes ?? '',
+            })),
+
+          artifacts: artifacts ?? null,
+
+          migration_stats: migration_stats ?? null,
+
+          sign_off: {
+            instructions: 'Please review the field mappings above and sign below to approve the migration to proceed.',
+            rows: [
+              { role: 'Customer Representative', name: '', signature: '', date: '' },
+              { role: 'Migration Lead',          name: '', signature: '', date: '' },
+            ],
+          },
+        },
+      });
+    } catch (e) { return fail(e.message); }
+  }
+);
+
 // ── Start ──────────────────────────────────────────────────────────────────
 const transport = new StdioServerTransport();
 await server.connect(transport);
