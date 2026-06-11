@@ -11,10 +11,27 @@ export class SalesforceConnector {
   }
 
   async connect() {
-    const { loginUrl, clientId, clientSecret, username, password, securityToken, jwtKey, jwtSubject } = config.salesforce;
+    const { loginUrl: rawLoginUrl, clientId, clientSecret, username, password, securityToken, jwtKey, jwtSubject } = config.salesforce;
+    const loginUrl = this._resolveOAuthUrl(rawLoginUrl);
 
     if (jwtKey && jwtSubject) return this._connectJwt({ loginUrl, clientId, jwtKey, jwtSubject });
 
+    // Try client_credentials first (External Client Apps), fall back to password grant
+    const ccBody = new URLSearchParams({ grant_type: 'client_credentials', client_id: clientId, client_secret: clientSecret });
+    const ccRes  = await httpFetch(`${loginUrl}/services/oauth2/token`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: ccBody,
+    });
+    const ccJson = await ccRes.json();
+    if (ccRes.ok) {
+      this.accessToken = ccJson.access_token;
+      this.instanceUrl = ccJson.instance_url;
+      logger.success(`Salesforce connected (client_credentials) → ${this.instanceUrl}`);
+      return this;
+    }
+
+    // Fall back to password grant
     const body = new URLSearchParams({
       grant_type:    'password',
       client_id:     clientId,
@@ -22,7 +39,6 @@ export class SalesforceConnector {
       username,
       password:      `${password}${securityToken}`,
     });
-
     const res  = await httpFetch(`${loginUrl}/services/oauth2/token`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
@@ -33,11 +49,17 @@ export class SalesforceConnector {
 
     this.accessToken = json.access_token;
     this.instanceUrl = json.instance_url;
-    logger.success(`Salesforce connected → ${this.instanceUrl}`);
+    logger.success(`Salesforce connected (password grant) → ${this.instanceUrl}`);
     return this;
   }
 
-  async _connectJwt({ loginUrl, clientId, jwtKey, jwtSubject }) {
+  _resolveOAuthUrl(raw) {
+    // lightning.force.com URLs redirect OAuth POSTs — swap to the my.salesforce.com equivalent
+    return raw.replace(/\/+$/, '').replace('.lightning.force.com', '.my.salesforce.com');
+  }
+
+  async _connectJwt({ loginUrl: rawLoginUrl, clientId, jwtKey, jwtSubject }) {
+    const loginUrl = this._resolveOAuthUrl(rawLoginUrl);
     let jwt;
     try { jwt = await import('jsonwebtoken'); }
     catch { throw new Error('JWT auth needs the "jsonwebtoken" package — install it or use password flow.'); }
