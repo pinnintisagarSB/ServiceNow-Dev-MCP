@@ -372,7 +372,7 @@ export class ServiceNowConnector {
     const internal = name.toLowerCase().replace(/[^a-z0-9]/g, '_');
     // run_as=system is required for flows to execute reliably without a user session
     // accessible_from=package_private keeps the flow scoped to its application
-    const body = { name, description, run_as: 'system', active: 'false', internal_name: internal, accessible_from: 'package_private' };
+    const body = { name, description, type: 'flow', run_as: 'system', active: 'false', internal_name: internal, accessible_from: 'package_private' };
     if (appScopeId) body.sys_scope = appScopeId;
 
     const record = await this.post('sys_hub_flow', body);
@@ -389,7 +389,64 @@ export class ServiceNowConnector {
       return rows[0];
     }
 
+    // Bootstrap an empty Workflow Studio canvas snapshot so the flow opens correctly.
+    // Without latest_snapshot Workflow Studio shows a blank canvas even when action instances exist.
+    await this._bootstrapFlowSnapshot(record.sys_id, name, internal, description, 'flow').catch(e =>
+      logger.warn(`createFlow: snapshot bootstrap failed (flow still usable): ${e.message}`)
+    );
+
     return record;
+  }
+
+  // Creates the minimal sys_hub_snapshot + sys_hub_flow_snapshot records that Workflow Studio
+  // needs to render the flow canvas. Called once on flow/subflow creation.
+  async _bootstrapFlowSnapshot(flowSysId, name, internalName, description, type) {
+    const canvas = {
+      id:          flowSysId,
+      parentFlow:  flowSysId,
+      name,
+      internalName,
+      description:  description ?? '',
+      type,
+      status:       'draft',
+      active:       false,
+      runAs:        'system',
+      access:       'package_private',
+      isSnapshot:   true,
+      fIsMasterSnapshot: true,
+      inputs:  [], outputs: [], stages: [], flowVariables: [],
+      triggerInstances: [], actionInstances: [], flowLogicInstances: [],
+      subFlowInstances: [], connectionConfigurations: [],
+      updated: [], deleted: [],
+    };
+
+    const snapRecord = await this.post('sys_hub_snapshot', {
+      parent:  flowSysId,
+      payload: JSON.stringify(canvas),
+    });
+    const snapSysId = snapRecord?.sys_id;
+    if (!snapSysId) return;
+
+    const flowSnapRecord = await this.post('sys_hub_flow_snapshot', {
+      parent_flow:   flowSysId,
+      name,
+      internal_name: internalName,
+      type,
+      status:        'draft',
+      active:        'false',
+      master:        'true',
+      run_as:        'system',
+      description:   description ?? '',
+      flow_priority: 'MEDIUM',
+      version:       '1',
+    });
+    const flowSnapSysId = flowSnapRecord?.sys_id ?? snapSysId;
+
+    await this.patch('sys_hub_flow', flowSysId, {
+      latest_snapshot: flowSnapSysId,
+      master_snapshot: flowSnapSysId,
+    });
+    logger.info(`Flow snapshot bootstrapped: ${flowSnapSysId}`);
   }
 
   async createFlowVariable(flowSysId, varName, varType, isInput = false, isOutput = false) {
@@ -578,12 +635,16 @@ export class ServiceNowConnector {
 
     if (isV2) {
       // Flow Engine V2: write to sys_hub_action_instance_v2 with compressed values
+      const { randomUUID } = await import('crypto');
       const hasInputs = Object.keys(inputs).length > 0;
+      // V2 schema: label is stored in "comment" field (not "name" which doesn't exist on this table)
       const body = {
-        flow:        flowSysId,
-        action_type: actionTypeSysId,
-        order:       String(order),
-        name:        stepName,
+        flow:              flowSysId,
+        action_type:       actionTypeSysId,
+        compiled_snapshot: actionTypeSysId,
+        order:             String(order),
+        comment:           stepName,
+        ui_id:             randomUUID(),
         ...(hasInputs && { values: this._compressValuesV2(inputs) }),
       };
       return this.post('sys_hub_action_instance_v2', body);
@@ -631,6 +692,9 @@ export class ServiceNowConnector {
       if (!rows[0]?.sys_id) throw new Error(`Subflow "${name}" was created but sys_id could not be resolved`);
       return rows[0];
     }
+    await this._bootstrapFlowSnapshot(record.sys_id, name, internal, description, 'subflow').catch(e =>
+      logger.warn(`createSubflow: snapshot bootstrap failed: ${e.message}`)
+    );
     return record;
   }
 
@@ -711,6 +775,144 @@ export class ServiceNowConnector {
 
   async activateFlow(flowSysId) {
     return this.patch('sys_hub_flow', flowSysId, { active: 'true' });
+  }
+
+  // Publishes a flow by creating the sys_hub_flow_version payload that Workflow Studio renders.
+  // Must be called AFTER all action instances and the trigger have been created.
+  async publishFlowVersion(flowSysId, flowName, triggerSysId = null, triggerTable = null, triggerDefId = null) {
+    const { randomUUID } = await import('crypto');
+
+    // Fetch all V2 action instances for this flow, sorted by order
+    const isV2 = await this._isFlowEngineV2();
+    const instanceTable = isV2 ? 'sys_hub_action_instance_v2' : 'sys_hub_action_instance';
+    const instances = await this.get(instanceTable, {
+      sysparm_query:  `flow=${flowSysId}`,
+      sysparm_fields: 'sys_id,order,ui_id,parent_ui_id,action_type',
+      sysparm_limit:  '100',
+    });
+    const sorted = (instances ?? []).sort((a, b) => parseInt(a.order) - parseInt(b.order));
+
+    // Cache action type names
+    const atNames = {};
+    for (const inst of sorted) {
+      const atId = typeof inst.action_type === 'object' ? inst.action_type.value : inst.action_type;
+      if (atId && !atNames[atId]) {
+        const at = await this.getById('sys_hub_action_type_base', atId, { sysparm_fields: 'name,internal_name' }).catch(() => null);
+        atNames[atId] = { name: at?.name ?? 'Action', internal_name: at?.internal_name ?? 'action' };
+      }
+    }
+
+    // Build actionInstances array for the payload
+    const actionInstances = sorted.map((inst, i) => {
+      const atId     = typeof inst.action_type   === 'object' ? inst.action_type.value   : inst.action_type;
+      const uiId     = typeof inst.ui_id         === 'object' ? (inst.ui_id?.value   ?? randomUUID()) : (inst.ui_id   ?? randomUUID());
+      const parentUi = typeof inst.parent_ui_id  === 'object' ? (inst.parent_ui_id?.value ?? '') : (inst.parent_ui_id ?? '');
+      const atInfo   = atNames[atId] ?? { name: 'Action', internal_name: 'action' };
+      return {
+        actionName:         atInfo.name,
+        actionInternalName: atInfo.internal_name,
+        actionTypeSysId:    atId,
+        inputs:             [],
+        outputs:            [],
+        actionType: { fId: atId, fName: atInfo.name, fInternalName: atInfo.internal_name, fActive: true, fInputs: [], fOutputs: [], fSteps: [] },
+        parentActionTypeId: '',
+        compiledSnapshot:   atId,
+        aliasIds:           [],
+        id:                 inst.sys_id,
+        flowSysId,
+        order:              String(inst.order),
+        displayText:        '',
+        uiUniqueIdentifier: uiId,
+        deleted:            false,
+        metadata:           {},
+        isSnapshot:         false,
+        parent:             parentUi,
+        comment:            atInfo.name,
+        generationSource:   '',
+        uiComponentIndex:   i,
+      };
+    });
+
+    // Build triggerInstances array
+    const triggerInstances = triggerSysId ? [{
+      id:                  triggerSysId,
+      flowSysId,
+      remoteSysId:         '',
+      name:                'Record Updated',
+      inputs:              [],
+      outputs:             [],
+      displayText:         '',
+      deleted:             false,
+      fTriggerType:        'record',
+      metadata:            {},
+      comment:             '',
+      type:                'record',
+      fUserCanRead:        true,
+      fHasDynamicOutputs:  false,
+      triggerDefinitionId: triggerDefId ?? '',
+      table:               triggerTable ?? '',
+    }] : [];
+
+    // Build the full payload
+    const payload = {
+      id:            flowSysId,
+      masterSnapshotId: '',
+      name:          flowName,
+      updatedBy:     'system',
+      triggerInstances,
+      actionInstances,
+      flowLogicInstances: [],
+      subFlowInstances:   [],
+      deleted:      false,
+      description:  flowName,
+      scope:        'global',
+      scopeDisplayName: 'Global',
+      scopeName:    'global',
+      isSnapshot:   false,
+      status:       'published',
+      active:       true,
+      type:         'flow',
+      runAs:        'system',
+      internalName: flowName.toLowerCase().replace(/[^a-z0-9]/g, '_'),
+      engineVersion: isV2 ? 2 : 1,
+      version:      '1',
+      inputs:       [],
+      outputs:      [],
+      flowVariables:[],
+      flowPriority: '',
+      stages:       {},
+      natlang:      '',
+    };
+
+    // Create the flow version record
+    const ver = await this.post('sys_hub_flow_version', {
+      flow:    flowSysId,
+      type:    'update',
+      payload: JSON.stringify(payload),
+    });
+    const verId = ver?.sys_id;
+
+    // Create a published snapshot so the flow shows as "published" status
+    const snap = await this.post('sys_hub_flow_snapshot', {
+      parent_flow:   flowSysId,
+      name:          flowName,
+      internal_name: flowName.toLowerCase().replace(/[^a-z0-9]/g, '_'),
+      type:          'flow',
+      run_as:        'system',
+      status:        'published',
+      master:        'true',
+      version:       '1',
+      active:        'true',
+    }).catch(() => null);
+    const snapId = snap?.sys_id ?? null;
+
+    // Wire everything together on the flow record
+    const flowPatch = { status: 'published', version_record: verId };
+    if (snapId) { flowPatch.latest_snapshot = snapId; flowPatch.master_snapshot = snapId; }
+    await this.patch('sys_hub_flow', flowSysId, flowPatch);
+
+    logger.success(`Flow published: version=${verId} snapshot=${snapId ?? 'none'}`);
+    return { verId, snapId };
   }
 
   async activateCustomAction(actionTypeSysId) {
