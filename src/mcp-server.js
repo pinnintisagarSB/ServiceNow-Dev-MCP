@@ -25,6 +25,7 @@ import { BatchMigrationRunner } from './migration/batch.js';
 import { MigrationCleanup }     from './migration/cleanup.js';
 import { FlowRetriever }        from './flows/retriever.js';
 import { FlowBuilder }          from './flows/builder.js';
+import { FlowSdkCodegen }       from './flows/sdk-codegen.js';
 import { JiraAutomationRetriever } from './flows/jira-automation.js';
 import { logger }               from './utils/logger.js';
 
@@ -1397,6 +1398,107 @@ server.tool(
         ],
         action: result,
         action_designer_url: `${(await getSn()).baseUrl}/now/workflow-studio/action-designer`,
+      });
+    } catch (e) { return fail(e.message); }
+  }
+);
+
+// ══════════════════════════════════════════════════════════════════════════
+// TOOL: generate_flow_sdk_code  — generates official @servicenow/sdk TypeScript
+// ══════════════════════════════════════════════════════════════════════════
+server.tool(
+  'generate_flow_sdk_code',
+  `Generates official ServiceNow SDK TypeScript code for a flow, subflow, or custom action
+   using the @servicenow/sdk/automation Fluent Flow API (Flow(), Subflow(), Action() constructors).
+
+   This is the officially supported approach — the generated code can be deployed to ServiceNow
+   with: snc deploy  (requires ServiceNow CLI + @servicenow/sdk installed in the SN project)
+
+   When to prefer this over build_flow/build_subflow (direct Table API):
+   - When the user has the SN SDK CLI toolchain set up
+   - When they want version-controlled TypeScript code for the flow
+   - When they encountered Table API errors on their SN version
+
+   Output includes a ready-to-deploy .ts file and deployment instructions.`,
+  {
+    flow_structure: z.object({
+      apiName:     z.string().describe('Internal/API name for the flow (used as TypeScript export name)'),
+      label:       z.string().optional(),
+      description: z.string().optional(),
+      type:        z.string().default('record').describe('record | scheduled | on_demand | subflow | autolaunched'),
+      isSubflow:   z.boolean().default(false),
+      _sourcePlatform: z.string().optional().describe('jira | salesforce'),
+      trigger:     z.object({
+        when:       z.string().optional().describe('created | updated | createdOrUpdated'),
+        condition:  z.string().optional().describe('SN encoded query for trigger condition'),
+        runType:    z.string().optional().describe('daily | weekly | monthly | periodically | once'),
+      }).optional(),
+      variables: z.array(z.object({
+        name:      z.string(),
+        label:     z.string().optional(),
+        dataType:  z.string().optional(),
+        isInput:   z.boolean().default(false),
+        isOutput:  z.boolean().default(false),
+        mandatory: z.boolean().default(false),
+      })).default([]),
+      elements: z.array(z.object({
+        name:              z.string().optional(),
+        label:             z.string().optional(),
+        kind:              z.string().describe('recordCreate | recordUpdate | recordDelete | recordLookup | decision | loop | subflow | assignment | action'),
+        inputAssignments:  z.array(z.object({ field: z.string(), value: z.string() })).optional(),
+        filterConditions:  z.array(z.object({ field: z.string(), operator: z.string().optional(), value: z.string() })).optional(),
+        conditions:        z.array(z.object({ leftValueReference: z.string().optional(), operator: z.string().optional(), rightValue: z.object({ stringValue: z.string().optional() }).optional() })).optional(),
+        subflowName:       z.string().optional(),
+        config:            z.record(z.unknown()).optional(),
+        raw_type:          z.string().optional(),
+      })).default([]),
+    }).describe('Parsed flow structure from Jira or Salesforce'),
+    sn_table_name:  z.string().optional().describe('ServiceNow target table (e.g. incident, problem)'),
+    field_mappings: z.record(z.string()).default({}).describe('Source field name → SN field name map'),
+    artifact_type:  z.enum(['flow', 'subflow', 'action']).default('flow'),
+    // For custom action type:
+    action_inputs:  z.array(z.object({ name: z.string(), dataType: z.string().optional(), label: z.string().optional(), mandatory: z.boolean().default(false) })).optional(),
+    action_outputs: z.array(z.object({ name: z.string(), dataType: z.string().optional(), label: z.string().optional() })).optional(),
+    action_script:  z.string().optional(),
+  },
+  async ({ flow_structure, sn_table_name, field_mappings, artifact_type, action_inputs, action_outputs, action_script }) => {
+    try {
+      const gen = new FlowSdkCodegen();
+      let code;
+
+      if (artifact_type === 'action') {
+        code = gen.generateCustomAction(
+          flow_structure.label ?? flow_structure.apiName,
+          flow_structure.description,
+          action_inputs ?? [],
+          action_outputs ?? [],
+          action_script,
+        );
+      } else if (artifact_type === 'subflow' || flow_structure.isSubflow || (flow_structure.type ?? '').toLowerCase() === 'subflow') {
+        code = gen.generateSubflow(flow_structure, sn_table_name, field_mappings);
+      } else {
+        code = gen.generateFlow(flow_structure, sn_table_name, field_mappings);
+      }
+
+      const internalName = flow_structure.apiName.toLowerCase().replace(/[^a-z0-9]/g, '_').replace(/^_+|_+$/g, '');
+      const fileName = `${internalName}.ts`;
+
+      return ok({
+        file_name: fileName,
+        typescript_code: code,
+        deployment_instructions: [
+          '1. Install the SN SDK: npm install -g @servicenow/sdk',
+          '2. In your ServiceNow project: snc init  (if not already done)',
+          `3. Save the code as: src/flows/${fileName}`,
+          '4. Deploy to your SN instance: snc deploy --config=app.config.json',
+          '5. Open Workflow Studio to verify and activate the flow',
+        ],
+        notes: [
+          'TODOs in the code mark elements that need manual review (conditions, field references).',
+          'wfa.dataPill() references connect flow variable values between steps.',
+          'Subflows must be deployed before parent flows that call them.',
+          'Use action.core.* for built-in SN actions; import custom actions from their own files.',
+        ],
       });
     } catch (e) { return fail(e.message); }
   }
