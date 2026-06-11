@@ -45,9 +45,12 @@ export class JiraConnector {
   }
 
   async getSampleIssue(projectKey) {
-    const result = await this.search({ jql: `project=${projectKey}`, maxResults: 1 });
-    if (!result.issues.length) return null;
-    return this.get(`/rest/api/3/issue/${result.issues[0].key}`);
+    const result = await this.search({ jql: `project=${projectKey} ORDER BY created DESC`, maxResults: 1 });
+    if (!result.issues?.length) return null;
+    const issue = result.issues[0];
+    const id = issue.key ?? issue.id;
+    if (!id) return null;
+    return this.get(`/rest/api/3/issue/${id}`);
   }
 
   async getIssueTypes() { return this.get('/rest/api/3/issuetype'); }
@@ -57,7 +60,7 @@ export class JiraConnector {
   async search({ jql, startAt = 0, maxResults = this.pageSize, fields = [] }) {
     const params = { jql, startAt, maxResults };
     if (fields.length) params.fields = fields.join(',');
-    return this.get('/rest/api/3/search', params);
+    return this.get('/rest/api/3/search/jql', params);
   }
 
   async *fetchAllIssues(jql, fields = []) {

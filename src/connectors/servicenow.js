@@ -96,15 +96,16 @@ export class ServiceNowConnector {
     });
   }
 
-  async createFieldMap(transformMapSysId, sourceField, targetField, coalesce = false, referenceValue = null) {
+  async createFieldMap(transformMapSysId, sourceField, targetField, coalesce = false, referenceValue = null, script = null) {
     const body = {
       map: transformMapSysId,
       source_field: sourceField,
       target_field: targetField,
       coalesce: String(coalesce),
-      use_source_script: 'false',
+      use_source_script: script ? 'true' : 'false',
     };
-    if (referenceValue) body.reference_value = referenceValue;
+    if (script)          body.script = script;
+    if (referenceValue)  body.reference_value = referenceValue;
     return this.post('sys_transform_entry', body);
   }
 
@@ -162,6 +163,68 @@ export class ServiceNowConnector {
       api_name: name,
       script,
     });
+  }
+
+  // ── Existence checks (idempotency) ────────────────────────────────────────
+  async findStagingTable(name) {
+    const rows = await this.get('sys_db_object', {
+      sysparm_query:  `name=${name}`,
+      sysparm_fields: 'sys_id,name,label',
+      sysparm_limit:  '1',
+    });
+    return rows[0] ?? null;
+  }
+
+  async findStagingColumns(tableName) {
+    const rows = await this.get('sys_dictionary', {
+      sysparm_query:  `name=${tableName}^active=true`,
+      sysparm_fields: 'sys_id,element,column_label,internal_type',
+      sysparm_limit:  '300',
+    });
+    return rows;
+  }
+
+  async findTransformMap(name) {
+    const rows = await this.get('sys_transform_map', {
+      sysparm_query:  `name=${name}`,
+      sysparm_fields: 'sys_id,name,source_table,target_table',
+      sysparm_limit:  '1',
+    });
+    return rows[0] ?? null;
+  }
+
+  async findFieldMaps(transformMapSysId) {
+    return this.get('sys_transform_entry', {
+      sysparm_query:  `map=${transformMapSysId}`,
+      sysparm_fields: 'sys_id,source_field,target_field,coalesce,use_source_script',
+      sysparm_limit:  '300',
+    });
+  }
+
+  async findTransformScripts(transformMapSysId) {
+    return this.get('sys_transform_script', {
+      sysparm_query:  `map=${transformMapSysId}`,
+      sysparm_fields: 'sys_id,field_name,when,order',
+      sysparm_limit:  '100',
+    });
+  }
+
+  async findDataSource(name) {
+    const rows = await this.get('sys_data_source', {
+      sysparm_query:  `name=${name}`,
+      sysparm_fields: 'sys_id,name',
+      sysparm_limit:  '1',
+    });
+    return rows[0] ?? null;
+  }
+
+  async findRestMessage(name) {
+    const rows = await this.get('sys_rest_message', {
+      sysparm_query:  `name=${name}`,
+      sysparm_fields: 'sys_id,name',
+      sysparm_limit:  '1',
+    });
+    return rows[0] ?? null;
   }
 
   // ── Flow artifacts (Phase F5) ──────────────────────────────────────────────

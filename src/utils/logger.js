@@ -9,5 +9,6 @@ export const logger = {
   warn:    (msg) => current <= 2 && process.stderr.write(`[warn]  ${msg}\n`),
   error:   (msg) => current <= 3 && process.stderr.write(`[error] ${msg}\n`),
   step:    (msg) => process.stderr.write(`\n>> ${msg}\n`),
+  header:  (msg) => process.stderr.write(`\n${'═'.repeat(60)}\n  ${msg}\n${'═'.repeat(60)}\n`),
   divider: ()    => process.stderr.write(`${'─'.repeat(60)}\n`),
 };

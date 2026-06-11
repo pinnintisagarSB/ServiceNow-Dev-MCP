@@ -19,6 +19,10 @@ import { JiraConnector }        from './connectors/jira.js';
 import { SchemaDiscovery }      from './migration/schema.js';
 import { ArtifactBuilder }      from './migration/staging.js';
 import { MigrationRunner }      from './migration/runner.js';
+import { DependencyAnalyzer }   from './migration/dependency.js';
+import { MigrationValidator }   from './migration/validator.js';
+import { BatchMigrationRunner } from './migration/batch.js';
+import { MigrationCleanup }     from './migration/cleanup.js';
 import { FlowRetriever }        from './flows/retriever.js';
 import { FlowBuilder }          from './flows/builder.js';
 import { logger }               from './utils/logger.js';
@@ -38,6 +42,78 @@ const fail = (msg) => ({ content: [{ type: 'text', text: `ERROR: ${msg}` }], isE
 
 // ── Server ─────────────────────────────────────────────────────────────────
 const server = new McpServer({ name: 'sn-data-migration', version: '1.0.0' });
+
+// ══════════════════════════════════════════════════════════════════════════
+// TOOL: check_migration_state  (run before build_artifacts on any revisit)
+// ══════════════════════════════════════════════════════════════════════════
+server.tool(
+  'check_migration_state',
+  `Inspect ServiceNow to see what migration artifacts already exist for a given source→target combination.
+   Call this at the very start of any migration session (before build_artifacts) to avoid re-creating things.
+   Returns a gap analysis: what exists, what's missing, and what needs to be added.
+   Works for ANY source platform and ANY ServiceNow target table.`,
+  {
+    platform:      z.enum(['salesforce', 'jira']).describe('Source platform'),
+    object_name:   z.string().describe('Source object / project key (e.g. KAN, Account, Case)'),
+    sn_table:      z.string().describe('ServiceNow target table (e.g. incident, problem, change_request, cmdb_ci)'),
+    staging_table: z.string().optional().describe('Override staging table name — auto-derived if omitted'),
+  },
+  async ({ platform, object_name, sn_table, staging_table }) => {
+    try {
+      const sn        = await getSn();
+      const discovery = new SchemaDiscovery(sn);
+      const source    = platform === 'salesforce' ? await getSf() : await getJira();
+
+      let sourceFields;
+      if (platform === 'salesforce') sourceFields = await discovery.discoverSalesforceSchema(source, object_name);
+      else                           sourceFields = await discovery.discoverJiraSchema(source, object_name);
+
+      const stagingDef = discovery.buildStagingDefinition(platform, object_name, sourceFields);
+      if (staging_table) stagingDef.tableName = staging_table;
+
+      const builder  = new ArtifactBuilder(sn);
+      const existing = await builder.checkExisting({ stagingDef, targetTable: sn_table, platform, objectName: object_name });
+
+      const gaps = [];
+      if (!existing.stagingTable.exists)  gaps.push('staging_table');
+      if (!existing.transformMap.exists)  gaps.push('transform_map');
+      if (!existing.dataSource.exists)    gaps.push('data_source');
+      if (!existing.restMessage.exists)   gaps.push('rest_message');
+
+      const definedCols     = stagingDef.columns.length;
+      const existingColSet  = new Set(existing.existingColumns.map(c => c.element));
+      const missingCols     = stagingDef.columns.filter(c => !existingColSet.has(c.element) && !existingColSet.has(`u_${c.element}`));
+      if (missingCols.length) gaps.push(`${missingCols.length} missing staging columns`);
+      if (!existing.existingFieldMaps.length && existing.transformMap.exists) gaps.push('no field maps on existing transform map');
+
+      return ok({
+        instructions_for_claude: gaps.length === 0
+          ? [
+              'Tell the user: "Good news — all migration artifacts are already set up in ServiceNow. We can skip straight to running a test migration."',
+              'Proceed directly to run_test_migration (or run_full_migration if they are ready).',
+            ]
+          : [
+              `Tell the user what already exists and what still needs to be created.`,
+              `Show the gaps list. Explain that build_artifacts will fill only the missing pieces (it won't recreate what's already there).`,
+              'Ask: "Should I go ahead and set up the missing pieces now?"',
+            ],
+        staging_table:    existing.stagingTable,
+        transform_map:    existing.transformMap,
+        data_source:      existing.dataSource,
+        rest_message:     existing.restMessage,
+        columns: {
+          defined:  definedCols,
+          existing: existing.existingColumns.length,
+          missing:  missingCols.map(c => c.element),
+        },
+        field_maps:        existing.existingFieldMaps.length,
+        transform_scripts: existing.existingTxScripts.length,
+        gaps,
+        recommendation: gaps.length === 0 ? 'skip_to_test' : 'run_build_artifacts',
+      });
+    } catch (e) { return fail(e.message); }
+  }
+);
 
 // ══════════════════════════════════════════════════════════════════════════
 // TOOL: connect
@@ -83,8 +159,8 @@ server.tool(
    Only call build_artifacts after the user explicitly approves.`,
   {
     platform:    z.enum(['salesforce', 'jira']).describe('Source platform'),
-    object_name: z.string().describe('Salesforce object (e.g. Account, Contact, Case) or Jira project key (e.g. BUG, PROJ)'),
-    sn_table:    z.string().describe('ServiceNow target table name (e.g. core_company, incident, sys_user)'),
+    object_name: z.string().describe('Salesforce object (e.g. Account, Contact, Case) or Jira project key (e.g. KAN, EMAL)'),
+    sn_table:    z.string().describe('ServiceNow target table — any table the user wants (e.g. incident, problem, change_request, cmdb_ci, hr_case, sc_request, core_company)'),
   },
   async ({ platform, object_name, sn_table }) => {
     try {
@@ -196,28 +272,67 @@ server.tool(
 // ══════════════════════════════════════════════════════════════════════════
 server.tool(
   'run_test_migration',
-  `Phase 5: Push exactly 10 records from source to the SN staging table to validate the transform.
-   Only call after Checkpoint 3 (artifacts validated in ServiceNow).
-   After this, show results and ask the user to verify the 10 records in ServiceNow (Checkpoint 4).
-   Only call run_full_migration if the user explicitly approves.`,
+  `Trial run: sends a small sample of records (default 5) through the full migration pipeline
+   and produces a detailed data quality report.
+
+   The report checks three layers:
+     1. Source (Jira/Salesforce) — what values exist in the original data
+     2. Staging table — what landed in the ServiceNow staging table
+     3. Target table  — what ended up in the final ServiceNow record (e.g. Incident)
+
+   For each mapped field it shows the fill rate (% of records with a value) and flags
+   any field that is blank in staging (source → staging data loss) or blank in the
+   target (staging → target mapping failure).
+
+   Only call this after build_artifacts. Only call run_full_migration after the user
+   reviews this report and explicitly says "Approved".`,
   {
     platform:      z.enum(['salesforce', 'jira']),
-    object_name:   z.string(),
-    staging_table: z.string().describe('Staging table name returned by build_artifacts'),
+    object_name:   z.string().describe('Salesforce object name or Jira project key'),
+    staging_table: z.string(),
+    target_table:  z.string().describe('ServiceNow target table (e.g. incident, problem, change_request — whatever the user chose)'),
     mappings: z.array(z.object({
       staging_field: z.string(),
       source_field:  z.string().optional(),
+      sn_target:     z.string().nullable().optional(),
     })),
-    filter: z.string().optional().describe('Optional SOQL WHERE clause or JQL to target specific records'),
+    sample_size: z.number().default(5).describe('How many records to test (5–10 recommended)'),
+    filter: z.string().optional(),
   },
-  async ({ platform, object_name, staging_table, mappings, filter }) => {
+  async ({ platform, object_name, staging_table, target_table, mappings, sample_size, filter }) => {
     try {
-      const sn     = await getSn();
-      const runner = new MigrationRunner(sn);
-      const limit  = parseInt(process.env.MIGRATION_TEST_LIMIT ?? '10', 10);
-      let records;
+      const sn        = await getSn();
+      const runner    = new MigrationRunner(sn);
+      const validator = new MigrationValidator(sn);
+      const limit     = sample_size ?? parseInt(process.env.MIGRATION_TEST_LIMIT ?? '5', 10);
 
-      if (platform === 'salesforce') {
+      // Flatten function for Jira
+      const flattenJira = (issue) => {
+        const f = issue.fields ?? {};
+        const flat = {};
+        mappings.forEach(m => {
+          if (!m.source_field) return;
+          const val = f[m.source_field];
+          if (val === null || val === undefined) { flat[m.staging_field] = ''; return; }
+          if (m.source_field === 'description') { flat[m.staging_field] = JiraConnector.adfToText(val); return; }
+          if (m.source_field === 'project')     { flat[m.staging_field] = val.key ?? ''; return; }
+          if (typeof val === 'object' && val.emailAddress) flat[m.staging_field] = val.emailAddress;
+          else if (typeof val === 'object' && val.name)    flat[m.staging_field] = val.name;
+          else if (typeof val === 'object' && val.key)     flat[m.staging_field] = val.key;
+          else if (Array.isArray(val)) flat[m.staging_field] = val.map(v => v.name ?? v).join('|');
+          else flat[m.staging_field] = String(val);
+        });
+        return flat;
+      };
+
+      let records = [];
+      if (platform === 'jira') {
+        const jira   = await getJira();
+        const jql    = filter ? `project=${object_name} AND ${filter}` : `project=${object_name} ORDER BY created DESC`;
+        const result = await jira.search({ jql, maxResults: limit });
+        const full   = await Promise.all(result.issues.map(i => jira.get(`/rest/api/3/issue/${i.id}`)));
+        records = full.map(flattenJira);
+      } else {
         const sf     = await getSf();
         const fields = [...new Set(mappings.map(m => m.source_field).filter(Boolean))].join(',');
         const where  = filter ? ` WHERE ${filter}` : '';
@@ -227,28 +342,139 @@ server.tool(
           mappings.forEach(m => { if (m.source_field) flat[m.staging_field] = r[m.source_field] ?? null; });
           return flat;
         });
-      } else {
-        const jira   = await getJira();
-        const jql    = filter ? `project=${object_name} AND ${filter}` : `project=${object_name}`;
-        const result = await jira.search({ jql, maxResults: limit });
-        records = result.issues.map(JiraConnector.flattenIssue);
       }
 
+      // Push test records
       const testResults = await runner.runTestMigration(staging_table, records);
+
+      // Data quality validation
+      const validationReport = await validator.validate({
+        platform, source: null,
+        stagingTable: staging_table,
+        targetTable:  target_table,
+        mappings,
+        sampleSize:   limit,
+      });
 
       return ok({
         checkpoint: 4,
         instructions_for_claude: [
-          'Show the test results breakdown to the user.',
-          `Ask them to open ServiceNow and check the ${staging_table} staging table for the 10 records.`,
-          'If there are errors, diagnose and suggest fixes before asking them to approve.',
-          'Ask: "Do the 10 test records look correct in ServiceNow? Reply \'Approved — run full migration\' to proceed."',
-          'Only call run_full_migration after explicit approval.',
+          `Tell the user in plain English: "We just moved ${records.length} sample records from Jira into ServiceNow as a test."`,
+          `Show the data quality report — highlight any fields flagged as blank in staging or blank in the incident.`,
+          `If staging_issues or target_issues exist, explain what went wrong in simple terms (e.g. "The Priority field didn't get copied across — we need to fix the mapping before running the full migration").`,
+          `If overall_health is PASS, say: "The test looks good — all fields came through correctly. Ready to run the full migration?"`,
+          `Only call run_full_migration after the user replies with clear approval (e.g. "Yes, run it" or "Approved").`,
         ],
-        records_pushed: records.length,
-        results:        testResults.results,
-        counts:         testResults.counts,
+        test_summary: {
+          records_tested: records.length,
+          ...testResults.counts,
+        },
+        data_quality: {
+          overall_health:  validationReport.overall_health,
+          staging_issues:  validationReport.staging_issues.map(f => ({ field: f.staging_field, fill_rate: `${f.staging_pct}%` })),
+          target_issues:   validationReport.target_issues.map(f => ({ field: f.target_field,  fill_rate: `${f.target_pct}%`  })),
+          field_detail:    validationReport.fields.map(f => ({
+            from: f.staging_field,
+            to:   f.target_field,
+            staging_fill: `${f.staging_pct}%`,
+            target_fill:  f.target_pct !== null ? `${f.target_pct}%` : 'n/a',
+            status: f.staging_issue ? 'BLANK IN STAGING' : f.target_issue ? 'BLANK IN TARGET' : 'OK',
+          })),
+        },
         staging_table,
+        target_table,
+      });
+    } catch (e) { return fail(e.message); }
+  }
+);
+
+// ══════════════════════════════════════════════════════════════════════════
+// TOOL: analyze_dependencies  (Phase 3 — before build_artifacts)
+// ══════════════════════════════════════════════════════════════════════════
+server.tool(
+  'analyze_dependencies',
+  `Phase 3: Analyse migration dependencies before building artifacts.
+   For Jira: scans all referenced users, checks if they exist in ServiceNow,
+   identifies issue type hierarchy (Epic → Story → Task → Subtask), and proposes
+   a sequenced migration plan (Tier 1 = parents, Tier 2 = children, etc.).
+   Always call this after discover_schema and before build_artifacts.
+   If users are missing, ask the user whether to auto-create them in SN.`,
+  {
+    platform:     z.enum(['salesforce', 'jira']),
+    project_keys: z.array(z.string()).describe('Jira project keys to analyse (e.g. ["EMAL","KAN"])'),
+    auto_create_users: z.boolean().default(false).describe('Create missing SN users automatically'),
+  },
+  async ({ platform, project_keys, auto_create_users }) => {
+    try {
+      const sn       = await getSn();
+      const analyzer = new DependencyAnalyzer(sn);
+
+      let analysis;
+      if (platform === 'jira') {
+        const jira = await getJira();
+        analysis   = await analyzer.analyze(platform, jira, project_keys);
+      } else {
+        return fail('Dependency analysis for Salesforce not yet implemented');
+      }
+
+      let usersCreated = [];
+      if (auto_create_users && analysis.users.missing.length) {
+        usersCreated = await analyzer.createMissingUsers(analysis.users.missing);
+      }
+
+      return ok({
+        instructions_for_claude: [
+          'Show the dependency summary to the user.',
+          analysis.users.missing.length && !auto_create_users
+            ? 'Tell the user that missing users must exist in SN for assignee/reporter references to resolve. Ask: "Should I auto-create them now?"'
+            : 'All users are ready.',
+          'Present the migration sequence (Tier 1 → 2 → 3) so the user understands the order.',
+          'After user confirms, proceed to build_artifacts.',
+        ],
+        users: {
+          found:   analysis.users.found.map(u => u.email),
+          missing: analysis.users.missing,
+          created: usersCreated,
+        },
+        issue_hierarchy: analysis.issueHierarchy,
+        migration_sequence: analysis.migrationSequence.map(s => ({
+          tier:  s.tier,
+          types: s.types,
+          count: s.count,
+        })),
+        warnings: analysis.warnings,
+      });
+    } catch (e) { return fail(e.message); }
+  }
+);
+
+// ══════════════════════════════════════════════════════════════════════════
+// TOOL: analyze_transform_map  (utility — inspect existing transform map)
+// ══════════════════════════════════════════════════════════════════════════
+server.tool(
+  'analyze_transform_map',
+  `Inspect an existing ServiceNow transform map and report:
+   - Field maps (direct vs field map scripts)
+   - Standalone transform scripts (and whether they have field_name set)
+   - Issues: orphan scripts, missing field_name, scripts that should be field map scripts
+   - Suggestions to improve the transform map following best practices
+   Use this to audit a transform map after build_artifacts or to review a manually built one.`,
+  {
+    transform_map_sys_id: z.string().describe('sys_id of the sys_transform_map record'),
+  },
+  async ({ transform_map_sys_id }) => {
+    try {
+      const sn       = await getSn();
+      const analyzer = new DependencyAnalyzer(sn);
+      const analysis = await analyzer.analyzeTransformMap(transform_map_sys_id);
+
+      return ok({
+        instructions_for_claude: [
+          'Show the field map breakdown (direct vs scripted) and transform scripts.',
+          'Highlight any issues (orphan scripts, missing field_name).',
+          'Present suggestions clearly — offer to fix them if the user agrees.',
+        ],
+        ...analysis,
       });
     } catch (e) { return fail(e.message); }
   }
@@ -259,52 +485,258 @@ server.tool(
 // ══════════════════════════════════════════════════════════════════════════
 server.tool(
   'run_full_migration',
-  `Phase 6: Migrate ALL records from source to ServiceNow via paginated import.
+  `Phase 6: Migrate ALL records from source to ServiceNow.
+   For Jira: automatically migrates in dependency order (Tier 1 parents first, then children).
+   For Salesforce: paginated bulk migration.
    Only call after explicit user approval at Checkpoint 4.
-   Stops immediately on any error and reports what happened — never silently skips errors.`,
+   Stops immediately on any error and reports what happened.`,
   {
     platform:      z.enum(['salesforce', 'jira']),
-    object_name:   z.string(),
+    object_name:   z.string().describe('Salesforce object or comma-separated Jira project keys (e.g. "EMAL,KAN")'),
     staging_table: z.string(),
     mappings: z.array(z.object({
       staging_field: z.string(),
       source_field:  z.string().optional(),
     })),
-    filter: z.string().optional().describe('Optional SOQL WHERE clause or JQL to scope the migration'),
+    filter: z.string().optional().describe('Optional SOQL WHERE or JQL to scope the migration'),
   },
   async ({ platform, object_name, staging_table, mappings, filter }) => {
     try {
       const sn     = await getSn();
       const runner = new MigrationRunner(sn);
 
-      const flattenSf = (r) => {
+      if (platform === 'jira') {
+        const jira       = await getJira();
+        const analyzer   = new DependencyAnalyzer(sn);
+        const projectKeys = object_name.split(',').map(k => k.trim());
+
+        // Dependency analysis + auto-create missing users
+        const analysis = await analyzer.analyze('jira', jira, projectKeys);
+        if (analysis.users.missing.length) {
+          await analyzer.createMissingUsers(analysis.users.missing);
+        }
+
+        // Flatten function using staging field names
+        const flattenIssue = (issue) => {
+          const f = issue.fields ?? {};
+          const flat = {};
+          mappings.forEach(m => {
+            if (!m.source_field) return;
+            const val = f[m.source_field];
+            if (val === null || val === undefined) { flat[m.staging_field] = ''; return; }
+            if (m.source_field === 'description') { flat[m.staging_field] = JiraConnector.adfToText(val); return; }
+            if (m.source_field === 'project')     { flat[m.staging_field] = val.key ?? ''; return; }
+            if (typeof val === 'object' && val.emailAddress) flat[m.staging_field] = val.emailAddress;
+            else if (typeof val === 'object' && val.name)    flat[m.staging_field] = val.name;
+            else if (typeof val === 'object' && val.key)     flat[m.staging_field] = val.key;
+            else if (Array.isArray(val)) flat[m.staging_field] = val.map(v => v.name ?? v).join('|');
+            else flat[m.staging_field] = String(val);
+          });
+          return flat;
+        };
+
+        // Filter sequence if JQL filter provided
+        let sequence = analysis.migrationSequence;
+        if (filter) {
+          sequence = sequence.map(tier => ({
+            ...tier,
+            issues: tier.issues.filter(i => {
+              // basic project filter support
+              return projectKeys.includes(i.fields?.project?.key);
+            }),
+          })).filter(t => t.issues.length);
+        }
+
+        // Use batch runner: divides records into import sets, runs up to 5 in parallel
+        const batchRunner = new BatchMigrationRunner(sn);
+        const result = await batchRunner.run(staging_table, sequence, flattenIssue);
+        return ok({
+          ...result,
+          users_created: analysis.users.missing.length,
+          migration_sequence: sequence.map(s => ({ tier: s.tier, types: s.types, count: s.count })),
+          instructions_for_claude: result.stopped
+            ? [
+                result.reason === 'import_set_limit_reached'
+                  ? `Tell the user: "ServiceNow is currently busy running ${result.active} other import jobs. Please wait a few minutes and try again."`
+                  : 'Migration stopped due to an error. Show the details and ask whether to retry or stop.',
+              ]
+            : [
+                `Tell the user in plain English: "The migration is complete! ${result.stats.inserted} records were successfully moved into ServiceNow."`,
+                `Show the stats table (inserted / updated / ignored / errors) and how many import sets were used.`,
+                `If there were errors, show them and suggest next steps.`,
+              ],
+        });
+      }
+
+      // Salesforce — batched paginated migration
+      const sf          = await getSf();
+      const fields      = [...new Set(mappings.map(m => m.source_field).filter(Boolean))].join(',');
+      const where       = filter ? ` WHERE ${filter}` : '';
+      const flatSf      = (r) => {
         const flat = {};
         mappings.forEach(m => { if (m.source_field) flat[m.staging_field] = r[m.source_field] ?? null; });
         return flat;
       };
-
-      let result;
-      if (platform === 'salesforce') {
-        const sf     = await getSf();
-        const fields = [...new Set(mappings.map(m => m.source_field).filter(Boolean))].join(',');
-        const where  = filter ? ` WHERE ${filter}` : '';
-        const iter   = sf.fetchAllRecords(`SELECT ${fields} FROM ${object_name}${where}`);
-        result       = await runner.runFullMigration(staging_table, iter, flattenSf);
-      } else {
-        const jira = await getJira();
-        const jql  = filter ? `project=${object_name} AND ${filter}` : `project=${object_name}`;
-        const iter = jira.fetchAllIssues(jql);
-        result     = await runner.runFullMigration(staging_table, iter, JiraConnector.flattenIssue);
-      }
-
+      const sfRunner    = new MigrationRunner(sn);
+      const iter        = sf.fetchAllRecords(`SELECT ${fields} FROM ${object_name}${where}`);
+      const result      = await sfRunner.runFullMigration(staging_table, iter, flatSf);
       return ok({
         ...result,
         instructions_for_claude: result.stopped
-          ? [
-              'Migration stopped due to an error. Show the error details to the user.',
-              'Ask: "Resume from where we stopped", "Skip this record and continue", or "Stop here".',
-            ]
-          : ['Migration complete. Show the final stats to the user.'],
+          ? ['Migration stopped. Show error details and ask the user how to proceed.']
+          : ['Tell the user the migration is complete and show the final record counts.'],
+      });
+    } catch (e) { return fail(e.message); }
+  }
+);
+
+// ══════════════════════════════════════════════════════════════════════════
+// TOOL: cleanup_migration
+// ══════════════════════════════════════════════════════════════════════════
+server.tool(
+  'cleanup_migration',
+  `Remove records that were created during a migration — both from the staging table
+   and from the target table (e.g. incidents).
+
+   Use this if:
+     - The test migration created records you want to delete before the real run
+     - A migration went wrong and you want to start fresh
+     - The client asked you to roll back
+
+   IMPORTANT: Always ask the user for explicit permission before calling this tool.
+   Show them exactly how many records will be deleted and from which tables.
+   Only proceed after they confirm with "Yes, delete them" or similar.`,
+  {
+    staging_table:   z.string(),
+    target_table:    z.string().describe('ServiceNow target table to clean up (same table that was used in build_artifacts)'),
+    project_keys:    z.array(z.string()).optional().describe('Project / object keys to scope the cleanup (e.g. ["EMAL","KAN"])'),
+    project_field:   z.string().optional().describe('Staging table column that holds the project key (e.g. u_jira_project). Used to scope deletion. Leave blank to delete all staging records.'),
+    confirmed:       z.boolean().describe('Must be true — user has explicitly confirmed the deletion'),
+  },
+  async ({ staging_table, target_table, project_keys, project_field, confirmed }) => {
+    try {
+      if (!confirmed) {
+        return ok({
+          instructions_for_claude: [
+            'The user has NOT confirmed the deletion yet.',
+            `First discover what would be deleted by calling cleanup_migration with confirmed=false (already done — see below).`,
+            'Show the user exactly how many staging records and incidents will be permanently deleted.',
+            'Ask: "Are you sure you want to permanently delete these records? This cannot be undone. Please reply \'Yes, delete them\' to confirm."',
+            'Only call cleanup_migration with confirmed=true after they explicitly confirm.',
+          ],
+          status: 'awaiting_confirmation',
+        });
+      }
+
+      const sn      = await getSn();
+      const cleanup = new MigrationCleanup(sn);
+      const result  = await cleanup.cleanupAll({
+        stagingTable:  staging_table,
+        targetTable:   target_table,
+        projectKeys:   project_keys ?? [],
+        projectField:  project_field ?? null,
+      });
+
+      return ok({
+        ...result,
+        instructions_for_claude: [
+          `Tell the user in plain English: "${result.summary}."`,
+          'Confirm that both the staging records and the ServiceNow incidents have been removed.',
+          'Let them know they can run the migration again from scratch.',
+        ],
+      });
+    } catch (e) { return fail(e.message); }
+  }
+);
+
+// ══════════════════════════════════════════════════════════════════════════
+// TOOL: cleanup_artifacts
+// ══════════════════════════════════════════════════════════════════════════
+server.tool(
+  'cleanup_artifacts',
+  `Remove all migration artifacts that were created in ServiceNow during the setup phase.
+   This deletes (in safe order):
+     1. Field maps  (sys_transform_entry)
+     2. Transform scripts  (sys_transform_script)
+     3. Transform map  (sys_transform_map)
+     4. Staging table columns  (sys_dictionary)
+     5. Staging table  (sys_db_object)
+     6. Data source  (sys_data_source)
+     7. REST message  (sys_rest_message)
+
+   Use this when you want a completely clean slate — for example after a failed migration setup,
+   or when the customer wants to restart with different field mappings.
+
+   IMPORTANT: Always discover first (confirmed=false) to show the user exactly what will be deleted.
+   Only delete after they explicitly confirm with "Yes, delete them" or similar.`,
+  {
+    platform:      z.enum(['salesforce', 'jira']).describe('Source platform used during setup'),
+    object_name:   z.string().describe('Source object / project key used during setup (e.g. KAN, Account)'),
+    staging_table: z.string().describe('Staging table name (e.g. u_stg_jira_kan)'),
+    target_table:  z.string().describe('ServiceNow target table (e.g. incident, problem, change_request)'),
+    confirmed:     z.boolean().describe('Must be true — user has explicitly confirmed the deletion'),
+  },
+  async ({ platform, object_name, staging_table, target_table, confirmed }) => {
+    try {
+      const sn      = await getSn();
+      const cleanup = new MigrationCleanup(sn);
+
+      // Always discover first so we can show the user what will be deleted
+      const artifacts = await cleanup.discoverArtifacts({
+        stagingTable: staging_table,
+        targetTable:  target_table,
+        platform,
+        objectName:   object_name,
+      });
+
+      if (!confirmed) {
+        const willDelete = [
+          artifacts.stagingTable.exists  ? `Staging table: ${artifacts.stagingTable.name}`                  : null,
+          artifacts.transformMap.exists  ? `Transform map: ${artifacts.transformMap.name}`                  : null,
+          artifacts.fieldMaps.length     ? `${artifacts.fieldMaps.length} field map(s)`                     : null,
+          artifacts.transformScripts.length ? `${artifacts.transformScripts.length} transform script(s)`    : null,
+          artifacts.columns.length       ? `${artifacts.columns.length} staging column definition(s)`       : null,
+          artifacts.dataSource.exists    ? `Data source: ${artifacts.dataSource.name}`                      : null,
+          artifacts.restMessage.exists   ? `REST message: ${artifacts.restMessage.name}`                    : null,
+        ].filter(Boolean);
+
+        return ok({
+          instructions_for_claude: [
+            'Show the user the full list of artifacts that will be permanently deleted from ServiceNow.',
+            willDelete.length
+              ? `Say: "I found ${willDelete.length} migration artifact(s) in ServiceNow. Deleting these will remove the staging table, transform map, field maps, and all related configuration. This cannot be undone. Do you want to proceed?"`
+              : 'Tell the user: "No migration artifacts were found in ServiceNow for this configuration — nothing to delete."',
+            'Only call cleanup_artifacts with confirmed=true after explicit user approval.',
+          ],
+          status:       willDelete.length ? 'awaiting_confirmation' : 'nothing_to_delete',
+          will_delete:  willDelete,
+          artifacts_found: {
+            staging_table:     artifacts.stagingTable.exists,
+            transform_map:     artifacts.transformMap.exists,
+            field_maps:        artifacts.fieldMaps.length,
+            transform_scripts: artifacts.transformScripts.length,
+            columns:           artifacts.columns.length,
+            data_source:       artifacts.dataSource.exists,
+            rest_message:      artifacts.restMessage.exists,
+          },
+        });
+      }
+
+      const result = await cleanup.cleanupArtifacts({
+        stagingTable: staging_table,
+        targetTable:  target_table,
+        platform,
+        objectName:   object_name,
+      });
+
+      return ok({
+        ...result,
+        instructions_for_claude: [
+          `Tell the user in plain English: "${result.summary}"`,
+          result.failed.length
+            ? 'Some items could not be deleted — list them and suggest the user delete them manually in ServiceNow (System Definition → Tables / Transform Maps).'
+            : 'Let them know the ServiceNow environment is now clean and they can start the migration setup from scratch.',
+        ],
       });
     } catch (e) { return fail(e.message); }
   }
