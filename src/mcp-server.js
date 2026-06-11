@@ -358,14 +358,18 @@ server.tool(
       const stagingDef = discovery.buildStagingDefinition(platform, object_name, sourceFields);
       const mappings   = discovery.suggestMappings(sourceFields, snFields);
 
-      const unmapped   = mappings.filter(m => !m.sn_target).length;
-      const autoMapped = mappings.filter(m => m.auto_matched).length;
+      const unmapped    = mappings.filter(m => !m.sn_target).length;
+      const autoMapped  = mappings.filter(m => m.auto_matched).length;
+      const coalesceFields = mappings.filter(m => m.coalesce);
 
       return ok({
         checkpoint: 1,
         instructions_for_claude: [
           'Present the source_fields and sn_fields tables to the user side by side.',
-          'Show the suggested_mappings highlighting any unmapped fields.',
+          'Show the suggested_mappings — highlight unmapped fields and the coalesce (upsert key) fields.',
+          coalesceFields.length
+            ? `Tell the user: "I've set ${coalesceFields.map(f => `'${f.staging_field}'`).join(', ')} as the upsert key(s). This means if the migration runs more than once, existing records will be updated instead of duplicated."`
+            : 'Warn the user that no upsert key was found — ask them which field should be used to prevent duplicate records on re-run.',
           'Ask the user: (1) Are all needed source fields present? (2) Any fields to exclude? (3) Any mapping corrections?',
           'Wait for explicit "Approved" before calling build_artifacts.',
         ],
@@ -375,6 +379,12 @@ server.tool(
           auto_mapped_count:     autoMapped,
           unmapped_count:        unmapped,
           staging_table:         stagingDef.tableName,
+          coalesce_fields:       coalesceFields.map(f => ({
+            staging_field: f.staging_field,
+            source_field:  f.source_field,
+            sn_target:     f.sn_target,
+            reason:        f.coalesce_reason,
+          })),
         },
         source_fields:        sourceFields,
         sn_fields:            snFields,

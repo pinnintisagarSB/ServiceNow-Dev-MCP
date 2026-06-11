@@ -40,10 +40,10 @@ export class SchemaDiscovery {
     const fieldMap   = Object.fromEntries(fields.map(f => [f.id, f]));
 
     // Core + used custom fields
-    const coreIds = ['summary','description','status','priority','issuetype','assignee','reporter','created','updated','project'];
+    const coreIds = ['summary','description','status','priority','issuetype','assignee','reporter','created','updated','project','resolutiondate','duedate','labels','environment'];
     const allIds  = [...new Set([...coreIds, ...usedFields])];
 
-    return allIds
+    const discovered = allIds
       .filter(id => fieldMap[id])
       .map(id => {
         const f       = fieldMap[id];
@@ -59,6 +59,24 @@ export class SchemaDiscovery {
           ...JiraConnector.mapFieldType(jType),
         };
       });
+
+    // Always include the issue key as a synthetic field — it's the primary unique identifier
+    // (it lives on issue.key, not issue.fields, so it's never in fieldMap)
+    if (!discovered.find(f => f.source_field === 'key')) {
+      discovered.unshift({
+        source_field:  'key',
+        label:         'Issue Key',
+        jira_type:     'string',
+        required:      true,
+        is_reference:  false,
+        is_unique_id:  true,
+        sn_column:     'jira_key',
+        internal_type: 'string',
+        max_length:    40,
+      });
+    }
+
+    return discovered;
   }
 
   // ── Target Schema ──────────────────────────────────────────────────────────
@@ -98,27 +116,81 @@ export class SchemaDiscovery {
   // ── Auto-suggest mappings ──────────────────────────────────────────────────
   suggestMappings(sourceFields, snFields) {
     const snIndex = Object.fromEntries(snFields.map(f => [f.field, f]));
+
+    // SN fields that are good coalesce targets — unique/reference fields on the target table
+    const snCoalesceFields = new Set([
+      'correlation_id',     // used across SN tables for external system references
+      'number',             // incident/problem/change number — unique per record
+      'name',               // unique name fields
+      'u_jira_key',         // custom field for jira key
+      'u_sf_id',            // custom field for SF record id
+      'u_external_id',      // generic external ID
+      'employee_number',    // sys_user unique field
+      'email',              // sys_user unique field
+      'user_name',          // sys_user unique field
+      'asset_tag',          // cmdb unique field
+      'serial_number',      // cmdb unique field
+    ]);
+
     return sourceFields.map(sf => {
       // Try to auto-match by common naming conventions
       const candidates = [
         sf.source_field.toLowerCase(),
         sf.sn_column.replace(/^(sf|jira)_/, ''),
-      ];
+        // common field name aliases
+        sf.source_field === 'summary'     ? 'short_description' : null,
+        sf.source_field === 'description' ? 'description'       : null,
+        sf.source_field === 'assignee'    ? 'assigned_to'       : null,
+        sf.source_field === 'reporter'    ? 'caller_id'         : null,
+        sf.source_field === 'created'     ? 'opened_at'         : null,
+        sf.source_field === 'priority'    ? 'priority'          : null,
+        sf.source_field === 'status'      ? 'state'             : null,
+        sf.source_field === 'issuetype'   ? 'category'          : null,
+        sf.source_field === 'duedate'     ? 'due_date'          : null,
+        sf.source_field === 'Name'        ? 'name'              : null,
+        sf.source_field === 'Subject'     ? 'short_description' : null,
+        sf.source_field === 'Body'        ? 'description'       : null,
+        sf.source_field === 'OwnerId'     ? 'assigned_to'       : null,
+        sf.source_field === 'Status'      ? 'state'             : null,
+        sf.source_field === 'Priority'    ? 'priority'          : null,
+      ].filter(Boolean);
 
       let matched = null;
       for (const c of candidates) {
         if (snIndex[c]) { matched = snIndex[c]; break; }
       }
 
+      // Determine coalesce:
+      // true when this field is the natural unique identifier from the source
+      // AND either maps to a known unique SN field or is a custom external-ref field
+      const isSourceUniqueId =
+        sf.is_unique_id ||                            // explicitly flagged (e.g. jira key)
+        sf.source_field === 'Id' ||                   // Salesforce record ID
+        sf.source_field === 'key' ||                  // Jira issue key
+        sf.source_field === 'ExternalId' ||           // SF external ID
+        sf.sn_column === 'jira_key' ||                // jira key staging column
+        sf.sn_column === 'sf_id' ||                   // salesforce ID staging column
+        sf.sn_column?.endsWith('_id') && sf.required; // required ID-like column
+
+      const snTargetIsCoalesceable =
+        !matched ||                                   // unmapped — will go to custom field
+        snCoalesceFields.has(matched?.field) ||       // maps to known unique SN field
+        matched?.field?.startsWith('u_');             // maps to any custom field (u_ prefix)
+
+      const coalesce = isSourceUniqueId && snTargetIsCoalesceable;
+
       return {
-        staging_field:  sf.sn_column,
-        source_field:   sf.source_field,
-        sn_target:      matched?.field ?? null,
-        coalesce:       sf.source_field === 'Id' || sf.source_field === 'key',
-        is_reference:   sf.is_reference,
-        needs_script:   sf.sf_type === 'picklist' || sf.jira_type === 'status' || sf.jira_type === 'priority',
-        auto_matched:   !!matched,
-        source_type:    sf.sf_type ?? sf.jira_type,
+        staging_field:    sf.sn_column,
+        source_field:     sf.source_field,
+        sn_target:        matched?.field ?? null,
+        coalesce,
+        coalesce_reason:  coalesce
+          ? `"${sf.source_field}" is the unique identifier from the source — used as upsert key to prevent duplicates on re-run`
+          : null,
+        is_reference:     sf.is_reference,
+        needs_script:     sf.sf_type === 'picklist' || sf.jira_type === 'status' || sf.jira_type === 'priority',
+        auto_matched:     !!matched,
+        source_type:      sf.sf_type ?? sf.jira_type,
       };
     });
   }
