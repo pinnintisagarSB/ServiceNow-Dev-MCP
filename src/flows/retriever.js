@@ -56,15 +56,30 @@ export class FlowRetriever {
     };
   }
 
-  // Map SF flow type → SN trigger type
-  static mapTriggerType(sfProcessType) {
+  // Map SF flow type + trigger metadata → SN trigger type string
+  static mapTriggerType(sfProcessType, trigger = null) {
+    const sfTriggerType = trigger?.triggerType ?? '';
+    if (sfTriggerType === 'RecordAfterSave' || sfTriggerType === 'RecordBeforeSave') return 'record';
+    if (sfTriggerType === 'Scheduled')   return 'scheduled';
     const map = {
-      AutoLaunchedFlow: 'manual',
-      RecordTriggeredFlow: 'record',
-      ScheduledFlow: 'scheduled',
-      Flow: 'manual', // Screen Flow
+      AutoLaunchedFlow:   'record',
+      RecordTriggeredFlow:'record',
+      ScheduledFlow:      'scheduled',
+      Flow:               'manual',
     };
     return map[sfProcessType] ?? 'manual';
+  }
+
+  // Build a SN sysparm_query condition string from SF trigger filters
+  static buildTriggerCondition(trigger, fieldMappings = {}) {
+    if (!trigger?.filters?.length) return null;
+    return trigger.filters.map(f => {
+      const snField = fieldMappings?.[f.field] ?? f.field.toLowerCase();
+      const val     = f.value?.stringValue ?? f.value?.numberValue ?? '';
+      const opMap   = { EqualTo: '=', NotEqualTo: '!=', GreaterThan: '>', LessThan: '<' };
+      const op      = opMap[f.operator] ?? '=';
+      return `${snField}${op}${val}`;
+    }).join('^');
   }
 
   // Map SF element kind → human summary for plan

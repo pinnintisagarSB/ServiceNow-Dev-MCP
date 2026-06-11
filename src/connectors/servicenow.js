@@ -363,46 +363,151 @@ export class ServiceNowConnector {
     return rows[0] ?? null;
   }
 
-  // ── Flow artifacts (Phase F5) ──────────────────────────────────────────────
+  // ── Flow Designer REST API (Phase F5) ────────────────────────────────────
+  // SN Flow Designer tables (sys_hub_flow, sys_hub_action_instance, etc.) are
+  // only partially accessible via Table API. The supported path is:
+  //   POST /api/sn_fd/flow           → create flow
+  //   POST /api/sn_fd/flow/{id}/step → add a step
+  //   POST /api/sn_fd/flow/{id}/activate → activate
+  //
+  // For instances where sn_fd plugin is unavailable, we fall back to Table API
+  // with the correct field names and action type lookups.
+
+  async _fdRequest(method, path, body = null) {
+    const url = `${this.baseUrl}/api/sn_fd${path}`;
+    const res  = await httpFetch(url, {
+      method,
+      headers: this.headers(),
+      body: body ? JSON.stringify(body) : undefined,
+    });
+    const json = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(`Flow Designer API ${method} ${path} → ${res.status}: ${JSON.stringify(json.error ?? json)}`);
+    return json.result ?? json;
+  }
+
   async createFlow(name, description, appScopeId = null) {
-    const body = { name, description, active: false, run_as: 'system' };
-    if (appScopeId) body.sys_scope = appScopeId;
-    return this.post('sys_hub_flow', body);
+    // Try Flow Designer API first, fall back to Table API
+    try {
+      const body = { name, description, run_as: 'user', active: false };
+      if (appScopeId) body.scope = appScopeId;
+      return await this._fdRequest('POST', '/flow', body);
+    } catch (e) {
+      if (e.message.includes('404') || e.message.includes('not found') || e.message.includes('sn_fd')) {
+        // Fall back to direct table insert
+        const body = { name, description, run_as: 'user', active: 'false', internal_name: name.toLowerCase().replace(/[^a-z0-9]/g, '_') };
+        if (appScopeId) body.sys_scope = appScopeId;
+        return this.post('sys_hub_flow', body);
+      }
+      throw e;
+    }
   }
 
   async createFlowVariable(flowSysId, varName, varType, isInput = false, isOutput = false) {
-    return this.post('sys_hub_flow_var', {
-      flow: flowSysId,
-      name: varName,
-      type: varType,
-      input: String(isInput),
-      output: String(isOutput),
+    // Flow variables in Flow Designer are sys_hub_flow_input / sys_hub_flow_output
+    // or managed as part of the flow JSON. Try Table API.
+    const table = isInput ? 'sys_hub_flow_input' : isOutput ? 'sys_hub_flow_output' : 'sys_hub_flow_input';
+    try {
+      return await this.post(table, {
+        flow:      flowSysId,
+        name:      varName,
+        label:     varName,
+        type:      varType,
+        mandatory: 'false',
+      });
+    } catch (e) {
+      // Not all instances expose these tables — log and continue
+      logger.warn(`Flow variable creation skipped (${varName}): ${e.message}`);
+      return { skipped: true, name: varName };
+    }
+  }
+
+  async createFlowTrigger(flowSysId, triggerType, triggerTable = null, condition = null) {
+    // Map generic type strings to the exact SN trigger_type values
+    const typeMap = {
+      record:       'record',
+      scheduled:    'scheduled',
+      manual:       'on_demand',
+      inbound_api:  'on_demand',
+      on_demand:    'on_demand',
+      RecordTriggeredFlow: 'record',
+      ScheduledFlow:       'scheduled',
+      AutoLaunchedFlow:    'on_demand',
+    };
+    const snType = typeMap[triggerType] ?? 'on_demand';
+
+    // Try Flow Designer API trigger endpoint first
+    try {
+      const body = { trigger_type: snType };
+      if (triggerTable) body.table  = triggerTable;
+      if (condition)    body.filter = condition;
+      return await this._fdRequest('POST', `/flow/${flowSysId}/trigger`, body);
+    } catch (_) {
+      // Fall back to sys_hub_trigger_instance Table API
+      const body = { flow: flowSysId, trigger_type: snType };
+      if (triggerTable) body.table     = triggerTable;
+      if (condition)    body.condition = condition;
+      return this.post('sys_hub_trigger_instance', body);
+    }
+  }
+
+  // Looks up a named action type from sys_hub_action_type_base (needed for step creation)
+  async lookupActionType(nameOrLabel) {
+    // Try exact name first, then label match
+    const results = await this.get('sys_hub_action_type_base', {
+      sysparm_query:  `name=${nameOrLabel}^ORlabel=${nameOrLabel}`,
+      sysparm_fields: 'sys_id,name,label',
+      sysparm_limit:  '5',
     });
+    return results[0]?.sys_id ?? null;
   }
 
-  async createFlowTrigger(flowSysId, triggerType, triggerTable = null) {
-    const body = { flow: flowSysId, trigger_type: triggerType };
-    if (triggerTable) body.trigger_table = triggerTable;
-    return this.post('sys_hub_trigger_instance', body);
+  // Maps a logical action type string to the SN action type name for lookup
+  static flowActionTypeName(logicalType) {
+    const map = {
+      create_record:  'Create Record',
+      update_record:  'Update Record',
+      delete_record:  'Delete Record',
+      lookup_record:  'Look Up Record',
+      condition:      'If',
+      script:         'Run Script',
+      notification:   'Send Notification',
+      outbound_rest:  'REST Step',
+      subflow:        'Flow Logic - Subflow',
+      log:            'Log',
+    };
+    return map[logicalType] ?? 'Run Script';
   }
 
-  async createFlowBlock(flowSysId, stepName, actionType, script = null, order = 100) {
-    const body = { flow: flowSysId, name: stepName, action_type: actionType, order: String(order) };
-    if (script) body.script = script;
-    return this.post('sys_hub_flow_block', body);
+  async createActionInstance(flowSysId, stepName, logicalActionType, order = 100, inputs = {}) {
+    // Look up the real action type sys_id
+    const actionTypeName = ServiceNowConnector.flowActionTypeName(logicalActionType);
+    const actionTypeSysId = await this.lookupActionType(actionTypeName);
+
+    // Try Flow Designer step API
+    try {
+      const body = { name: stepName, action_type: actionTypeSysId ?? actionTypeName, order, inputs };
+      return await this._fdRequest('POST', `/flow/${flowSysId}/step`, body);
+    } catch (_) {
+      // Fall back to Table API with whatever we have
+      const body = { flow: flowSysId, name: stepName, order: String(order) };
+      if (actionTypeSysId) body.action_type = actionTypeSysId;
+      return this.post('sys_hub_action_instance', body);
+    }
   }
 
-  async createFlowConditionBranch(flowSysId, blockSysId, label, condition) {
-    return this.post('sys_hub_condition_branch', {
-      flow: flowSysId,
-      block: blockSysId,
-      label,
-      condition,
-    });
+  async createFlowBlock(flowSysId, stepName, logicalActionType, script = null, order = 100) {
+    const inputs = script ? { script } : {};
+    return this.createActionInstance(flowSysId, stepName, logicalActionType, order, inputs);
   }
 
   async activateFlow(flowSysId) {
-    return this.patch('sys_hub_flow', flowSysId, { active: true });
+    // Try Flow Designer activate endpoint
+    try {
+      return await this._fdRequest('POST', `/flow/${flowSysId}/activate`, {});
+    } catch (_) {
+      // Fall back to Table API patch
+      return this.patch('sys_hub_flow', flowSysId, { active: 'true' });
+    }
   }
 
   // ── Choice synchronization ───────────────────────────────────────────────
