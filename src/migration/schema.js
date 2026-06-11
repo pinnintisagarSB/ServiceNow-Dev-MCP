@@ -179,6 +179,10 @@ export class SchemaDiscovery {
 
       const coalesce = isSourceUniqueId && snTargetIsCoalesceable;
 
+      const sourceType = sf.sf_type ?? sf.jira_type ?? '';
+      const targetType = matched?.type ?? '';
+      const needs_script = this._needsScript(sourceType, targetType, sf.source_field, matched?.field);
+
       return {
         staging_field:    sf.sn_column,
         source_field:     sf.source_field,
@@ -188,11 +192,60 @@ export class SchemaDiscovery {
           ? `"${sf.source_field}" is the unique identifier from the source — used as upsert key to prevent duplicates on re-run`
           : null,
         is_reference:     sf.is_reference,
-        needs_script:     sf.sf_type === 'picklist' || sf.jira_type === 'status' || sf.jira_type === 'priority',
+        needs_script,
+        script_reason:    needs_script ? this._scriptReason(sourceType, targetType, sf.source_field, matched?.field) : null,
         auto_matched:     !!matched,
-        source_type:      sf.sf_type ?? sf.jira_type,
+        source_type:      sourceType,
       };
     });
+  }
+
+  // ── Determine if a field needs an inline transform script ─────────────────
+  // Compares source field type against SN target field type for every mapping.
+  _needsScript(srcType, tgtType, srcField, tgtField) {
+    // Explicit value-mapped types — source values don't match SN picklist integers
+    if (['picklist', 'multipicklist', 'status', 'priority'].includes(srcType)) return true;
+
+    // Jira/SF array/list fields must be joined to a string for SN
+    if (['array', 'list', 'combobox'].includes(srcType)) return true;
+
+    // Boolean source going into a non-boolean SN field (e.g. string/integer)
+    if (srcType === 'boolean' && tgtType && tgtType !== 'boolean') return true;
+
+    // String/textarea source going into an integer SN field — needs parseInt
+    if (['string', 'textarea', 'text'].includes(srcType) && tgtType === 'integer') return true;
+
+    // Jira date-time strings need reformatting for SN glide_date_time
+    if (['datetime', 'date'].includes(srcType) && ['glide_date_time', 'glide_date'].includes(tgtType)) return true;
+
+    // Jira/SF nested objects that land as a plain string in staging but target is a
+    // structured SN field (e.g. issuetype → category, resolution → close_code)
+    if (['option', 'resolution', 'issuelinks'].includes(srcType)) return true;
+
+    // Well-known source→target field pairs that always need value translation
+    const knownPairs = new Set([
+      'priority:priority',   // Jira "High" → SN "2"
+      'status:state',        // Jira "In Progress" → SN "2"
+      'issuetype:category',  // Jira "Bug" → SN "software"
+      'Status:state',        // SF "Open" → SN "1"
+      'Priority:priority',   // SF "High" → SN "2"
+    ]);
+    if (srcField && tgtField && knownPairs.has(`${srcField}:${tgtField}`)) return true;
+
+    return false;
+  }
+
+  _scriptReason(srcType, tgtType, srcField, tgtField) {
+    if (['picklist', 'multipicklist'].includes(srcType)) return 'picklist values must be mapped to SN choice integers';
+    if (srcType === 'status')    return 'status strings must be translated to SN state integers';
+    if (srcType === 'priority')  return 'priority strings must be translated to SN priority integers (1-5)';
+    if (['array', 'list'].includes(srcType)) return 'array must be joined to a comma-separated string';
+    if (srcType === 'boolean' && tgtType !== 'boolean') return `boolean → ${tgtType} requires explicit conversion`;
+    if (['string', 'textarea'].includes(srcType) && tgtType === 'integer') return 'string must be parsed to integer';
+    if (['datetime', 'date'].includes(srcType)) return 'date format must be converted to SN glide_date_time format';
+    if (['option', 'resolution'].includes(srcType)) return 'nested object — extract .name or .value before storing';
+    if (srcField && tgtField) return `"${srcField}" → "${tgtField}" values require translation`;
+    return 'value transform required';
   }
 
   // ── Print schemas side-by-side ─────────────────────────────────────────────

@@ -47,12 +47,14 @@ export class ArtifactBuilder {
   }
 
   // ── Default inline field map scripts for common field types ──────────────
+  // These are sensible starting points; users can customise them after the
+  // transform map is created.
   _defaultScript(m) {
     const f = m.staging_field;
     const t = m.source_type ?? '';
     const target = m.sn_target ?? '';
 
-    // Jira priority → SN priority integer (1 = Critical/Highest … 5 = Planning/Lowest)
+    // Jira priority / SF Priority → SN priority integer (1 = Critical … 5 = Lowest)
     if (t === 'priority' || target === 'priority') {
       return (
         `var _p = source.getValue('${f}');\n` +
@@ -69,7 +71,48 @@ export class ArtifactBuilder {
       );
     }
 
-    // Generic picklist — pass value through as-is; the mapping can be refined later
+    // Array / list fields → join to comma-separated string
+    if (['array', 'list', 'combobox'].includes(t)) {
+      return (
+        `var _v = source.getValue('${f}');\n` +
+        `try { answer = JSON.parse(_v || '[]').join(', '); } catch(e) { answer = _v || ''; }`
+      );
+    }
+
+    // Boolean → SN true/false string
+    if (t === 'boolean') {
+      return (
+        `var _b = source.getValue('${f}');\n` +
+        `answer = (_b === 'true' || _b === '1') ? 'true' : 'false';`
+      );
+    }
+
+    // String → integer (e.g. story points, votes)
+    if (target && ['integer', 'decimal', 'float'].includes(target)) {
+      return (
+        `var _n = parseInt(source.getValue('${f}'), 10);\n` +
+        `answer = isNaN(_n) ? null : String(_n);`
+      );
+    }
+
+    // Nested option/resolution objects — extract the .name value stored as JSON
+    if (['option', 'resolution'].includes(t)) {
+      return (
+        `var _o = source.getValue('${f}');\n` +
+        `try { answer = JSON.parse(_o || '{}').name || _o || ''; } catch(e) { answer = _o || ''; }`
+      );
+    }
+
+    // Jira issuetype → SN category
+    if (t === 'issuetype' || target === 'category') {
+      return (
+        `var _i = source.getValue('${f}');\n` +
+        `answer = ({Bug:'software',Task:'request',Story:'request','Sub-task':'request',Epic:'request',Improvement:'enhancement'})[_i] || 'request';`
+      );
+    }
+
+    // Generic picklist / anything else with needs_script — pass value through;
+    // user should review and add a value map if needed
     return `answer = source.getValue('${f}');`;
   }
 
