@@ -158,39 +158,70 @@ LOG_LEVEL=info
 
 ### 3. Register with Claude Code
 
+Run this once from inside the project folder:
+
 ```bash
-claude mcp add sn-migration -- node /absolute/path/to/SN-Migration-Agent/src/mcp-server.js
+cd SN-Migration-Agent
+claude mcp add sn-migration node "$(pwd)/src/mcp-server.js"
 ```
 
-Replace `/absolute/path/to/SN-Migration-Agent` with the actual path on your machine. You can find it by running `pwd` inside the project folder.
+This registers the server in your local Claude Code config. The server starts automatically whenever Claude Code opens this project.
 
 **Verify the registration:**
 ```bash
 claude mcp list
 ```
 
-You should see `sn-migration` in the output.
+You should see:
 
-### 4. Restart Claude Code
+```
+sn-migration: node /path/to/SN-Migration-Agent/src/mcp-server.js - ✔ Connected
+```
+
+### 4. Test the server starts cleanly
+
+```bash
+node src/mcp-server.js
+```
+
+Expected output:
+
+```
+[info]  sn-data-migration MCP server running
+```
+
+Press `Ctrl+C` to stop. If you see an error about a missing `.env` variable, open `.env` and fill in the missing value.
+
+### 5. Restart Claude Code
 
 Close and reopen Claude Code (or reload your IDE extension). The `sn-migration` tools will be available in your next session.
 
+**Verify tools are loaded** — type `/mcp` in the Claude Code chat window. You should see `sn-migration` listed with all its tools.
+
 ---
 
-## Usage
+## Using the MCP in Claude Code chat
 
-Just tell Claude what you want in plain English:
+Once registered, just talk to Claude naturally — no commands or tool names needed:
 
 ```
-Migrate Jira project KAN to ServiceNow incident table
-Migrate Salesforce Account records to ServiceNow core_company
-Check if the migration setup already exists in ServiceNow
-Run a test migration of 5 records before doing the full run
-Clean up all the test records that were created
-Delete all the migration tables and transform maps from ServiceNow
+can you migrate jira data to servicenow
 ```
 
-Claude will call the tools, show you what it finds, ask for approval at each checkpoint, and only proceed when you confirm.
+Claude will automatically call `get_config` first, confirm credentials are in place, then walk through the full workflow step by step.
+
+Other example prompts:
+
+```
+migrate Jira project KAN to the incident table in ServiceNow
+migrate Salesforce Account records to ServiceNow core_company
+check if the migration setup already exists before doing anything
+run a test migration of 5 records first
+clean up all the test records that were created
+delete all the migration tables and transform maps
+```
+
+> **Tip:** Type `/mcp` at any time to see all available tools and their current status.
 
 ---
 
