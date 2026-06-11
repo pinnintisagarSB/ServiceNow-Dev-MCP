@@ -13,23 +13,23 @@ export class DependencyAnalyzer {
   }
 
   // ── Main entry point ───────────────────────────────────────────────────────
-  async analyze(platform, source, projectKeys) {
+  // jqlOverride: if provided, used as the full JQL query (caller handles scoping/filters)
+  async analyze(platform, source, projectKeys, jqlOverride = null) {
     logger.step('Dependency analysis...');
 
     const result = {
       platform,
-      references:        [],   // all cross-object/cross-record references found
-      missingInTarget:   [],   // referenced records that don't exist in SN yet
-      migrationSequence: [],   // ordered list of tiers
-      hierarchy:         {},   // object → record count
+      references:        [],
+      missingInTarget:   [],
+      migrationSequence: [],
+      hierarchy:         {},
       warnings:          [],
-      // backwards-compat
       users: { found: [], missing: [] },
       issueHierarchy: {},
     };
 
     if (platform === 'jira') {
-      const allIssues = await this._fetchAllJiraIssues(source, projectKeys);
+      const allIssues = await this._fetchAllJiraIssues(source, projectKeys, jqlOverride);
       this._analyzeJira(allIssues, result);
       await this._checkJiraRefsInSN(allIssues, result);
     } else if (platform === 'salesforce') {
@@ -45,12 +45,13 @@ export class DependencyAnalyzer {
   // JIRA
   // ════════════════════════════════════════════════════════════════════════
 
-  async _fetchAllJiraIssues(jira, projectKeys) {
-    const jql    = projectKeys.map(k => `project=${k}`).join(' OR ');
+  async _fetchAllJiraIssues(jira, projectKeys, jqlOverride = null) {
+    const jql    = jqlOverride
+      ?? `(${projectKeys.map(k => `project=${k}`).join(' OR ')}) ORDER BY created ASC`;
     const issues = [];
     let startAt  = 0;
     while (true) {
-      const res = await jira.search({ jql: `(${jql}) ORDER BY created ASC`, maxResults: 50, startAt });
+      const res = await jira.search({ jql, maxResults: 50, startAt });
       if (!res.issues?.length) break;
       const full = await Promise.all(res.issues.map(i => jira.get(`/rest/api/3/issue/${i.id}`)));
       issues.push(...full);

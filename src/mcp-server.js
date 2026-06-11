@@ -25,6 +25,7 @@ import { BatchMigrationRunner } from './migration/batch.js';
 import { MigrationCleanup }     from './migration/cleanup.js';
 import { FlowRetriever }        from './flows/retriever.js';
 import { FlowBuilder }          from './flows/builder.js';
+import { JiraAutomationRetriever } from './flows/jira-automation.js';
 import { logger }               from './utils/logger.js';
 
 // ── Connector cache (reuse within a session) ───────────────────────────────
@@ -792,8 +793,12 @@ server.tool(
         const analyzer   = new DependencyAnalyzer(sn);
         const projectKeys = object_name.split(',').map(k => k.trim());
 
-        // Dependency analysis + auto-create missing users
-        const analysis = await analyzer.analyze('jira', jira, projectKeys);
+        // Build JQL — apply filter server-side so we only fetch matching issues
+        const baseJql  = `project IN (${projectKeys.map(k => `"${k}"`).join(',')})`;
+        const fullJql  = filter ? `${baseJql} AND (${filter})` : baseJql;
+
+        // Dependency analysis with JQL so only filtered issues are fetched
+        const analysis = await analyzer.analyze('jira', jira, projectKeys, fullJql);
         if (analysis.users.missing.length) {
           await analyzer.createMissingUsers(analysis.users.missing);
         }
@@ -817,17 +822,7 @@ server.tool(
           return flat;
         };
 
-        // Filter sequence if JQL filter provided
-        let sequence = analysis.migrationSequence;
-        if (filter) {
-          sequence = sequence.map(tier => ({
-            ...tier,
-            issues: tier.issues.filter(i => {
-              // basic project filter support
-              return projectKeys.includes(i.fields?.project?.key);
-            }),
-          })).filter(t => t.issues.length);
-        }
+        const sequence = analysis.migrationSequence;
 
         // Use batch runner: divides records into import sets, runs up to 5 in parallel
         const batchRunner = new BatchMigrationRunner(sn);
@@ -1157,12 +1152,13 @@ server.tool(
       return ok({
         total: flows.length,
         flows: flows.map((f, i) => ({
-          index:        i + 1,
-          api_name:     f.ApiName,
-          label:        f.Label,
-          process_type: f.ProcessType,
-          trigger_type: f.TriggerType ?? null,
-          manual_only:  f.ProcessType === 'Flow',
+          index:          i + 1,
+          api_name:       f.Definition?.DeveloperName ?? f.MasterLabel,
+          label:          f.MasterLabel,
+          process_type:   f.ProcessType,
+          last_modified_by: f.LastModifiedBy?.Name ?? null,
+          last_modified_date: f.LastModifiedDate ?? null,
+          manual_only:    f.ProcessType === 'Flow',
         })),
         instructions_for_claude: [
           'Present the flow list to the user.',
@@ -1758,6 +1754,249 @@ server.tool(
       const sn = await getSn();
       const r = await sn.cleanupOldImportSetRuns(days_old);
       return ok({ ...r, message: `Scanned ${r.scanned} runs older than ${days_old} days. Deleted ${r.deleted}.` });
+    } catch (e) { return fail(e.message); }
+  }
+);
+
+// ══════════════════════════════════════════════════════════════════════════
+// TOOL: preview_query — show count + sample records before migrating
+// ══════════════════════════════════════════════════════════════════════════
+server.tool(
+  'preview_query',
+  `Preview how many records will be migrated before committing to a full run.
+   Returns the total record count and a sample (up to 5 records) matching the query.
+   ALWAYS call this before run_test_migration or run_full_migration when the user wants
+   to filter or scope the migration — e.g. "only migrate closed tickets" or
+   "just the records from 2024". This prevents accidentally migrating too many records.
+
+   For Jira: filter is JQL (e.g. "status = Done AND created >= 2024-01-01")
+   For Salesforce: filter is a SOQL WHERE clause (e.g. "Status = 'Closed' AND CreatedDate >= 2024-01-01T00:00:00Z")`,
+  {
+    platform:    z.string().describe('Source platform (jira or salesforce)'),
+    object_name: z.string().describe('Jira project key or Salesforce object name'),
+    filter:      z.string().optional().describe('JQL (Jira) or SOQL WHERE clause (Salesforce) to scope records'),
+    fields:      z.array(z.string()).optional().describe('Specific fields to preview (defaults to key fields)'),
+  },
+  async ({ platform, object_name, filter, fields }) => {
+    try {
+      if (platform === 'jira') {
+        const jira = await getJira();
+        const jql  = filter
+          ? `project=${object_name} AND ${filter}`
+          : `project=${object_name}`;
+
+        const [countResult, sampleResult] = await Promise.all([
+          jira.search({ jql, maxResults: 0 }),
+          jira.search({ jql, maxResults: 5, fields: fields?.length ? fields : ['summary', 'status', 'priority', 'issuetype', 'assignee', 'created'] }),
+        ]);
+
+        const sample = (sampleResult.issues ?? []).map(i => ({
+          key:       i.key,
+          summary:   i.fields?.summary ?? '',
+          status:    i.fields?.status?.name ?? '',
+          priority:  i.fields?.priority?.name ?? '',
+          issuetype: i.fields?.issuetype?.name ?? '',
+          assignee:  i.fields?.assignee?.emailAddress ?? i.fields?.assignee?.displayName ?? null,
+          created:   i.fields?.created?.substring(0, 10) ?? '',
+        }));
+
+        return ok({
+          instructions_for_claude: [
+            `Tell the user: "${countResult.total ?? 0} records match${filter ? ` the filter "${filter}"` : ''} in project ${object_name}."`,
+            `Show the sample records table and ask: "Does this look right? Should I proceed with the migration?"`,
+            countResult.total === 0
+              ? 'Warn: no records found — the filter may be too restrictive or the project key wrong.'
+              : null,
+          ].filter(Boolean),
+          total_records: countResult.total ?? 0,
+          jql_used: jql,
+          sample,
+        });
+      }
+
+      if (platform === 'salesforce') {
+        const sf         = await getSf();
+        const previewFields = fields?.length ? fields : ['Id', 'Name', 'CreatedDate', 'LastModifiedDate'];
+        const where      = filter ? ` WHERE ${filter}` : '';
+        const countSoql  = `SELECT COUNT() FROM ${object_name}${where}`;
+        const sampleSoql = `SELECT ${previewFields.join(',')} FROM ${object_name}${where} LIMIT 5`;
+
+        const [countRes, sampleRes] = await Promise.all([
+          sf.query(countSoql),
+          sf.query(sampleSoql),
+        ]);
+
+        return ok({
+          instructions_for_claude: [
+            `Tell the user: "${countRes.totalSize ?? 0} records match${filter ? ` the filter "${filter}"` : ''} in ${object_name}."`,
+            `Show the sample records and ask: "Does this look right? Shall I proceed with the migration?"`,
+            (countRes.totalSize ?? 0) === 0
+              ? 'Warn: no records found — check the filter or object name.'
+              : null,
+          ].filter(Boolean),
+          total_records: countRes.totalSize ?? 0,
+          soql_used: sampleSoql,
+          sample: sampleRes.records ?? [],
+        });
+      }
+
+      return fail(`preview_query not yet supported for platform "${platform}"`);
+    } catch (e) { return fail(e.message); }
+  }
+);
+
+// ══════════════════════════════════════════════════════════════════════════
+// TOOL: list_jira_automations  (Jira Automation Phase 1)
+// ══════════════════════════════════════════════════════════════════════════
+server.tool(
+  'list_jira_automations',
+  `Lists all Jira Automation rules visible to the authenticated user.
+   Call this when the user wants to migrate Jira automations to ServiceNow Flow Designer.
+   Returns a summary of each rule: name, trigger type, number of conditions/actions, enabled state.
+   After calling this, show the list and ask which automation(s) the user wants to migrate.`,
+  {
+    project_key: z.string().optional().describe('Jira project key to scope — omit to list all automations'),
+  },
+  async ({ project_key }) => {
+    try {
+      const jira      = await getJira();
+      const retriever = new JiraAutomationRetriever(jira);
+      const rules     = await retriever.listAutomations(project_key ?? null);
+
+      const summary = rules.map(r => ({
+        id:       r.id,
+        name:     r.name,
+        enabled:  r.state === 'ENABLED',
+        projects: (r.projects ?? []).map(p => p.key ?? p.name ?? p.id),
+        trigger:  JiraAutomationRetriever.triggerLabel(r.trigger?.type ?? r.ruleScope?.trigger?.type ?? ''),
+        actions:  (r.components ?? r.elements ?? []).filter(c => (c.type ?? '').includes('ACTION')).length,
+      }));
+
+      return ok({
+        instructions_for_claude: [
+          `Tell the user: "I found ${rules.length} Jira automation rule(s)${project_key ? ` for project ${project_key}` : ''}.`,
+          'Show the list in a table: name | trigger | actions | enabled.',
+          'Ask: "Which automation(s) would you like to migrate to ServiceNow Flow Designer?"',
+          'Then call analyze_jira_automation with the chosen rule ID.',
+        ],
+        total: rules.length,
+        automations: summary,
+      });
+    } catch (e) { return fail(e.message); }
+  }
+);
+
+// ══════════════════════════════════════════════════════════════════════════
+// TOOL: analyze_jira_automation  (Jira Automation Phase 2)
+// ══════════════════════════════════════════════════════════════════════════
+server.tool(
+  'analyze_jira_automation',
+  `Fetches and analyses a specific Jira Automation rule and produces a migration plan for ServiceNow.
+   Returns: trigger type, conditions, actions, what can be automated vs manual.
+   After calling this, present the plan and ask the user to confirm before building.`,
+  {
+    rule_id:   z.string().describe('Jira Automation rule ID (from list_jira_automations)'),
+    sn_table:  z.string().describe('ServiceNow table this automation will operate on (e.g. incident, problem)'),
+  },
+  async ({ rule_id, sn_table }) => {
+    try {
+      const jira      = await getJira();
+      const retriever = new JiraAutomationRetriever(jira);
+      const raw       = await retriever.getAutomation(rule_id);
+      const parsed    = retriever.parseRule(raw);
+      const plan      = retriever.buildMigrationPlan(parsed);
+
+      const autoSteps   = plan.steps.filter(s => s.auto).length;
+      const manualSteps = plan.manual.length;
+
+      return ok({
+        instructions_for_claude: [
+          `Present the automation: "${parsed.name}"`,
+          `Trigger: ${parsed.trigger?.label ?? 'unknown'} → SN type: ${parsed.trigger?.sn_type ?? 'manual'}`,
+          `${autoSteps} steps can be automated, ${manualSteps} require manual setup.`,
+          manualSteps
+            ? `Manual items: ${plan.manual.map(m => m.label).join(', ')}. Explain these to the user.`
+            : 'All steps can be automated.',
+          'Ask: "Does this plan look correct? Which ServiceNow table should this flow operate on?" (already set if sn_table was provided)',
+          'After confirmation, call build_jira_automation.',
+        ],
+        automation: parsed,
+        migration_plan: plan,
+        sn_table,
+        auto_steps:   autoSteps,
+        manual_steps: manualSteps,
+      });
+    } catch (e) { return fail(e.message); }
+  }
+);
+
+// ══════════════════════════════════════════════════════════════════════════
+// TOOL: build_jira_automation  (Jira Automation Phase 3)
+// ══════════════════════════════════════════════════════════════════════════
+server.tool(
+  'build_jira_automation',
+  `Builds the ServiceNow Flow Designer artifacts for a Jira Automation rule.
+   Creates the flow record, trigger, condition blocks, and action steps.
+   Steps that cannot be automated are skipped — the manual build guide explains what to do.
+   Only call this after analyze_jira_automation and user confirmation.`,
+  {
+    rule_id:        z.string().describe('Jira Automation rule ID'),
+    sn_table:       z.string().describe('ServiceNow table the flow will operate on'),
+    flow_scope:     z.string().optional().describe('Scope prefix for the SN flow name (e.g. custom, global)'),
+    field_mappings: z.record(z.string()).optional().describe('Jira field name → SN field name overrides'),
+  },
+  async ({ rule_id, sn_table, flow_scope, field_mappings }) => {
+    try {
+      const jira      = await getJira();
+      const sn        = await getSn();
+      const retriever = new JiraAutomationRetriever(jira);
+      const raw       = await retriever.getAutomation(rule_id);
+      const parsed    = retriever.parseRule(raw);
+
+      // Build using the existing FlowBuilder (shared with Salesforce flow path)
+      const builder     = new FlowBuilder(sn);
+      const flowStructure = {
+        apiName:    `jira_${parsed.id}`,
+        type:       parsed.trigger?.sn_type === 'record' ? 'RecordTriggeredFlow' : 'AutoLaunchedFlow',
+        label:      parsed.name,
+        trigger:    parsed.trigger,
+        variables:  [],
+        elements:   [
+          ...parsed.conditions.map(c => ({ ...c, kind: 'decision',   label: c.label,  name: c.label })),
+          ...parsed.actions.filter(a => a.can_auto).map(a => ({
+            kind:   a.sn_action === 'create_record' ? 'recordCreate'
+                  : a.sn_action === 'update_record' ? 'recordUpdate'
+                  : a.sn_action === 'delete_record' ? 'recordDelete'
+                  : 'action',
+            label:  a.label,
+            name:   a.label,
+          })),
+        ],
+        isScreen:   false,
+      };
+
+      const results = await builder.build({
+        flowStructure,
+        snTableName:   sn_table,
+        fieldMappings: field_mappings ?? {},
+        flowScope:     flow_scope ?? 'jira',
+      });
+
+      const plan      = retriever.buildMigrationPlan(parsed);
+      const manualCount = plan.manual.length;
+
+      return ok({
+        instructions_for_claude: [
+          `Tell the user: "Flow '${parsed.name}' has been created in ServiceNow Flow Designer."`,
+          manualCount
+            ? `${manualCount} step(s) need manual configuration. Show the manual_guide to the user step by step.`
+            : 'All steps were automated successfully.',
+          `Share the SN Flow Designer URL: ${sn.baseUrl}/nav_to.do?uri=sys_flow.do`,
+        ],
+        flow: results,
+        manual_guide: plan.manual,
+        sn_table,
+      });
     } catch (e) { return fail(e.message); }
   }
 );

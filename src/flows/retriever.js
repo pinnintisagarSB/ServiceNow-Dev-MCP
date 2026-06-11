@@ -26,16 +26,17 @@ export class FlowRetriever {
     flows.forEach((f, i) => {
       const isScreen = f.ProcessType === 'Flow';
       const tag      = isScreen ? '⚠️  Screen Flow (manual only)' : f.ProcessType;
-      console.log(`  ${String(i + 1).padStart(2)}. ${f.ApiName.padEnd(50)} [${tag}]`);
+      const name = f.Definition?.DeveloperName ?? f.MasterLabel ?? '';
+      console.log(`  ${String(i + 1).padStart(2)}. ${name.padEnd(50)} [${tag}]`);
     });
   }
 
   parseFlowStructure(flowMetadata) {
     const meta = flowMetadata.Metadata ?? {};
     return {
-      apiName:    flowMetadata.ApiName,
+      apiName:    flowMetadata._apiName ?? flowMetadata.MasterLabel,
       type:       flowMetadata.ProcessType,
-      label:      meta.label ?? flowMetadata.ApiName,
+      label:      meta.label ?? flowMetadata._apiName ?? flowMetadata.MasterLabel,
       trigger:    meta.start ?? null,
       variables:  meta.variables ?? [],
       elements:   [

@@ -166,6 +166,45 @@ export class JiraConnector {
     }
   }
 
+  // ── Jira Automation API ───────────────────────────────────────────────────
+  // Lists all automations visible to the authenticated user.
+  // projectKey is optional — omit to fetch global + all project automations.
+  async listAutomations({ projectKey = null, limit = 100 } = {}) {
+    const params = { limit };
+    if (projectKey) params.projectKey = projectKey;
+    try {
+      const res = await httpFetch(`${this.baseUrl}/rest/automation/1.0/rules/search`, {
+        method: 'POST',
+        headers: this.headers(),
+        body: JSON.stringify({ limit, ...(projectKey ? { projectKey } : {}) }),
+      });
+      const json = await res.json();
+      if (!res.ok) throw new Error(`Jira Automation API → ${res.status}: ${JSON.stringify(json)}`);
+      return json.values ?? json.rules ?? [];
+    } catch (e) {
+      // Cloud Automation is at a different path on some instances
+      const res2 = await httpFetch(`${this.baseUrl}/rest/automation/1.0/rules/search?limit=${limit}${projectKey ? `&projectKey=${projectKey}` : ''}`, {
+        headers: this.headers(),
+      });
+      const json2 = await res2.json();
+      if (!res2.ok) throw new Error(`Jira Automation list failed: ${e.message}`);
+      return json2.values ?? json2.rules ?? [];
+    }
+  }
+
+  async getAutomation(ruleId) {
+    const res  = await httpFetch(`${this.baseUrl}/rest/automation/1.0/rules/${ruleId}`, { headers: this.headers() });
+    const json = await res.json();
+    if (!res.ok) throw new Error(`Jira Automation get → ${res.status}: ${JSON.stringify(json)}`);
+    return json;
+  }
+
+  // Returns count of issues matching a JQL query (without fetching all records)
+  async countIssues(jql) {
+    const result = await this.search({ jql, maxResults: 0 });
+    return result.total ?? 0;
+  }
+
   // ── Flatten Issue for Staging (legacy — kept for back-compat) ─────────────
   static flattenIssue(issue) {
     const f = issue.fields;

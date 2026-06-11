@@ -256,10 +256,15 @@ export class SalesforceConnector {
 
   // ── Tooling / Flow ────────────────────────────────────────────────────────
   async toolingQuery(soql) { return this.get(`/services/data/${this.apiVersion}/tooling/query`, { q: soql }); }
-  async listFlows() { return this.toolingQuery('SELECT Id,ApiName,ProcessType,TriggerType,Label,Description FROM FlowDefinition'); }
+  async listFlows() { return this.toolingQuery("SELECT Id,MasterLabel,ProcessType,Description,LastModifiedDate,LastModifiedBy.Name,Definition.DeveloperName FROM Flow WHERE Status='Active'"); }
   async getFlowMetadata(apiName) {
-    const result = await this.toolingQuery(`SELECT Id,ApiName,ProcessType,Metadata FROM Flow WHERE ApiName='${apiName}' AND Status='Active'`);
-    return result.records[0] ?? null;
+    const defResult = await this.toolingQuery(`SELECT Id FROM FlowDefinition WHERE DeveloperName='${apiName}'`);
+    const def = defResult.records[0];
+    if (!def) return null;
+    const result = await this.toolingQuery(`SELECT Id,MasterLabel,ProcessType,Metadata FROM Flow WHERE DefinitionId='${def.Id}' AND Status='Active' ORDER BY VersionNumber DESC LIMIT 1`);
+    const record = result.records[0] ?? null;
+    if (record) record._apiName = apiName;
+    return record;
   }
 
   // ── Type Mapping → ServiceNow ──────────────────────────────────────────────
