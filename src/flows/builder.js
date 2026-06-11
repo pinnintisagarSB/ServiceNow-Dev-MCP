@@ -3,13 +3,21 @@ import { FlowRetriever } from './retriever.js';
 
 export class FlowBuilder {
   constructor(sn) {
-    this.sn         = sn;
-    this.manualList = [];
-    this.results    = {};
+    this.sn             = sn;
+    this.manualList     = [];
+    this.results        = {};
+    this.subflowRegistry = {}; // name → sys_id, for cross-referencing within a session
+  }
+
+  // Determine if the flowStructure represents a subflow
+  _isSubflow(flowStructure) {
+    const t = (flowStructure.type ?? '').toLowerCase();
+    return t === 'subflow' || t === 'autolaunchedflow' || flowStructure.isSubflow === true;
   }
 
   async build({ flowStructure, snTableName, fieldMappings, flowScope, appScopeId = null }) {
-    logger.header(`Phase F5 — Building Flow: ${flowStructure.apiName}`);
+    const isSubflow = this._isSubflow(flowStructure);
+    logger.header(`Phase F5 — Building ${isSubflow ? 'Subflow' : 'Flow'}: ${flowStructure.apiName}`);
     const results = {};
 
     if (flowStructure.isScreen) {
@@ -23,16 +31,25 @@ export class FlowBuilder {
       return results;
     }
 
-    // F5.1 Create flow record
-    logger.step('F5.1 Creating flow record...');
-    const flowName   = flowScope ? `${flowScope}_${flowStructure.apiName}` : flowStructure.apiName;
-    const flowRecord = await this.sn.createFlow(flowName, flowStructure.label ?? flowStructure.apiName, appScopeId);
-    const flowSysId  = flowRecord?.sys_id ?? flowRecord?.id;
-    if (!flowSysId) throw new Error(`Flow record created but sys_id is missing. Raw response: ${JSON.stringify(flowRecord)}`);
-    results.flow = { name: flowName, sys_id: flowSysId };
-    logger.success(`Flow record: ${flowName} (${flowSysId})`);
+    // F5.1 Create flow / subflow record
+    logger.step(`F5.1 Creating ${isSubflow ? 'subflow' : 'flow'} record...`);
+    const flowName = flowScope ? `${flowScope}_${flowStructure.apiName}` : flowStructure.apiName;
 
-    // F5.2 Create variables
+    let flowRecord;
+    if (isSubflow) {
+      flowRecord = await this.sn.createSubflow(flowName, flowStructure.label ?? flowStructure.apiName, appScopeId);
+    } else {
+      flowRecord = await this.sn.createFlow(flowName, flowStructure.label ?? flowStructure.apiName, appScopeId);
+    }
+
+    const flowSysId = flowRecord?.sys_id ?? flowRecord?.id;
+    if (!flowSysId) throw new Error(`${isSubflow ? 'Subflow' : 'Flow'} record created but sys_id is missing. Raw: ${JSON.stringify(flowRecord)}`);
+    results.flow = { name: flowName, sys_id: flowSysId, type: isSubflow ? 'subflow' : 'flow' };
+    this.subflowRegistry[flowStructure.apiName] = flowSysId;
+    this.subflowRegistry[flowName]              = flowSysId;
+    logger.success(`${isSubflow ? 'Subflow' : 'Flow'} record: ${flowName} (${flowSysId})`);
+
+    // F5.2 Create variables (inputs/outputs for subflows, internal vars for flows)
     logger.step('F5.2 Creating flow variables...');
     let varCount = 0;
     for (const v of flowStructure.variables ?? []) {
@@ -43,15 +60,20 @@ export class FlowBuilder {
     logger.success(`Variables: ${varCount} created`);
     results.variables = varCount;
 
-    // F5.3 Create trigger
-    logger.step('F5.3 Creating flow trigger...');
-    const triggerType = FlowRetriever.mapTriggerType(flowStructure.type);
-    const condition   = flowStructure.trigger?.filterConditions
-      ? this._buildConditionString(flowStructure.trigger.filterConditions, fieldMappings)
-      : null;
-    const trigger = await this.sn.createFlowTrigger(flowSysId, triggerType, snTableName, condition);
-    results.trigger = trigger?.sys_id ?? trigger?.id ?? 'created';
-    logger.success(`Trigger: ${triggerType} on ${snTableName ?? '—'}`);
+    // F5.3 Create trigger — skipped for subflows (they have no trigger)
+    if (isSubflow) {
+      logger.info('F5.3 Skipping trigger (subflows have no trigger)');
+      results.trigger = 'none (subflow)';
+    } else {
+      logger.step('F5.3 Creating flow trigger...');
+      const triggerType = FlowRetriever.mapTriggerType(flowStructure.type);
+      const condition   = flowStructure.trigger?.filterConditions
+        ? this._buildConditionString(flowStructure.trigger.filterConditions, fieldMappings)
+        : null;
+      const trigger = await this.sn.createFlowTrigger(flowSysId, triggerType, snTableName, condition);
+      results.trigger = trigger?.sys_id ?? trigger?.id ?? 'created';
+      logger.success(`Trigger: ${triggerType} on ${snTableName ?? '—'}`);
+    }
 
     // F5.4 Create steps
     logger.step('F5.4 Creating flow steps...');
@@ -161,6 +183,33 @@ export class FlowBuilder {
   }
 
   _buildStepInputs(el, logicalType, fieldMappings, snTableName) {
+    // Subflow call: pass the subflow sys_id + any input assignments
+    if (logicalType === 'subflow') {
+      // Resolve subflow sys_id: check registry first, then el.subflowSysId, then el.flowName
+      const subflowSysId = el.subflowSysId
+        ?? this.subflowRegistry?.[el.flowName]
+        ?? this.subflowRegistry?.[el.subflowName]
+        ?? null;
+      if (!subflowSysId) {
+        // Generate a script stub that calls the subflow by name when sys_id isn't known
+        const subflowRef = el.flowName ?? el.subflowName ?? 'unknown_subflow';
+        el._overrideScript = [
+          `// TODO: Call subflow "${subflowRef}"`,
+          `// Replace 'subflow_internal_name' with the actual internal name after migration`,
+          `// var outputs = sn_fd.FlowAPI.executeSubflow('${subflowRef.toLowerCase().replace(/[^a-z0-9]/g, '_')}', {});`,
+          `gs.info('Subflow call placeholder: ${subflowRef}');`,
+        ].join('\n');
+        return { script: el._overrideScript };
+      }
+      const inputs = { subflow: subflowSysId };
+      // Map any input parameters from the calling element
+      (el.inputAssignments ?? el.inputParameters ?? []).forEach(p => {
+        const snField = fieldMappings?.[p.field ?? p.name] ?? p.field ?? p.name;
+        inputs[snField] = p.value ?? '';
+      });
+      return inputs;
+    }
+
     if (logicalType === 'create_record' || logicalType === 'update_record') {
       const assignments = el.inputAssignments ?? el.inputParameters ?? [];
       if (assignments.length === 0) {

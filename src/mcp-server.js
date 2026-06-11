@@ -1243,10 +1243,20 @@ server.tool(
   },
   async ({ flow_api_name, sn_table, flow_scope, field_mappings, app_scope_id }) => {
     try {
+      const sn        = await getSn();
       const retriever = new FlowRetriever(await getSf());
-      const builder   = new FlowBuilder(await getSn());
+      const builder   = new FlowBuilder(sn);
       const raw       = await retriever.getFlowMetadata(flow_api_name);
       const structure = retriever.parseFlowStructure(raw);
+
+      // Pre-populate subflow registry from any subflow elements so Call Subflow
+      // steps get the correct sys_id if those subflows were already migrated
+      for (const el of structure.elements ?? []) {
+        if (el.kind === 'subflow' && el.flowName) {
+          const existing = await sn.findSubflow(el.flowName).catch(() => null);
+          if (existing?.sys_id) builder.subflowRegistry[el.flowName] = existing.sys_id;
+        }
+      }
 
       const result = await builder.build({
         flowStructure:  structure,
@@ -1269,6 +1279,124 @@ server.tool(
           ? `${(await getSn()).baseUrl}/now/workflow-studio/home`
           : null,
         flow_sys_id: result.flow?.sys_id ?? null,
+      });
+    } catch (e) { return fail(e.message); }
+  }
+);
+
+// ══════════════════════════════════════════════════════════════════════════
+// TOOL: build_subflow  — creates a reusable SN subflow from a parsed structure
+// ══════════════════════════════════════════════════════════════════════════
+server.tool(
+  'build_subflow',
+  `Creates a ServiceNow Subflow (no trigger, callable by flows and scripts).
+   Use this when migrating Salesforce AutoLaunchedFlows, Jira rule chains, or
+   any reusable logic block that other flows will call.
+   Returns the subflow sys_id so you can reference it in parent flow steps.`,
+  {
+    name:           z.string().describe('Subflow name (will be prefixed with flow_scope if provided)'),
+    description:    z.string().optional().describe('What this subflow does'),
+    flow_scope:     z.string().optional().describe('Scope prefix e.g. jira, sf'),
+    app_scope_id:   z.string().optional().describe('sys_id of the scoped app'),
+    variables:      z.array(z.object({
+      name:      z.string(),
+      dataType:  z.string().default('String'),
+      isInput:   z.boolean().default(false),
+      isOutput:  z.boolean().default(false),
+    })).optional().describe('Input/output variables for the subflow'),
+    elements:       z.array(z.object({
+      kind:  z.string(),
+      label: z.string().optional(),
+      name:  z.string().optional(),
+    })).optional().describe('Steps inside the subflow'),
+    sn_table:       z.string().optional().describe('Target SN table the subflow operates on'),
+    field_mappings: z.record(z.string()).optional(),
+  },
+  async ({ name, description, flow_scope, app_scope_id, variables, elements, sn_table, field_mappings }) => {
+    try {
+      const sn = await getSn();
+      const builder = new FlowBuilder(sn);
+      const flowStructure = {
+        apiName:   name.toLowerCase().replace(/[^a-z0-9]/g, '_'),
+        type:      'subflow',
+        isSubflow: true,
+        label:     name,
+        trigger:   null,
+        variables: variables ?? [],
+        elements:  elements ?? [],
+        isScreen:  false,
+      };
+      const result = await builder.build({
+        flowStructure,
+        snTableName:   sn_table ?? null,
+        fieldMappings: field_mappings ?? {},
+        flowScope:     flow_scope ?? null,
+        appScopeId:    app_scope_id ?? null,
+      });
+      return ok({
+        instructions_for_claude: [
+          `Tell the user: Subflow "${result.flow?.name}" created with sys_id ${result.flow?.sys_id}.`,
+          'Share the Workflow Studio URL so they can view and configure it.',
+          result.steps?.manual
+            ? `${result.steps.manual} TODO stub step(s) need manual configuration — show the manual_build_items.`
+            : 'All steps were created successfully.',
+        ],
+        result,
+        manual_build_items: builder.manualList,
+        workflow_studio_url: result.flow?.sys_id
+          ? `${(await getSn()).baseUrl}/now/workflow-studio/builder?table=sys_hub_flow&sysId=${result.flow.sys_id}`
+          : null,
+      });
+    } catch (e) { return fail(e.message); }
+  }
+);
+
+// ══════════════════════════════════════════════════════════════════════════
+// TOOL: create_custom_action  — builds an Action Designer action type
+// ══════════════════════════════════════════════════════════════════════════
+server.tool(
+  'create_custom_action',
+  `Creates a reusable custom Action in ServiceNow Action Designer (sys_hub_action_type_definition).
+   Use this to migrate Salesforce Apex actions, Jira webhook actions, or any complex
+   reusable logic that should be packaged as a Flow Designer action step.
+   The action can then be referenced in flows/subflows as a step.`,
+  {
+    name:         z.string().describe('Action name shown in Flow Designer step picker'),
+    description:  z.string().optional(),
+    app_scope_id: z.string().optional().describe('sys_id of the scoped app'),
+    inputs:       z.array(z.object({
+      name:      z.string(),
+      label:     z.string().optional(),
+      type:      z.string().default('string'),
+      mandatory: z.boolean().default(false),
+    })).optional().describe('Input variables for this action'),
+    outputs: z.array(z.object({
+      name:  z.string(),
+      label: z.string().optional(),
+      type:  z.string().default('string'),
+    })).optional().describe('Output variables this action produces'),
+    script: z.string().optional().describe('GlideScript body for the action\'s script step'),
+  },
+  async ({ name, description, app_scope_id, inputs, outputs, script }) => {
+    try {
+      const sn = await getSn();
+      const result = await sn.createCustomAction(
+        name,
+        description ?? `Migrated action: ${name}`,
+        inputs ?? [],
+        outputs ?? [],
+        script ?? null,
+        app_scope_id ?? null,
+      );
+      return ok({
+        instructions_for_claude: [
+          `Tell the user: Custom action "${name}" created (sys_id: ${result.sys_id}).`,
+          'They can find it in Flow Designer → Action Designer → Custom Actions.',
+          'It will appear in the step picker when building flows.',
+          script ? 'Review the script in Action Designer before activating.' : '⚠️ No script was provided — add the business logic manually in Action Designer.',
+        ],
+        action: result,
+        action_designer_url: `${(await getSn()).baseUrl}/now/workflow-studio/action-designer`,
       });
     } catch (e) { return fail(e.message); }
   }

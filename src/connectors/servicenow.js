@@ -604,8 +604,117 @@ export class ServiceNowConnector {
     return this.createActionInstance(flowSysId, stepName, logicalActionType, order, inputs);
   }
 
+  // ── Subflow creation ────────────────────────────────────────────────────────
+  // Subflows live in sys_hub_flow just like flows but have no trigger record.
+  // callable_by_others=true allows them to be called from flows and scripts.
+  async createSubflow(name, description, appScopeId = null) {
+    const internal = name.toLowerCase().replace(/[^a-z0-9]/g, '_');
+    const body = {
+      name,
+      description,
+      run_as:            'system',
+      active:            'false',
+      internal_name:     internal,
+      accessible_from:   'package_private',
+      callable_by_others: 'true',
+    };
+    if (appScopeId) body.sys_scope = appScopeId;
+
+    const record = await this.post('sys_hub_flow', body);
+    if (!record?.sys_id) {
+      logger.warn('createSubflow: POST response missing sys_id — querying by internal_name');
+      const rows = await this.get('sys_hub_flow', {
+        sysparm_query:  `internal_name=${internal}`,
+        sysparm_fields: 'sys_id,name,internal_name',
+        sysparm_limit:  '1',
+      });
+      if (!rows[0]?.sys_id) throw new Error(`Subflow "${name}" was created but sys_id could not be resolved`);
+      return rows[0];
+    }
+    return record;
+  }
+
+  // Creates a "Call Subflow" action step inside a parent flow.
+  // inputs = key/value pairs to pass to the subflow's input variables.
+  async callSubflow(parentFlowSysId, subflowSysId, stepLabel, order = 100, subflowInputs = {}) {
+    const inputs = { subflow: subflowSysId, ...subflowInputs };
+    return this.createActionInstance(parentFlowSysId, stepLabel, 'subflow', order, inputs);
+  }
+
+  // ── Custom Action (Action Designer) ────────────────────────────────────────
+  // Creates a reusable Action definition in sys_hub_action_type_definition.
+  // Adds input/output variable definitions and an optional script step.
+  async createCustomAction(name, description, inputs = [], outputs = [], script = null, appScopeId = null) {
+    const internal = name.toLowerCase().replace(/[^a-z0-9]/g, '_');
+    const body = {
+      name,
+      description,
+      internal_name: internal,
+      active:        'false',
+    };
+    if (appScopeId) body.sys_scope = appScopeId;
+
+    const actionDef = await this.post('sys_hub_action_type_definition', body);
+    const defSysId  = actionDef?.sys_id;
+    if (!defSysId) throw new Error(`Action type definition "${name}" created but no sys_id returned`);
+
+    // Create input variable definitions
+    for (const inp of inputs) {
+      await this.post('sys_hub_action_input', {
+        action_type: defSysId,
+        name:        inp.name,
+        label:       inp.label ?? inp.name,
+        type:        inp.type ?? 'string',
+        mandatory:   inp.mandatory ? 'true' : 'false',
+      }).catch(e => logger.warn(`Action input "${inp.name}" skipped: ${e.message}`));
+    }
+
+    // Create output variable definitions
+    for (const out of outputs) {
+      await this.post('sys_hub_action_output', {
+        action_type: defSysId,
+        name:        out.name,
+        label:       out.label ?? out.name,
+        type:        out.type ?? 'string',
+      }).catch(e => logger.warn(`Action output "${out.name}" skipped: ${e.message}`));
+    }
+
+    // Create a script step if provided
+    if (script) {
+      await this.post('sys_hub_action_script', {
+        action_type: defSysId,
+        script,
+        order:       '100',
+      }).catch(async () => {
+        // Some instances use sys_hub_step for script steps inside actions
+        await this.post('sys_hub_step', {
+          action_type: defSysId,
+          script,
+          order:       '100',
+        }).catch(e => logger.warn(`Action script step skipped: ${e.message}`));
+      });
+    }
+
+    return { sys_id: defSysId, name };
+  }
+
+  // Find an existing subflow by internal_name or name (for cross-referencing)
+  async findSubflow(name) {
+    const internal = name.toLowerCase().replace(/[^a-z0-9]/g, '_');
+    const rows = await this.get('sys_hub_flow', {
+      sysparm_query:  `internal_name=${internal}^ORname=${name}`,
+      sysparm_fields: 'sys_id,name,internal_name,callable_by_others',
+      sysparm_limit:  '1',
+    });
+    return rows[0] ?? null;
+  }
+
   async activateFlow(flowSysId) {
     return this.patch('sys_hub_flow', flowSysId, { active: 'true' });
+  }
+
+  async activateCustomAction(actionTypeSysId) {
+    return this.patch('sys_hub_action_type_definition', actionTypeSysId, { active: 'true' });
   }
 
   // ── Choice synchronization ───────────────────────────────────────────────
