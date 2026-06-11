@@ -44,6 +44,63 @@ const fail = (msg) => ({ content: [{ type: 'text', text: `ERROR: ${msg}` }], isE
 const server = new McpServer({ name: 'sn-data-migration', version: '1.0.0' });
 
 // ══════════════════════════════════════════════════════════════════════════
+// TOOL: get_config  (always call first in a new session)
+// ══════════════════════════════════════════════════════════════════════════
+server.tool(
+  'get_config',
+  `Returns the current configuration from the .env file — which platforms are set up and ready to use.
+   Call this at the very start of every session BEFORE asking the user for any information.
+   Never ask the user for credentials, URLs, or tokens — they are already in the .env file.
+   Use this to confirm what's configured, then call connect() to verify the connections are live.`,
+  {},
+  async () => {
+    const cfg = {
+      servicenow: {
+        configured: !!(process.env.SN_INSTANCE_URL && (process.env.SN_USERNAME || process.env.SN_USE_SDK_AUTH === 'true')),
+        instance:   process.env.SN_INSTANCE_URL ?? null,
+        auth_type:  process.env.SN_USE_SDK_AUTH === 'true' ? 'oauth_sdk' : 'basic',
+        scope_prefix: process.env.SN_SCOPE_PREFIX ?? 'u',
+      },
+      jira: {
+        configured: !!(process.env.JIRA_BASE_URL && process.env.JIRA_EMAIL && process.env.JIRA_API_TOKEN),
+        base_url:   process.env.JIRA_BASE_URL ?? null,
+        email:      process.env.JIRA_EMAIL ?? null,
+      },
+      salesforce: {
+        configured: !!(process.env.SF_CLIENT_ID && process.env.SF_USERNAME),
+        login_url:  process.env.SF_LOGIN_URL ?? null,
+        username:   process.env.SF_USERNAME ?? null,
+        api_version: process.env.SF_API_VERSION ?? null,
+      },
+      migration_settings: {
+        test_limit:  parseInt(process.env.MIGRATION_TEST_LIMIT ?? '5', 10),
+        page_size:   parseInt(process.env.MIGRATION_PAGE_SIZE ?? '200', 10),
+      },
+    };
+
+    const ready = Object.entries(cfg)
+      .filter(([k, v]) => v?.configured)
+      .map(([k]) => k);
+
+    const notConfigured = ['servicenow', 'jira', 'salesforce'].filter(p => !cfg[p].configured);
+
+    return ok({
+      instructions_for_claude: [
+        'Do NOT ask the user for any credentials or configuration — everything is already set up in the .env file.',
+        `The following platforms are configured and ready: ${ready.join(', ')}.`,
+        notConfigured.length
+          ? `These platforms are NOT configured (missing .env values): ${notConfigured.join(', ')}. Only mention this if the user asks to use one of them.`
+          : 'All three platforms are configured.',
+        'Call connect() next to verify the live connections, then proceed with the user\'s request.',
+      ],
+      configured_platforms: ready,
+      not_configured:       notConfigured,
+      config:               cfg,
+    });
+  }
+);
+
+// ══════════════════════════════════════════════════════════════════════════
 // TOOL: check_migration_state  (run before build_artifacts on any revisit)
 // ══════════════════════════════════════════════════════════════════════════
 server.tool(
@@ -120,8 +177,9 @@ server.tool(
 // ══════════════════════════════════════════════════════════════════════════
 server.tool(
   'connect',
-  `Test connections to one or all platforms.
-   Always call this first before any migration or flow work.
+  `Test live connections to one or all platforms using credentials already stored in .env.
+   Call this after get_config to verify connections are working.
+   Do NOT ask the user for any credentials before calling this — they are already configured.
    Returns connection status and instance URLs.`,
   {
     platform: z.enum(['servicenow', 'salesforce', 'jira', 'all']).default('all')
