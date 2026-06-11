@@ -1,49 +1,67 @@
 # SN Migration Agent — Claude Instructions
 
-## Important: credentials are already configured
+## CRITICAL: Always use the sn-migration MCP tools
 
-All credentials are stored in the `.env` file in this project. **Never ask the user for credentials, passwords, API tokens, or URLs.** They are already set up.
+This project has a registered MCP server called **`sn-migration`**. For ANY request involving migration, data movement, Jira, Salesforce, or ServiceNow — **always use the `sn-migration` MCP tools**. Never use built-in skills, bash commands, or any other approach.
 
-Platforms configured:
+Trigger phrases that must use `sn-migration` MCP tools (not skills):
+- "migrate jira data to servicenow"
+- "migrate salesforce to servicenow"
+- "migrate data"
+- "check servicenow connection"
+- "run migration"
+- "build staging table"
+- "clean up migration"
+- anything involving Jira, Salesforce, or ServiceNow
+
+The correct first action for ANY of these is to call the `mcp__sn-migration__get_config` tool — not a skill, not a bash command.
+
+---
+
+## Credentials are already configured — never ask
+
+All credentials are in `.env`. **Never ask the user for credentials, passwords, API tokens, or URLs.**
+
 - **ServiceNow** — `SN_INSTANCE_URL`, `SN_USERNAME`, `SN_PASSWORD`
 - **Jira** — `JIRA_BASE_URL`, `JIRA_EMAIL`, `JIRA_API_TOKEN`
 - **Salesforce** — `SF_LOGIN_URL`, `SF_CLIENT_ID`, `SF_CLIENT_SECRET`, `SF_USERNAME`, `SF_PASSWORD`
 
-## How to start every session
+---
 
-When the user asks to do anything migration-related, always begin by calling `get_config` to confirm which platforms are configured, then `connect` to verify the connections are live. Do not ask the user for any setup information first.
+## Session start — always follow this order
 
 ```
-1. get_config          → see what's already configured
-2. connect             → verify connections are working
-3. check_migration_state → see if artifacts already exist in ServiceNow
+1. mcp__sn-migration__get_config          → confirm what platforms are configured
+2. mcp__sn-migration__connect             → verify live connections
+3. mcp__sn-migration__check_migration_state → find existing SN artifacts
 4. proceed with the user's request
 ```
 
-## How to run this MCP server
+---
 
-The server is registered as `sn-migration` in Claude Code. If it's not responding, the user can restart it with:
-```bash
-cd /Users/sagarpinninti/Documents/Claude/Projects/SNMigrationAgent
-node src/mcp-server.js
-```
+## Full migration workflow
 
-## Migration workflow (summary)
+| Step | Tool | When |
+|------|------|------|
+| 1 | `get_config` | Always first — reads .env, no questions needed |
+| 2 | `connect` | Verify platforms are reachable |
+| 3 | `check_migration_state` | Before setup — skip what already exists |
+| 4 | `analyze_dependencies` | Before build — check record order and references |
+| 5 | `discover_schema` | Show source + target fields, suggest mappings |
+| 6 | `build_artifacts` | Create SN staging table, transform map, field maps |
+| 7 | `run_test_migration` | Push sample records, get data quality report |
+| 8 | `run_full_migration` | Migrate all records after user approval |
+| 9 | `verify_migration_counts` | Confirm counts match across all layers |
+| — | `cleanup_migration` | Delete migrated records (with confirmation) |
+| — | `cleanup_artifacts` | Delete SN setup artifacts (with confirmation) |
 
-1. `get_config` — confirm platforms configured
-2. `connect` — verify live connections
-3. `check_migration_state` — find existing artifacts, skip what's already done
-4. `analyze_dependencies` — dependency order, missing references
-5. `discover_schema` — source + target schemas, field mapping suggestions
-6. `build_artifacts` — create SN staging table, transform map, field maps (idempotent)
-7. `run_test_migration` — push sample records, review data quality report
-8. `run_full_migration` — migrate all records in batches
-9. `verify_migration_counts` — confirm source/staging/target counts match
+---
 
 ## Rules
 
+- Use `sn-migration` MCP tools for everything — never use skills or bash for migration work
 - Never ask for credentials — they are in `.env`
 - Never ask the user to run node commands — use the MCP tools
-- Always call `check_migration_state` before `build_artifacts` to avoid re-creating things
-- Always wait for explicit user approval after the test migration report before running the full migration
-- Use plain English when explaining what is happening — avoid ServiceNow technical jargon like "sys_transform_entry" or "sys_import_set_row" unless the user asks
+- Always call `check_migration_state` before `build_artifacts`
+- Always wait for explicit user approval after test migration before running the full migration
+- Use plain English — avoid jargon like "sys_transform_entry" or "sys_import_set_row"
