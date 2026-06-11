@@ -364,15 +364,8 @@ export class ServiceNowConnector {
   }
 
   // ── Flow Designer (Phase F5) ──────────────────────────────────────────────
-  // Uses Table API with the correct field names confirmed from live schema inspection.
-  // Key findings from schema discovery on zetechnodemo4:
-  //   sys_hub_action_instance: action_type (ref), action_inputs (glide_var JSON), order
-  //   sys_hub_trigger_instance: flow, trigger_type, table, trigger_definition (ref)
-  //   sys_hub_trigger_definition: DefaultTriggerDef = 3d442150435d311057c35a5088b8f205
-  //   action_type lookup: nameCONTAINS works; exact name= query returns empty due to SN encoding
-
-  // DefaultTriggerDef sys_id (universal OOB record — same across all instances)
-  static TRIGGER_DEF_DEFAULT = '3d442150435d311057c35a5088b8f205';
+  // All sys_ids are resolved live from the target instance — nothing hardcoded.
+  // Cached per connector instance so we only query once per session.
 
   async createFlow(name, description, appScopeId = null) {
     const internal = name.toLowerCase().replace(/[^a-z0-9]/g, '_');
@@ -391,6 +384,49 @@ export class ServiceNowConnector {
     }
   }
 
+  // Looks up the sys_hub_trigger_definition for a given logical trigger type.
+  // Searches by trigger_type field first, then by keyword in the name — fully live.
+  async _lookupTriggerDefinition(snTriggerType) {
+    if (!this._triggerDefCache) this._triggerDefCache = {};
+    if (this._triggerDefCache[snTriggerType]) return this._triggerDefCache[snTriggerType];
+
+    // Try to find by trigger_type field match
+    let defs = await this.get('sys_hub_trigger_definition', {
+      sysparm_query:  `trigger_type=${snTriggerType}`,
+      sysparm_fields: 'sys_id,name,trigger_type',
+      sysparm_limit:  '5',
+    }).catch(() => []);
+
+    // Fall back to keyword search in name
+    if (!defs.length) {
+      const keywords = {
+        record:    'nameLIKERecord^ORnameLIKEDefault',
+        scheduled: 'nameLIKEScheduled^ORnameLIKEDaily^ORnameLIKEWeekly',
+        on_demand: 'nameLIKEManual^ORnameLIKEDemand^ORnameLIKECatalog',
+      };
+      const query = keywords[snTriggerType] ?? 'nameLIKEDefault';
+      defs = await this.get('sys_hub_trigger_definition', {
+        sysparm_query:  query,
+        sysparm_fields: 'sys_id,name',
+        sysparm_limit:  '5',
+      }).catch(() => []);
+    }
+
+    // Last resort: grab any trigger definition (every instance has at least one)
+    if (!defs.length) {
+      defs = await this.get('sys_hub_trigger_definition', {
+        sysparm_fields: 'sys_id,name',
+        sysparm_limit:  '1',
+      }).catch(() => []);
+    }
+
+    const sysId = defs[0]?.sys_id ?? null;
+    if (!sysId) throw new Error(`No sys_hub_trigger_definition found on this instance for trigger type "${snTriggerType}"`);
+    logger.info(`Trigger definition resolved: ${defs[0].name} (${sysId})`);
+    this._triggerDefCache[snTriggerType] = sysId;
+    return sysId;
+  }
+
   async createFlowTrigger(flowSysId, triggerType, triggerTable = null, condition = null) {
     const typeMap = {
       record: 'record', scheduled: 'scheduled', manual: 'on_demand',
@@ -398,18 +434,7 @@ export class ServiceNowConnector {
       RecordTriggeredFlow: 'record', ScheduledFlow: 'scheduled', AutoLaunchedFlow: 'on_demand',
     };
     const snType = typeMap[triggerType] ?? 'on_demand';
-
-    // Look up the trigger definition for this type — DefaultTriggerDef covers record triggers
-    let triggerDefSysId = ServiceNowConnector.TRIGGER_DEF_DEFAULT;
-    if (snType === 'scheduled') {
-      // Try to find a "Daily" or "Scheduled" trigger definition
-      const defs = await this.get('sys_hub_trigger_definition', {
-        sysparm_query:  'nameLIKEScheduled^ORnameLIKEDaily',
-        sysparm_fields: 'sys_id,name',
-        sysparm_limit:  '1',
-      }).catch(() => []);
-      if (defs[0]) triggerDefSysId = defs[0].sys_id;
-    }
+    const triggerDefSysId = await this._lookupTriggerDefinition(snType);
 
     const body = { flow: flowSysId, trigger_type: snType, trigger_definition: triggerDefSysId };
     if (triggerTable) body.table     = triggerTable;
@@ -417,48 +442,80 @@ export class ServiceNowConnector {
     return this.post('sys_hub_trigger_instance', body);
   }
 
-  // Look up action type sys_id by name (using CONTAINS query which works in SN)
+  // Resolves action type sys_id by searching the live sys_hub_action_type_base table.
+  // Uses STARTSWITH query (CONTAINS causes false positives) then exact-match from results.
+  // Cached per session to avoid repeated lookups for the same type.
   async lookupActionType(name) {
-    // Use STARTSWITH to avoid false positives from CONTAINS
-    const results = await this.get('sys_hub_action_type_base', {
+    if (!this._actionTypeCache) this._actionTypeCache = {};
+    if (this._actionTypeCache[name]) return this._actionTypeCache[name];
+
+    // Try exact-prefix match first
+    let results = await this.get('sys_hub_action_type_base', {
       sysparm_query:  `nameSTARTSWITH${name}`,
       sysparm_fields: 'sys_id,name',
-      sysparm_limit:  '5',
+      sysparm_limit:  '10',
     });
-    // Prefer an exact match if multiple results
-    const exact = results.find(r => r.name === name);
-    return (exact ?? results[0])?.sys_id ?? null;
+
+    // Prefer exact match; fall back to first result
+    let match = results.find(r => r.name === name) ?? results[0] ?? null;
+
+    // If nothing found, try a broader CONTAINS search
+    if (!match) {
+      results = await this.get('sys_hub_action_type_base', {
+        sysparm_query:  `nameCONTAINS${name}`,
+        sysparm_fields: 'sys_id,name',
+        sysparm_limit:  '10',
+      });
+      match = results.find(r => r.name === name) ?? results[0] ?? null;
+    }
+
+    if (match) {
+      this._actionTypeCache[name] = match.sys_id;
+      logger.info(`Action type resolved: "${match.name}" (${match.sys_id})`);
+    }
+    return match?.sys_id ?? null;
   }
 
-  static flowActionTypeName(logicalType) {
-    // These names match the OOB sys_hub_action_type_base records
+  // Maps a logical step type to the human-readable action type name used in
+  // sys_hub_action_type_base. These are the standard OOB names present in all
+  // instances — if an instance uses a different name, lookupActionType's
+  // CONTAINS fallback will still find the closest match.
+  _flowActionTypeCandidates(logicalType) {
     const map = {
-      create_record:  'Create Record',
-      update_record:  'Update Record',
-      delete_record:  'Delete Record',
-      lookup_record:  'Look Up Record',
-      condition:      'Run Script',   // IF blocks → script in Flow Designer Table API path
-      script:         'Run Script',
-      notification:   'Send Notification',
-      outbound_rest:  'REST Step',
-      subflow:        'Flow Logic - Subflow',
+      create_record:  ['Create Record'],
+      update_record:  ['Update Record'],
+      delete_record:  ['Delete Record'],
+      lookup_record:  ['Look Up Record', 'Lookup Record', 'Look up Record'],
+      condition:      ['Run Script', 'Script'],
+      script:         ['Run Script', 'Script'],
+      notification:   ['Send Notification', 'Notification'],
+      outbound_rest:  ['REST Step', 'REST', 'Outbound REST'],
+      subflow:        ['Flow Logic - Subflow', 'Subflow'],
     };
-    return map[logicalType] ?? 'Run Script';
+    return map[logicalType] ?? ['Run Script', 'Script'];
   }
 
   async createActionInstance(flowSysId, stepName, logicalActionType, order = 100, inputs = {}) {
-    const actionTypeName  = ServiceNowConnector.flowActionTypeName(logicalActionType);
-    const actionTypeSysId = await this.lookupActionType(actionTypeName);
-
-    if (!actionTypeSysId) {
-      throw new Error(`Action type "${actionTypeName}" not found in sys_hub_action_type_base — add step manually`);
+    // Try each candidate name until we find one on this instance
+    const candidates = this._flowActionTypeCandidates(logicalActionType);
+    let actionTypeSysId = null;
+    for (const name of candidates) {
+      actionTypeSysId = await this.lookupActionType(name);
+      if (actionTypeSysId) break;
     }
 
-    // action_inputs is a glide_var field — must be a JSON string, not an object
+    if (!actionTypeSysId) {
+      throw new Error(
+        `No action type found for "${logicalActionType}" (tried: ${candidates.join(', ')}) ` +
+        `— add this step manually in Flow Designer`
+      );
+    }
+
+    // action_inputs is a glide_var field — must be a JSON string
     const body = {
-      flow:         flowSysId,
-      action_type:  actionTypeSysId,
-      order:        String(order),
+      flow:          flowSysId,
+      action_type:   actionTypeSysId,
+      order:         String(order),
       action_inputs: Object.keys(inputs).length ? JSON.stringify(inputs) : '',
     };
     return this.post('sys_hub_action_instance', body);
@@ -470,7 +527,6 @@ export class ServiceNowConnector {
   }
 
   async activateFlow(flowSysId) {
-    // Activation via Table API patch
     return this.patch('sys_hub_flow', flowSysId, { active: 'true' });
   }
 
