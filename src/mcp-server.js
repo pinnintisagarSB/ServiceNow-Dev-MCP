@@ -435,27 +435,39 @@ server.tool(
 
       return ok({
         instructions_for_claude: [
-          'Show the dependency summary to the user.',
+          'Show the dependency summary to the user in plain English.',
+          'Show the record counts per object/project.',
+          analysis.missingInTarget?.length
+            ? `Highlight the ${analysis.missingInTarget.length} missing reference(s) — explain the impact of each in plain language (e.g. "5 issues reference a user that doesn't exist in ServiceNow — those records will have a blank assignee field").`
+            : 'Tell the user all referenced records already exist in ServiceNow.',
           analysis.users.missing.length && !auto_create_users
-            ? 'Tell the user that missing users must exist in SN for owner/assignee/reporter references to resolve correctly. Ask: "Should I auto-create them now?"'
-            : 'All users are ready.',
-          platform === 'salesforce'
-            ? 'Show the object record counts and explain the migration order (parent objects before child objects).'
-            : 'Present the migration sequence (Tier 1 → 2 → 3) so the user understands the order.',
-          analysis.warnings.length ? 'Highlight any warnings about missing parent objects.' : null,
+            ? 'For missing users specifically, ask: "Should I create these users in ServiceNow now so that assignee and owner fields resolve correctly?"'
+            : null,
+          analysis.warnings.length
+            ? 'List any warnings about out-of-scope references — explain what will break if the referenced object is not migrated.'
+            : null,
+          'Show the migration sequence (Tier 1 first, then Tier 2, etc.) and explain why the order matters.',
           'After user confirms, proceed to build_artifacts.',
         ].filter(Boolean),
+        record_counts:   analysis.hierarchy,
+        references: {
+          total:      analysis.references.length,
+          resolved:   analysis.references.filter(r => r.resolved).length,
+          unresolved: analysis.references.filter(r => r.resolved === false).length,
+          by_type:    analysis.references.reduce((acc, r) => { acc[r.type] = (acc[r.type] ?? 0) + 1; return acc; }, {}),
+        },
+        missing_in_target: analysis.missingInTarget,
         users: {
           found:   analysis.users.found.map(u => u.email),
           missing: analysis.users.missing,
           created: usersCreated,
         },
-        hierarchy: analysis.hierarchy,
         migration_sequence: analysis.migrationSequence.map(s => ({
-          tier:  s.tier,
-          types: s.types,
-          count: s.count,
-          note:  s.note ?? null,
+          tier:       s.tier,
+          types:      s.types,
+          count:      s.count,
+          note:       s.note ?? null,
+          ref_fields: s.ref_fields ?? [],
         })),
         warnings: analysis.warnings,
       });
