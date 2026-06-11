@@ -743,6 +743,123 @@ server.tool(
 );
 
 // ══════════════════════════════════════════════════════════════════════════
+// TOOL: verify_migration_counts
+// ══════════════════════════════════════════════════════════════════════════
+server.tool(
+  'verify_migration_counts',
+  `Verify that record counts match across all three layers of a migration:
+     Source (Jira / Salesforce)  →  Staging table  →  Target table
+
+   Checks:
+     - How many records exist in the source
+     - How many rows landed in the staging table
+     - How many records were created in the target table
+     - Whether staging count matches source (no records lost in transit)
+     - Whether target count matches staging (no records lost in transform)
+     - Whether there are MORE records in staging or target than in source (duplicates)
+
+   Use this after a full migration to confirm data integrity.
+   Also useful after a test migration to see how many records were actually moved.`,
+  {
+    platform:      z.enum(['salesforce', 'jira']),
+    object_name:   z.string().describe('Comma-separated Jira project keys or Salesforce object name (e.g. "EMAL,KAN" or "Account")'),
+    staging_table: z.string().describe('Staging table name (e.g. u_stg_jira_kan)'),
+    target_table:  z.string().describe('ServiceNow target table (e.g. incident, problem, change_request)'),
+    project_field: z.string().optional().describe('Staging/target field that holds the project key for scoped queries (e.g. u_jira_project). Leave blank to count all rows.'),
+    filter:        z.string().optional().describe('Optional JQL (Jira) or SOQL WHERE clause (Salesforce) to scope the source count'),
+  },
+  async ({ platform, object_name, staging_table, target_table, project_field, filter }) => {
+    try {
+      const sn      = await getSn();
+      const keys    = object_name.split(',').map(k => k.trim());
+      const results = [];
+
+      for (const key of keys) {
+        // ── Source count ──────────────────────────────────────────────────
+        let sourceCount = 0;
+        if (platform === 'jira') {
+          const jira  = await getJira();
+          const jql   = filter ? `project=${key} AND ${filter}` : `project=${key}`;
+          const res   = await jira.search({ jql, maxResults: 0 });
+          sourceCount = res.total ?? 0;
+        } else {
+          const sf     = await getSf();
+          const where  = filter ? ` WHERE ${filter}` : '';
+          const res    = await sf.query(`SELECT COUNT() FROM ${key}${where}`);
+          sourceCount  = res.totalSize ?? 0;
+        }
+
+        // ── Staging count ─────────────────────────────────────────────────
+        const stagingQuery = project_field ? `${project_field}=${key}` : '';
+        const stagingCount = await sn.getCount(staging_table, stagingQuery).catch(() => null);
+
+        // ── Target count ──────────────────────────────────────────────────
+        const targetQuery = project_field ? `${project_field}=${key}` : '';
+        const targetCount = await sn.getCount(target_table, targetQuery).catch(() => null);
+
+        // ── Evaluate ──────────────────────────────────────────────────────
+        const stagingOk = stagingCount != null && stagingCount === sourceCount;
+        const targetOk  = targetCount  != null && targetCount  === sourceCount;
+        const stagingExtra = stagingCount != null && stagingCount > sourceCount;
+        const targetExtra  = targetCount  != null && targetCount  > sourceCount;
+
+        let status;
+        if (stagingOk && targetOk)      status = 'PASS';
+        else if (stagingExtra || targetExtra) status = 'DUPLICATES DETECTED';
+        else                            status = 'MISMATCH';
+
+        results.push({
+          key,
+          source_count:  sourceCount,
+          staging_count: stagingCount,
+          target_count:  targetCount,
+          staging_match: stagingOk,
+          target_match:  targetOk,
+          staging_extra: stagingExtra,
+          target_extra:  targetExtra,
+          status,
+          issues: [
+            !stagingOk && !stagingExtra && stagingCount != null
+              ? `${sourceCount - stagingCount} record(s) missing from staging (lost between source and staging)`
+              : null,
+            stagingExtra
+              ? `${stagingCount - sourceCount} extra record(s) in staging — possible duplicate push`
+              : null,
+            !targetOk && !targetExtra && targetCount != null
+              ? `${(stagingCount ?? sourceCount) - targetCount} record(s) missing from target (transform may have failed for some)`
+              : null,
+            targetExtra
+              ? `${targetCount - sourceCount} extra record(s) in target — possible duplicate migration run`
+              : null,
+          ].filter(Boolean),
+        });
+      }
+
+      const allPass = results.every(r => r.status === 'PASS');
+
+      return ok({
+        instructions_for_claude: allPass
+          ? [
+              `Tell the user: "Record counts match perfectly across all layers — the migration is verified."`,
+              `Show the summary table with source / staging / target counts for each project.`,
+            ]
+          : [
+              `Show the count comparison table for each project.`,
+              `For any MISMATCH, explain in plain English what went wrong (e.g. "5 records made it to staging but only 3 reached the incident table — the transform failed for 2 records").`,
+              `For DUPLICATES DETECTED, warn the user that the migration may have been run more than once and suggest running cleanup_migration before re-running.`,
+              `If all counts match, confirm the migration is complete and accurate.`,
+            ],
+        overall_status: allPass ? 'PASS' : 'NEEDS REVIEW',
+        results,
+        summary: results.map(r =>
+          `${r.key}: source=${r.source_count} | staging=${r.staging_count ?? 'n/a'} | target=${r.target_count ?? 'n/a'} → ${r.status}`
+        ),
+      });
+    } catch (e) { return fail(e.message); }
+  }
+);
+
+// ══════════════════════════════════════════════════════════════════════════
 // TOOL: list_sf_flows  (Phase F2)
 // ══════════════════════════════════════════════════════════════════════════
 server.tool(

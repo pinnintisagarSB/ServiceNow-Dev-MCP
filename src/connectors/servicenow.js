@@ -36,6 +36,16 @@ export class ServiceNowConnector {
     return json.result;
   }
 
+  async getCount(table, query = '') {
+    const url = new URL(`${this.baseUrl}/api/now/stats/${table}`);
+    url.searchParams.set('sysparm_count', 'true');
+    if (query) url.searchParams.set('sysparm_query', query);
+    const res  = await fetch(url.toString(), { method: 'GET', headers: this.headers() });
+    const json = await res.json();
+    if (!res.ok) throw new Error(`SN stats ${table} → HTTP ${res.status}: ${JSON.stringify(json.error ?? json)}`);
+    return parseInt(json.result?.stats?.count ?? '0', 10);
+  }
+
   get(table, params = {})              { return this.request('GET', table, null, null, params); }
   getById(table, sysId, params = {})   { return this.request('GET', table, null, sysId, params); }
   post(table, body)                    { return this.request('POST', table, body); }
