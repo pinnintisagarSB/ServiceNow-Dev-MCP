@@ -45,13 +45,16 @@ All credentials are in `.env`. **Never ask the user for credentials, passwords, 
 |------|------|------|
 | 1 | `get_config` | Always first — reads .env, no questions needed |
 | 2 | `connect` | Verify platforms are reachable |
-| 3 | `check_migration_state` | Before setup — skip what already exists |
-| 4 | `analyze_dependencies` | Before build — check record order and references |
-| 5 | `discover_schema` | Show source + target fields, suggest mappings |
-| 6 | `build_artifacts` | Create SN staging table, transform map, field maps |
-| 7 | `run_test_migration` | Push sample records, get data quality report |
-| 8 | `run_full_migration` | Migrate all records after user approval |
-| 9 | `verify_migration_counts` | Confirm counts match across all layers |
+| 3 | `list_update_sets` | Check for existing update sets |
+| 4 | `create_update_set` | **Ask user for a name**, then create — captures all SN config changes |
+| 5 | `check_migration_state` | Before setup — skip what already exists |
+| 6 | `analyze_dependencies` | Before build — check record order and references |
+| 7 | `discover_schema` | Show source + target fields, suggest mappings |
+| 8 | `build_artifacts` | Create SN staging table, transform map, field maps |
+| 9 | `complete_update_set` | Mark update set complete after build_artifacts |
+| 10 | `run_test_migration` | Push sample records, get data quality report |
+| 11 | `run_full_migration` | Migrate all records after user approval |
+| 12 | `verify_migration_counts` | Confirm counts match across all layers |
 | — | `cleanup_migration` | Delete migrated records (with confirmation) |
 | — | `cleanup_artifacts` | Delete SN setup artifacts (with confirmation) |
 

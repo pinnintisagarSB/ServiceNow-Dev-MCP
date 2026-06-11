@@ -175,6 +175,46 @@ export class ServiceNowConnector {
     });
   }
 
+  // ── Update Sets ───────────────────────────────────────────────────────────
+  async createUpdateSet(name, description = '') {
+    return this.post('sys_update_set', {
+      name,
+      description,
+      state:       'in progress',
+      is_default:  'false',
+    });
+  }
+
+  async setCurrentUpdateSet(sysId) {
+    // Set via user preference so all subsequent changes land in this update set
+    const existing = await this.get('sys_user_preference', {
+      sysparm_query:  'name=sys_update_set',
+      sysparm_fields: 'sys_id',
+      sysparm_limit:  '1',
+    });
+    if (existing.length) {
+      return this.patch('sys_user_preference', existing[0].sys_id, { value: sysId });
+    }
+    return this.post('sys_user_preference', { name: 'sys_update_set', value: sysId });
+  }
+
+  async getUpdateSet(sysId) {
+    return this.getById('sys_update_set', sysId, { sysparm_display_value: 'true' });
+  }
+
+  async listUpdateSets() {
+    return this.get('sys_update_set', {
+      sysparm_query:  'state=in progress^ORstate=build',
+      sysparm_fields: 'sys_id,name,state,description,sys_created_on,sys_created_by',
+      sysparm_limit:  '20',
+      sysparm_display_value: 'true',
+    });
+  }
+
+  async completeUpdateSet(sysId) {
+    return this.patch('sys_update_set', sysId, { state: 'complete' });
+  }
+
   // ── Existence checks (idempotency) ────────────────────────────────────────
   async findStagingTable(name) {
     const rows = await this.get('sys_db_object', {

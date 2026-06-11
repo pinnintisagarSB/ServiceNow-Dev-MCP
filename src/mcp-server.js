@@ -101,6 +101,128 @@ server.tool(
 );
 
 // ══════════════════════════════════════════════════════════════════════════
+// TOOL: create_update_set
+// ══════════════════════════════════════════════════════════════════════════
+server.tool(
+  'create_update_set',
+  `Create a ServiceNow Update Set before starting any migration setup.
+   An Update Set captures all configuration changes (staging tables, transform maps,
+   field maps, scripts, etc.) into a named package that can be reviewed, exported,
+   and deployed to other ServiceNow instances (e.g. from dev → test → production).
+
+   IMPORTANT: Always ask the user for a name before calling this tool.
+   A good name includes the source platform, project/object, and date — e.g.:
+     "Jira KAN Migration - June 2026"
+     "Salesforce Account Migration - v1"
+
+   Call this after connect() and before build_artifacts() so all artifacts
+   created during setup are captured in the update set.
+
+   Also use list_update_sets to show existing in-progress update sets in case
+   the user wants to reuse one instead of creating a new one.`,
+  {
+    name:        z.string().describe('Name for the update set — ask the user for this before calling'),
+    description: z.string().optional().describe('Optional description of what this update set contains'),
+  },
+  async ({ name, description }) => {
+    try {
+      const sn = await getSn();
+
+      // Create the update set
+      const updateSet = await sn.createUpdateSet(name, description ?? `Migration setup: ${name}`);
+
+      // Set as current so all subsequent changes land here
+      await sn.setCurrentUpdateSet(updateSet.sys_id).catch(() => null); // non-fatal if preference API blocked
+
+      const url = `${sn.baseUrl}/nav_to.do?uri=sys_update_set.do?sys_id=${updateSet.sys_id}`;
+
+      return ok({
+        instructions_for_claude: [
+          `Tell the user: "I've created an Update Set called '${name}' in ServiceNow. All the migration configuration changes (staging tables, transform maps, field maps, etc.) will be captured in this update set."`,
+          `Share the update set URL so they can view it: ${url}`,
+          `Explain: "Once the migration setup is complete, you can export this update set and deploy it to other ServiceNow instances (like test or production) without having to redo the setup manually."`,
+          `Proceed to check_migration_state or build_artifacts next.`,
+        ],
+        update_set: {
+          sys_id:      updateSet.sys_id,
+          name:        updateSet.name ?? name,
+          state:       'in progress',
+          url,
+        },
+      });
+    } catch (e) { return fail(e.message); }
+  }
+);
+
+// ══════════════════════════════════════════════════════════════════════════
+// TOOL: list_update_sets
+// ══════════════════════════════════════════════════════════════════════════
+server.tool(
+  'list_update_sets',
+  `List all in-progress Update Sets in ServiceNow.
+   Use this before creating a new one — the user may want to reuse an existing update set
+   instead of creating a new one, especially if they are continuing a previous migration session.`,
+  {},
+  async () => {
+    try {
+      const sn   = await getSn();
+      const sets = await sn.listUpdateSets();
+      return ok({
+        instructions_for_claude: sets.length
+          ? [
+              'Show the list of existing in-progress update sets to the user.',
+              'Ask: "Would you like to use one of these existing update sets, or create a new one? If you want a new one, what should it be called?"',
+            ]
+          : [
+              'Tell the user no in-progress update sets were found.',
+              'Ask: "What would you like to name the update set for this migration? A good name includes the source, object/project, and date — for example: \'Jira KAN Migration - June 2026\'."',
+              'Then call create_update_set with the name they give.',
+            ],
+        count:       sets.length,
+        update_sets: sets.map(s => ({
+          sys_id:      s.sys_id,
+          name:        s.name,
+          state:       s.state,
+          created_on:  s.sys_created_on,
+          created_by:  s.sys_created_by,
+          description: s.description,
+        })),
+      });
+    } catch (e) { return fail(e.message); }
+  }
+);
+
+// ══════════════════════════════════════════════════════════════════════════
+// TOOL: complete_update_set
+// ══════════════════════════════════════════════════════════════════════════
+server.tool(
+  'complete_update_set',
+  `Mark a ServiceNow Update Set as complete when migration setup is finished.
+   A completed update set can be exported as an XML file and deployed to other
+   ServiceNow instances (test, UAT, production) via System Update Sets → Retrieved Update Sets.
+   Call this after build_artifacts is done and the user has verified everything looks correct.`,
+  {
+    update_set_sys_id: z.string().describe('sys_id of the update set to complete'),
+  },
+  async ({ update_set_sys_id }) => {
+    try {
+      const sn  = await getSn();
+      await sn.completeUpdateSet(update_set_sys_id);
+      const url = `${sn.baseUrl}/nav_to.do?uri=sys_update_set.do?sys_id=${update_set_sys_id}`;
+      return ok({
+        instructions_for_claude: [
+          'Tell the user: "The Update Set has been marked as complete. It\'s ready to be exported and deployed to other ServiceNow instances."',
+          `Share the update set URL: ${url}`,
+          'Explain next steps: "To deploy to another instance: go to System Update Sets → Retrieved Update Sets → Import Update Set from XML. Select the exported file and click Preview, then Commit."',
+        ],
+        status: 'complete',
+        url,
+      });
+    } catch (e) { return fail(e.message); }
+  }
+);
+
+// ══════════════════════════════════════════════════════════════════════════
 // TOOL: check_migration_state  (run before build_artifacts on any revisit)
 // ══════════════════════════════════════════════════════════════════════════
 server.tool(
