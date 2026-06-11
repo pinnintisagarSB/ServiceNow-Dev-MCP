@@ -371,7 +371,22 @@ export class ServiceNowConnector {
     const internal = name.toLowerCase().replace(/[^a-z0-9]/g, '_');
     const body = { name, description, run_as: 'user', active: 'false', internal_name: internal };
     if (appScopeId) body.sys_scope = appScopeId;
-    return this.post('sys_hub_flow', body);
+
+    const record = await this.post('sys_hub_flow', body);
+
+    // sys_hub_flow sometimes returns a partial record without sys_id — fetch it explicitly
+    if (!record?.sys_id) {
+      logger.warn('createFlow: POST response missing sys_id — querying by internal_name');
+      const rows = await this.get('sys_hub_flow', {
+        sysparm_query:  `internal_name=${internal}`,
+        sysparm_fields: 'sys_id,name,internal_name',
+        sysparm_limit:  '1',
+      });
+      if (!rows[0]?.sys_id) throw new Error(`Flow "${name}" was created but sys_id could not be resolved (internal_name=${internal})`);
+      return rows[0];
+    }
+
+    return record;
   }
 
   async createFlowVariable(flowSysId, varName, varType, isInput = false, isOutput = false) {

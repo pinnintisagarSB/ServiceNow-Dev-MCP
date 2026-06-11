@@ -32,8 +32,8 @@ export class FlowBuilder {
     logger.step('F5.1 Creating flow record...');
     const flowName   = flowScope ? `${flowScope}_${flowStructure.apiName}` : flowStructure.apiName;
     const flowRecord = await this.sn.createFlow(flowName, flowStructure.label ?? flowStructure.apiName, appScopeId);
-    const flowSysId  = flowRecord.sys_id ?? flowRecord.id ?? flowRecord.name;
-    if (!flowSysId) throw new Error(`Flow record created but no sys_id returned: ${JSON.stringify(flowRecord)}`);
+    const flowSysId  = flowRecord?.sys_id ?? flowRecord?.id;
+    if (!flowSysId) throw new Error(`Flow record created but sys_id is missing. Raw response: ${JSON.stringify(flowRecord)}`);
     results.flow = { name: flowName, sys_id: flowSysId };
     logger.success(`Flow record: ${flowName} (${flowSysId})`);
 
@@ -116,7 +116,7 @@ export class FlowBuilder {
       recordUpdate: 'update_record',
       recordDelete: 'delete_record',
       recordLookup: 'lookup_record',
-      action:       'script',
+      action:       'notification',
       subflow:      'subflow',
     };
     return map[kind] ?? 'script';
