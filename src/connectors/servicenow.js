@@ -111,6 +111,47 @@ export class ServiceNowConnector {
   }
 
   // ── Schema discovery ───────────────────────────────────────────────────────
+
+  // Returns a list of candidate SN tables ranked by label/name similarity to the hint.
+  // Searches across all non-system, non-staging tables — fully live, nothing hardcoded.
+  async suggestTargetTable(hint) {
+    const norm = s => (s ?? '').toLowerCase().replace(/[_\-]/g, ' ').replace(/\s+/g, ' ').trim();
+    const hintNorm  = norm(hint);
+    const hintWords = new Set(hintNorm.split(' ').filter(w => w.length > 2));
+
+    // Pull tables that are visible (non sys_ internal, non staging) — limit 500
+    const tables = await this.get('sys_db_object', {
+      sysparm_query: 'super_class.name!=sys_import_set_row^nameNOT LIKEsys_^nameNOT LIKEx_snc^is_extendable=true^ORis_extendable=false',
+      sysparm_fields: 'name,label',
+      sysparm_limit: '500',
+    });
+
+    const scored = tables.map(t => {
+      const nameNorm  = norm(t.name);
+      const labelNorm = norm(t.label ?? t.name);
+      let score = 0;
+
+      if (nameNorm  === hintNorm || labelNorm === hintNorm) score = 100;
+      else if (nameNorm.includes(hintNorm) || labelNorm.includes(hintNorm)) score = 80;
+      else if (hintNorm.includes(nameNorm) && nameNorm.length > 3) score = 75;
+      else {
+        const labelWords = new Set(labelNorm.split(' ').filter(w => w.length > 2));
+        const nameWords  = new Set(nameNorm.split('_').filter(w => w.length > 2));
+        const overlap = [...hintWords].filter(w => labelWords.has(w) || nameWords.has(w)).length;
+        score = overlap > 0
+          ? Math.round((overlap / Math.max(hintWords.size, Math.max(labelWords.size, 1))) * 60)
+          : 0;
+      }
+
+      return { table: t.name, label: t.label, score };
+    });
+
+    return scored
+      .filter(t => t.score > 0)
+      .sort((a, b) => b.score - a.score)
+      .slice(0, 10);
+  }
+
   async getTableSchema(tableName) {
     return this.get('sys_dictionary', {
       sysparm_query: `name=${tableName}^active=true^internal_type!=collection`,

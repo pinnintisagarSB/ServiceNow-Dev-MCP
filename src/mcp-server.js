@@ -232,7 +232,7 @@ server.tool(
    Returns a gap analysis: what exists, what's missing, and what needs to be added.
    Works for ANY source platform and ANY ServiceNow target table.`,
   {
-    platform:      z.enum(['salesforce', 'jira']).describe('Source platform'),
+    platform:      z.string().describe('Source platform (salesforce, jira, or any registered connector)'),
     object_name:   z.string().describe('Source object / project key (e.g. KAN, Account, Case)'),
     sn_table:      z.string().describe('ServiceNow target table (e.g. incident, problem, change_request, cmdb_ci)'),
     staging_table: z.string().optional().describe('Override staging table name — auto-derived if omitted'),
@@ -328,68 +328,127 @@ server.tool(
 );
 
 // ══════════════════════════════════════════════════════════════════════════
+// TOOL: suggest_target_table  (Phase 1.5 — before discover_schema)
+// ══════════════════════════════════════════════════════════════════════════
+server.tool(
+  'suggest_target_table',
+  `Call this BEFORE discover_schema when the user has not told you which ServiceNow table to migrate into.
+   It queries the live SN instance for all tables and ranks them by similarity to the source object name.
+   Returns a ranked list of suggestions + a custom-table fallback.
+   Present the top suggestion(s) to the user and ask them to confirm or choose a different one.
+   NEVER guess or hardcode a table name — always call this first if the target is unknown.`,
+  {
+    platform:    z.string().describe('Source platform (e.g. salesforce, jira, hubspot, azure_devops — any string)'),
+    object_name: z.string().describe('Source object name (e.g. Case, Account, KAN project, Ticket)'),
+  },
+  async ({ platform, object_name }) => {
+    try {
+      const sn        = await getSn();
+      const discovery = new SchemaDiscovery(sn);
+      const result    = await discovery.suggestTargetTable(object_name);
+
+      return ok({
+        instructions_for_claude: [
+          result.suggested_table
+            ? `Present this to the user: "Based on your ${platform} ${object_name} object, I suggest migrating into the ServiceNow '${result.suggested_table}' table (${result.suggested_label ?? result.suggested_table}). Confidence: ${result.confidence}."`
+            : `Tell the user: "I couldn't find a close match in ServiceNow. I suggest creating a custom table named '${result.custom_table_hint}'.`,
+          result.alternatives?.length
+            ? `Also show the alternatives: ${result.alternatives.map(a => `${a.table} (${a.label})`).join(', ')}.`
+            : null,
+          `Always ask: "Would you like to use ${result.suggested_table ?? result.custom_table_hint}, or a different table?" before calling discover_schema.`,
+          `If the user says "custom" or no match fits, suggest '${result.custom_table_hint}' as the new table name.`,
+        ].filter(Boolean),
+        ...result,
+      });
+    } catch (e) { return fail(e.message); }
+  }
+);
+
+// ══════════════════════════════════════════════════════════════════════════
 // TOOL: discover_schema  (Phase 2 → Checkpoint 1)
 // ══════════════════════════════════════════════════════════════════════════
 server.tool(
   'discover_schema',
-  `Phase 2: Discover and display source (Salesforce/Jira) and ServiceNow target schemas side by side.
-   Returns full field lists + auto-suggested staging table definition + field mapping proposals.
-   After calling this, STOP and present the schemas to the user for Checkpoint 1 review.
-   Ask: (1) Are all needed source fields present? (2) Any fields to exclude? (3) Any corrections?
-   Only call build_artifacts after the user explicitly approves.
+  `Phase 2: Discover ALL source fields and ServiceNow target fields side by side.
+   Returns complete field lists (every source field is included — none are skipped),
+   auto-suggested staging table definition, and field mapping proposals.
+
+   WORKFLOW:
+   - If sn_table is not known yet, call suggest_target_table first and confirm with the user.
+   - After calling this, STOP and present all fields + mappings to the user for Checkpoint 1 review.
+   - For UNMAPPED fields (sn_target=null): highlight them and ask the user to either map them
+     to an existing SN field or confirm they should land only in staging.
+   - Show the upsert key (coalesce) fields so the user understands duplicate prevention.
+   - Ask: (1) Are all source fields present? (2) Any mapping corrections? (3) Approve to continue?
+   - Only call build_artifacts after explicit user approval.
 
    IMPORTANT — target table changes:
-   If the user changes the sn_table AFTER this has already been called (e.g. "use problem instead of incident"),
-   call discover_schema AGAIN from scratch with the new sn_table. Do NOT reuse the previous mappings — the
-   target fields will be completely different. Discard any prior suggested_mappings and staging_definition.`,
+   If the user changes the sn_table AFTER this has been called, call discover_schema AGAIN from scratch.
+   Discard all prior suggested_mappings — target fields will be completely different.
+
+   GENERIC: platform can be any string — salesforce, jira, or any registered custom connector.`,
   {
-    platform:    z.enum(['salesforce', 'jira']).describe('Source platform'),
-    object_name: z.string().describe('Salesforce object (e.g. Account, Contact, Case) or Jira project key (e.g. KAN, EMAL)'),
-    sn_table:    z.string().describe('ServiceNow target table — any table the user wants (e.g. incident, problem, change_request, cmdb_ci, hr_case, sc_request, core_company)'),
+    platform:    z.string().describe('Source platform — salesforce, jira, or any registered connector'),
+    object_name: z.string().describe('Source object name (Salesforce: Account/Case/..., Jira: project key, etc.)'),
+    sn_table:    z.string().describe('ServiceNow target table confirmed by the user (from suggest_target_table or explicit)'),
   },
   async ({ platform, object_name, sn_table }) => {
     try {
       const sn        = await getSn();
       const discovery = new SchemaDiscovery(sn);
-      let sourceFields;
 
-      if (platform === 'salesforce') {
-        sourceFields = await discovery.discoverSalesforceSchema(await getSf(), object_name);
-      } else {
-        sourceFields = await discovery.discoverJiraSchema(await getJira(), object_name);
-      }
+      // Connector dispatch — generic, works for any platform
+      let connector;
+      if (platform === 'salesforce') connector = await getSf();
+      else if (platform === 'jira')  connector = await getJira();
+      // else: custom connector must have been registered via SchemaDiscovery.registerConnector()
 
-      const snFields   = await discovery.discoverSnSchema(sn_table);
-      const stagingDef = discovery.buildStagingDefinition(platform, object_name, sourceFields);
-      const mappings   = discovery.suggestMappings(sourceFields, snFields);
+      const sourceFields = await discovery.discoverSourceSchema(platform, connector, object_name);
+      const snFields     = await discovery.discoverSnSchema(sn_table);
+      const stagingDef   = discovery.buildStagingDefinition(platform, object_name, sourceFields);
+      const mappings     = discovery.suggestMappings(sourceFields, snFields, { platform, objectName: object_name });
 
-      const unmapped    = mappings.filter(m => !m.sn_target).length;
-      const autoMapped  = mappings.filter(m => m.auto_matched).length;
+      const unmapped       = mappings.filter(m => !m.sn_target && !m.synthetic);
+      const autoMapped     = mappings.filter(m => m.auto_matched);
       const coalesceFields = mappings.filter(m => m.coalesce);
+      const scripted       = mappings.filter(m => m.needs_script);
 
       return ok({
         checkpoint: 1,
         instructions_for_claude: [
-          'Present the source_fields and sn_fields tables to the user side by side.',
-          'Show the suggested_mappings — highlight unmapped fields and the coalesce (upsert key) fields.',
+          `All ${sourceFields.length} source fields are included in suggested_mappings — none are skipped.`,
+          'Present a table: source field | source type | → | SN target field | approach (direct/script/reference/unmapped).',
+          unmapped.length
+            ? `UNMAPPED fields (${unmapped.length}): ${unmapped.map(f => `'${f.source_field}'`).join(', ')}. ` +
+              `For each, ask the user: map to an existing SN field, add a custom field to the target table, or keep only in staging?`
+            : 'All fields were auto-mapped to ServiceNow target fields.',
           coalesceFields.length
-            ? `Tell the user: "I've set ${coalesceFields.map(f => `'${f.staging_field}'`).join(', ')} as the upsert key(s). This means if the migration runs more than once, existing records will be updated instead of duplicated."`
-            : 'Warn the user that no upsert key was found — ask them which field should be used to prevent duplicate records on re-run.',
-          'Ask the user: (1) Are all needed source fields present? (2) Any fields to exclude? (3) Any mapping corrections?',
-          `If the user changes the target table (e.g. "use problem instead of ${sn_table}"), call discover_schema AGAIN with the new table. Discard these mappings entirely — do not try to adapt them.`,
-          'Wait for explicit "Approved" before calling build_artifacts.',
-        ],
+            ? `Upsert keys: ${coalesceFields.map(f => `'${f.source_field}' → '${f.sn_target}'`).join(', ')}. Tell the user these prevent duplicate records on re-run.`
+            : 'WARNING: No upsert key detected — ask the user which field should prevent duplicate records on re-run.',
+          scripted.length
+            ? `${scripted.length} fields will use value-mapping scripts (built from live schema values): ${scripted.map(f => f.source_field).slice(0, 5).join(', ')}${scripted.length > 5 ? '...' : ''}.`
+            : null,
+          'Ask: "Are the mappings correct? Any changes before I build the ServiceNow artifacts?"',
+          `If the user changes the target table (e.g. "use problem instead of ${sn_table}"), call discover_schema AGAIN from scratch.`,
+          'Wait for explicit approval before calling build_artifacts.',
+        ].filter(Boolean),
         summary: {
           source_fields_count:   sourceFields.length,
           sn_fields_count:       snFields.length,
-          auto_mapped_count:     autoMapped,
-          unmapped_count:        unmapped,
+          auto_mapped_count:     autoMapped.length,
+          unmapped_count:        unmapped.length,
+          scripted_count:        scripted.length,
           staging_table:         stagingDef.tableName,
           coalesce_fields:       coalesceFields.map(f => ({
-            staging_field: f.staging_field,
-            source_field:  f.source_field,
-            sn_target:     f.sn_target,
-            reason:        f.coalesce_reason,
+            source_field: f.source_field,
+            sn_target:    f.sn_target,
+            reason:       f.coalesce_reason,
+          })),
+          unmapped_fields:       unmapped.map(f => ({
+            source_field:   f.source_field,
+            source_label:   f.source_label,
+            staging_column: f.staging_field,
+            reason:         f.unmapped_reason,
           })),
         },
         source_fields:        sourceFields,
@@ -411,7 +470,7 @@ server.tool(
    Only call this after Checkpoint 1 (schema) AND Checkpoint 2 (mappings) are both approved by the user.
    After this completes, show the artifact summary and ask the user to verify in ServiceNow (Checkpoint 3).`,
   {
-    platform:    z.enum(['salesforce', 'jira']),
+    platform:    z.string().describe('Source platform (salesforce, jira, or any registered connector)'),
     object_name: z.string(),
     sn_table:    z.string(),
     mappings: z.array(z.object({
@@ -483,7 +542,7 @@ server.tool(
    Only call this after build_artifacts. Only call run_full_migration after the user
    reviews this report and explicitly says "Approved".`,
   {
-    platform:      z.enum(['salesforce', 'jira']),
+    platform:      z.string().describe('Source platform (salesforce, jira, or any registered connector)'),
     object_name:   z.string().describe('Salesforce object name or Jira project key'),
     staging_table: z.string(),
     target_table:  z.string().describe('ServiceNow target table (e.g. incident, problem, change_request — whatever the user chose)'),
@@ -606,7 +665,7 @@ server.tool(
    Always call this after discover_schema and before build_artifacts.
    If users are missing, ask the user whether to auto-create them in SN.`,
   {
-    platform:          z.enum(['salesforce', 'jira']),
+    platform:          z.string().describe('Source platform (salesforce, jira, or any registered connector)'),
     project_keys:      z.array(z.string()).describe('Jira project keys or Salesforce object names to analyse (e.g. ["EMAL","KAN"] or ["Account","Contact","Case"])'),
     auto_create_users: z.boolean().default(false).describe('Create missing SN users automatically'),
   },
@@ -714,7 +773,7 @@ server.tool(
    Only call after explicit user approval at Checkpoint 4.
    Stops immediately on any error and reports what happened.`,
   {
-    platform:      z.enum(['salesforce', 'jira']),
+    platform:      z.string().describe('Source platform (salesforce, jira, or any registered connector)'),
     object_name:   z.string().describe('Salesforce object or comma-separated Jira project keys (e.g. "EMAL,KAN")'),
     staging_table: z.string(),
     mappings: z.array(z.object({
@@ -893,7 +952,7 @@ server.tool(
    IMPORTANT: Always discover first (confirmed=false) to show the user exactly what will be deleted.
    Only delete after they explicitly confirm with "Yes, delete them" or similar.`,
   {
-    platform:      z.enum(['salesforce', 'jira']).describe('Source platform used during setup'),
+    platform:      z.string().describe('Source platform used during setup'),
     object_name:   z.string().describe('Source object / project key used during setup (e.g. KAN, Account)'),
     staging_table: z.string().describe('Staging table name (e.g. u_stg_jira_kan)'),
     target_table:  z.string().describe('ServiceNow target table (e.g. incident, problem, change_request)'),
@@ -984,7 +1043,7 @@ server.tool(
    Use this after a full migration to confirm data integrity.
    Also useful after a test migration to see how many records were actually moved.`,
   {
-    platform:      z.enum(['salesforce', 'jira']),
+    platform:      z.string().describe('Source platform (salesforce, jira, or any registered connector)'),
     object_name:   z.string().describe('Comma-separated Jira project keys or Salesforce object name (e.g. "EMAL,KAN" or "Account")'),
     staging_table: z.string().describe('Staging table name (e.g. u_stg_jira_kan)'),
     target_table:  z.string().describe('ServiceNow target table (e.g. incident, problem, change_request)'),
@@ -1256,7 +1315,7 @@ server.tool(
    Call this after discover_schema and optionally after build_artifacts / run_full_migration.
    Claude should then use the docx skill to produce a .docx file from the returned data.`,
   {
-    platform:       z.enum(['salesforce', 'jira']),
+    platform:       z.string().describe('Source platform (salesforce, jira, or any registered connector)'),
     object_name:    z.string(),
     sn_table:       z.string(),
     mappings:       z.array(z.object({
@@ -1433,7 +1492,7 @@ server.tool(
   `After a migration, compares a sample of source records against the target records (matched by correlation_id)
    and reports any per-field discrepancies. Use to certify data fidelity.`,
   {
-    platform: z.enum(['jira','salesforce']),
+    platform: z.string().describe('Source platform (salesforce, jira, or any registered connector)'),
     source_filter: z.string().describe('Jira JQL or SF SOQL WHERE clause'),
     sn_table: z.string(),
     sample_size: z.number().optional().default(20),
@@ -1514,7 +1573,7 @@ server.tool(
   `Copies attachments from source records to their corresponding ServiceNow target records.
    Matches via correlation_id (jira:<key> or salesforce:<id>).`,
   {
-    platform: z.enum(['jira','salesforce']),
+    platform: z.string().describe('Source platform (salesforce, jira, or any registered connector)'),
     source_ids: z.array(z.string()).describe('Jira issue keys or SF record Ids'),
     sn_table: z.string(),
   },
@@ -1565,7 +1624,7 @@ server.tool(
   `Copies source comments into the ServiceNow target record's comments or work_notes journal.
    Each comment is appended with its original author and timestamp.`,
   {
-    platform: z.enum(['jira','salesforce']),
+    platform: z.string().describe('Source platform (salesforce, jira, or any registered connector)'),
     source_ids: z.array(z.string()),
     sn_table: z.string(),
     journal_field: z.string().optional().default('comments'),
@@ -1608,7 +1667,7 @@ server.tool(
   `Runs a migration of records that have changed since the last delta sync (uses a stored watermark in ServiceNow).
    First run migrates everything and stores the current time as the watermark.`,
   {
-    platform: z.enum(['jira','salesforce']),
+    platform: z.string().describe('Source platform (salesforce, jira, or any registered connector)'),
     object_or_project: z.string(),
     sn_table: z.string(),
     staging_table: z.string(),

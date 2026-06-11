@@ -49,27 +49,14 @@ export class ArtifactBuilder {
   // ── Default inline field map scripts for common field types ──────────────
   // These are sensible starting points; users can customise them after the
   // transform map is created.
+  // _defaultScript is only called when schema.js could not generate a transform_script
+  // (e.g. one side had no picklist values at discovery time).
+  // All value-map scripts for picklist/status/priority are now generated live by schema.js
+  // using real API values — no hardcoded domain maps here.
   _defaultScript(m) {
     const f = m.staging_field;
     const t = m.source_type ?? '';
     const target = m.sn_target ?? '';
-
-    // Jira priority / SF Priority → SN priority integer (1 = Critical … 5 = Lowest)
-    if (t === 'priority' || target === 'priority') {
-      return (
-        `var _p = source.getValue('${f}');\n` +
-        `answer = ({Highest:'1',Critical:'1',High:'2',Medium:'3',Low:'4',Lowest:'5'})[_p] || '3';`
-      );
-    }
-
-    // Jira status → SN state integer
-    if (t === 'status' || target === 'state') {
-      return (
-        `var _s = source.getValue('${f}');\n` +
-        `answer = ({'To Do':'1','Open':'1','Backlog':'1','In Progress':'2','In Review':'2',` +
-        `'Done':'7','Closed':'7','Resolved':'6',"Won't Fix":'8'})[_s] || '1';`
-      );
-    }
 
     // Array / list fields → join to comma-separated string
     if (['array', 'list', 'combobox'].includes(t)) {
@@ -103,16 +90,7 @@ export class ArtifactBuilder {
       );
     }
 
-    // Jira issuetype → SN category
-    if (t === 'issuetype' || target === 'category') {
-      return (
-        `var _i = source.getValue('${f}');\n` +
-        `answer = ({Bug:'software',Task:'request',Story:'request','Sub-task':'request',Epic:'request',Improvement:'enhancement'})[_i] || 'request';`
-      );
-    }
-
-    // Generic picklist / anything else with needs_script — pass value through;
-    // user should review and add a value map if needed
+    // Passthrough — schema.js should have generated a real script; this is a safety net
     return `answer = source.getValue('${f}');`;
   }
 
