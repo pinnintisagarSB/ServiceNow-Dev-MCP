@@ -398,35 +398,45 @@ export class ServiceNowConnector {
     return record;
   }
 
-  // Creates the minimal sys_hub_snapshot + sys_hub_flow_snapshot records that Workflow Studio
-  // needs to render the flow canvas. Called once on flow/subflow creation.
+  // Creates sys_hub_snapshot + chunk + sys_hub_flow_snapshot so Workflow Studio renders the canvas.
+  // Encoding verified from real SN flows: gzip(JSON.stringify(JSON.stringify(canvas))) → base64
   async _bootstrapFlowSnapshot(flowSysId, name, internalName, description, type) {
     const canvas = {
-      id:          flowSysId,
-      parentFlow:  flowSysId,
-      name,
-      internalName,
-      description:  description ?? '',
-      type,
-      status:       'draft',
-      active:       false,
-      runAs:        'system',
-      access:       'package_private',
-      isSnapshot:   true,
-      fIsMasterSnapshot: true,
-      inputs:  [], outputs: [], stages: [], flowVariables: [],
+      id: flowSysId, parentFlow: flowSysId, name, internalName,
+      updatedBy: '', description: description ?? '', type,
+      status: 'draft', active: false, runAs: 'system', access: 'package_private',
+      isSnapshot: true, fIsMasterSnapshot: true, isJsonSnapshot: true, isSavedAsJson: true,
+      engineVersion: 2, flowPriority: 'MEDIUM',
+      inputs: [], outputs: [], stages: [], flowVariables: [],
       triggerInstances: [], actionInstances: [], flowLogicInstances: [],
       subFlowInstances: [], connectionConfigurations: [],
-      updated: [], deleted: [],
+      created: [], updated: [], deleted: [], nonCriticalErrors: [],
+      startingIndexOfErrorHandlingInstances: 0,
     };
 
-    const snapRecord = await this.post('sys_hub_snapshot', {
-      parent:  flowSysId,
-      payload: JSON.stringify(canvas),
-    });
-    const snapSysId = snapRecord?.sys_id;
-    if (!snapSysId) return;
+    // Double-encode + gzip + base64 — the format Workflow Studio uses for chunk storage
+    const compressed = gzipSync(Buffer.from(JSON.stringify(JSON.stringify(canvas)), 'utf8')).toString('base64');
 
+    // Create the sys_hub_snapshot document record
+    const snapDoc = await this.post('sys_hub_snapshot', { parent: flowSysId });
+    const snapDocId = snapDoc?.sys_id;
+    if (!snapDocId) return;
+
+    // Store the compressed canvas as a chunk
+    await this.post('sys_hub_snapshot_chunk', {
+      document_id: snapDocId,
+      field:    'payload',
+      position: '0',
+      length:   String(compressed.length),
+      data:     compressed,
+    });
+
+    // Point the snapshot record's payload field at its own chunk (SN self-referential pattern)
+    await this.patch('sys_hub_snapshot', snapDocId, {
+      payload: JSON.stringify({ table: 'sys_hub_snapshot', id: snapDocId, name: 'payload', type: 'java.lang.String' }),
+    });
+
+    // Create sys_hub_flow_snapshot (flow-level metadata snapshot)
     const flowSnapRecord = await this.post('sys_hub_flow_snapshot', {
       parent_flow:   flowSysId,
       name,
@@ -440,13 +450,13 @@ export class ServiceNowConnector {
       flow_priority: 'MEDIUM',
       version:       '1',
     });
-    const flowSnapSysId = flowSnapRecord?.sys_id ?? snapSysId;
+    const flowSnapSysId = flowSnapRecord?.sys_id ?? snapDocId;
 
     await this.patch('sys_hub_flow', flowSysId, {
       latest_snapshot: flowSnapSysId,
       master_snapshot: flowSnapSysId,
     });
-    logger.info(`Flow snapshot bootstrapped: ${flowSnapSysId}`);
+    logger.info(`Flow snapshot bootstrapped: ${flowSnapSysId} (chunk doc: ${snapDocId})`);
   }
 
   async createFlowVariable(flowSysId, varName, varType, isInput = false, isOutput = false) {
