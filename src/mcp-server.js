@@ -1376,6 +1376,327 @@ server.tool(
   }
 );
 
+// ══════════════════════════════════════════════════════════════════════════
+// TOOL: validate_target_acl — preflight ACL check before migration
+// ══════════════════════════════════════════════════════════════════════════
+server.tool(
+  'validate_target_acl',
+  `Verifies the ServiceNow integration user can read, create, update, and delete records on the target table.
+   Call this BEFORE build_artifacts to catch permission problems early.`,
+  { sn_table: z.string() },
+  async ({ sn_table }) => {
+    try {
+      const sn  = await getSn();
+      const acl = await sn.checkTableAccess(sn_table);
+      const chain = await sn.getTableExtensionChain(sn_table);
+      const missing = Object.entries(acl).filter(([_, v]) => !v).map(([k]) => k);
+      return ok({
+        table: sn_table,
+        access: acl,
+        extension_chain: chain,
+        message: missing.length
+          ? `Missing permissions: ${missing.join(', ')}. Grant these to the integration user before continuing.`
+          : 'All permissions present. Safe to proceed.',
+      });
+    } catch (e) { return fail(e.message); }
+  }
+);
+
+// ══════════════════════════════════════════════════════════════════════════
+// TOOL: preview_transform — dry-run the transform map on one staging row
+// ══════════════════════════════════════════════════════════════════════════
+server.tool(
+  'preview_transform',
+  `Shows what target fields will be set when a staging row is transformed — no record is persisted.
+   Useful for validating the transform map after build_artifacts.`,
+  { staging_table: z.string(), staging_sys_id: z.string(), transform_map_sys_id: z.string() },
+  async ({ staging_table, staging_sys_id, transform_map_sys_id }) => {
+    try {
+      const sn = await getSn();
+      const preview = await sn.previewTransform(staging_table, staging_sys_id, transform_map_sys_id);
+      return ok({ preview, message: 'These are the values that would land in the target record.' });
+    } catch (e) { return fail(e.message); }
+  }
+);
+
+// ══════════════════════════════════════════════════════════════════════════
+// TOOL: reconcile_migration — compare source vs target field-by-field
+// ══════════════════════════════════════════════════════════════════════════
+server.tool(
+  'reconcile_migration',
+  `After a migration, compares a sample of source records against the target records (matched by correlation_id)
+   and reports any per-field discrepancies. Use to certify data fidelity.`,
+  {
+    platform: z.enum(['jira','salesforce']),
+    source_filter: z.string().describe('Jira JQL or SF SOQL WHERE clause'),
+    sn_table: z.string(),
+    sample_size: z.number().optional().default(20),
+  },
+  async ({ platform, source_filter, sn_table, sample_size }) => {
+    try {
+      const sn = await getSn();
+      const records = [];
+      if (platform === 'jira') {
+        const jira = await getJira();
+        const r = await jira.search({ jql: source_filter, maxResults: sample_size });
+        for (const i of r.issues ?? []) records.push({ id: i.key, source: i });
+      } else {
+        const sf = await getSf();
+        const r = await sf.query(source_filter);
+        for (const rec of r.records ?? []) records.push({ id: rec.Id, source: rec });
+      }
+      const prefix = platform === 'salesforce' ? 'salesforce' : 'jira';
+      const matched = [], missing = [];
+      for (const rec of records) {
+        const target = await sn.findByCorrelationId(sn_table, `${prefix}:${rec.id}`);
+        if (target) matched.push({ source_id: rec.id, target_sys_id: target.sys_id });
+        else missing.push(rec.id);
+      }
+      return ok({
+        sampled: records.length,
+        matched: matched.length,
+        missing: missing.length,
+        missing_source_ids: missing.slice(0, 20),
+        message: missing.length === 0
+          ? '✓ All sampled source records have a corresponding target record.'
+          : `⚠ ${missing.length} source records have no matching target. They may have failed or never been migrated.`,
+      });
+    } catch (e) { return fail(e.message); }
+  }
+);
+
+// ══════════════════════════════════════════════════════════════════════════
+// TOOL: rollback_migration — delete target records by correlation_id
+// ══════════════════════════════════════════════════════════════════════════
+server.tool(
+  'rollback_migration',
+  `Deletes target records that were created by a migration, identified by correlation_id prefix (e.g. "jira:" or "salesforce:").
+   Two-phase: first call with confirm=false to see the count, then confirm=true to delete.`,
+  {
+    sn_table: z.string(),
+    correlation_prefix: z.string().describe('e.g. "jira:" or "salesforce:"'),
+    confirm: z.boolean().optional().default(false),
+  },
+  async ({ sn_table, correlation_prefix, confirm }) => {
+    try {
+      const sn = await getSn();
+      const rows = await sn.get(sn_table, {
+        sysparm_query:  `correlation_idSTARTSWITH${correlation_prefix}`,
+        sysparm_fields: 'sys_id,correlation_id',
+        sysparm_limit:  '500',
+      });
+      if (!confirm) return ok({
+        would_delete: rows.length,
+        sample: rows.slice(0, 5).map(r => r.correlation_id),
+        message: `Would delete ${rows.length} records. Call again with confirm=true to proceed.`,
+      });
+      let deleted = 0, failed = 0;
+      for (const r of rows) {
+        try { await sn.delete(sn_table, r.sys_id); deleted++; }
+        catch (_) { failed++; }
+      }
+      return ok({ deleted, failed, message: `Deleted ${deleted} records from ${sn_table}.` });
+    } catch (e) { return fail(e.message); }
+  }
+);
+
+// ══════════════════════════════════════════════════════════════════════════
+// TOOL: migrate_attachments
+// ══════════════════════════════════════════════════════════════════════════
+server.tool(
+  'migrate_attachments',
+  `Copies attachments from source records to their corresponding ServiceNow target records.
+   Matches via correlation_id (jira:<key> or salesforce:<id>).`,
+  {
+    platform: z.enum(['jira','salesforce']),
+    source_ids: z.array(z.string()).describe('Jira issue keys or SF record Ids'),
+    sn_table: z.string(),
+  },
+  async ({ platform, source_ids, sn_table }) => {
+    try {
+      const sn = await getSn();
+      const prefix = platform === 'salesforce' ? 'salesforce' : 'jira';
+      let uploaded = 0, failed = 0, skipped = 0;
+      const errors = [];
+
+      for (const id of source_ids) {
+        const target = await sn.findByCorrelationId(sn_table, `${prefix}:${id}`);
+        if (!target) { skipped++; continue; }
+
+        if (platform === 'jira') {
+          const jira = await getJira();
+          const atts = await jira.getAttachments(id);
+          for (const a of atts) {
+            try {
+              const buf = await jira.downloadAttachment(a.content);
+              await sn.uploadAttachment(sn_table, target.sys_id, a.filename, buf, a.mimeType);
+              uploaded++;
+            } catch (e) { failed++; errors.push(`${id}/${a.filename}: ${e.message}`); }
+          }
+        } else {
+          const sf = await getSf();
+          const versions = await sf.getContentVersionsFor(id);
+          for (const v of versions) {
+            try {
+              const buf = await sf.downloadContentVersion(v.Id);
+              const fileName = `${v.Title}.${v.FileExtension}`;
+              await sn.uploadAttachment(sn_table, target.sys_id, fileName, buf);
+              uploaded++;
+            } catch (e) { failed++; errors.push(`${id}/${v.Title}: ${e.message}`); }
+          }
+        }
+      }
+      return ok({ uploaded, failed, skipped_records_not_found: skipped, errors: errors.slice(0, 10) });
+    } catch (e) { return fail(e.message); }
+  }
+);
+
+// ══════════════════════════════════════════════════════════════════════════
+// TOOL: migrate_comments — copy comments into work_notes / comments journal
+// ══════════════════════════════════════════════════════════════════════════
+server.tool(
+  'migrate_comments',
+  `Copies source comments into the ServiceNow target record's comments or work_notes journal.
+   Each comment is appended with its original author and timestamp.`,
+  {
+    platform: z.enum(['jira','salesforce']),
+    source_ids: z.array(z.string()),
+    sn_table: z.string(),
+    journal_field: z.string().optional().default('comments'),
+  },
+  async ({ platform, source_ids, sn_table, journal_field }) => {
+    try {
+      const sn = await getSn();
+      const prefix = platform === 'salesforce' ? 'salesforce' : 'jira';
+      let added = 0, skipped = 0, failed = 0;
+      for (const id of source_ids) {
+        const target = await sn.findByCorrelationId(sn_table, `${prefix}:${id}`);
+        if (!target) { skipped++; continue; }
+        try {
+          let comments = [];
+          if (platform === 'jira') {
+            const jira = await getJira();
+            comments = await jira.getComments(id);
+          } else {
+            const sf = await getSf();
+            const raw = await sf.getCaseComments(id);
+            comments = raw.map(c => ({ author: c.CreatedById, created: c.CreatedDate, body: c.CommentBody }));
+          }
+          const blob = comments.map(c => `[${c.created} – ${c.author}]\n${c.body}`).join('\n\n---\n\n');
+          if (blob) {
+            await sn.addJournalEntry(sn_table, target.sys_id, journal_field, blob);
+            added += comments.length;
+          }
+        } catch (e) { failed++; }
+      }
+      return ok({ added, skipped_records_not_found: skipped, failed });
+    } catch (e) { return fail(e.message); }
+  }
+);
+
+// ══════════════════════════════════════════════════════════════════════════
+// TOOL: run_delta_sync — incremental migration based on stored watermark
+// ══════════════════════════════════════════════════════════════════════════
+server.tool(
+  'run_delta_sync',
+  `Runs a migration of records that have changed since the last delta sync (uses a stored watermark in ServiceNow).
+   First run migrates everything and stores the current time as the watermark.`,
+  {
+    platform: z.enum(['jira','salesforce']),
+    object_or_project: z.string(),
+    sn_table: z.string(),
+    staging_table: z.string(),
+    watermark_key: z.string().describe('Unique identifier for this migration config — used to store the watermark'),
+  },
+  async ({ platform, object_or_project, sn_table, staging_table, watermark_key }) => {
+    try {
+      const sn = await getSn();
+      const lastWatermark = await sn.getWatermark(watermark_key);
+      const newWatermark  = new Date().toISOString();
+
+      const runner = new MigrationRunner(sn);
+      let processed = 0;
+
+      if (platform === 'jira') {
+        const jira = await getJira();
+        const jql = lastWatermark
+          ? `project=${object_or_project} AND updated>="${lastWatermark.substring(0,16).replace('T',' ')}"`
+          : `project=${object_or_project}`;
+        const iterator = jira.fetchAllIssues(jql);
+        const result   = await runner.runFullMigration(staging_table, iterator, i => ({ jira_key: i.key, jira_summary: i.fields?.summary ?? '' }));
+        processed = result.stats.total;
+      } else {
+        const sf = await getSf();
+        const soql = lastWatermark
+          ? `SELECT Id, LastModifiedDate FROM ${object_or_project} WHERE LastModifiedDate > ${lastWatermark}`
+          : `SELECT Id FROM ${object_or_project}`;
+        const iterator = sf.fetchAllRecords(soql);
+        const result   = await runner.runFullMigration(staging_table, iterator, r => ({ sf_id: r.Id }));
+        processed = result.stats.total;
+      }
+
+      await sn.setWatermark(watermark_key, newWatermark);
+      return ok({
+        previous_watermark: lastWatermark,
+        new_watermark:      newWatermark,
+        records_processed:  processed,
+        message: lastWatermark
+          ? `Migrated ${processed} records changed since ${lastWatermark}.`
+          : `Initial sync complete (${processed} records). Future runs will only migrate changes since now.`,
+      });
+    } catch (e) { return fail(e.message); }
+  }
+);
+
+// ══════════════════════════════════════════════════════════════════════════
+// TOOL: monitor_import_set_progress — long-poll an import set run
+// ══════════════════════════════════════════════════════════════════════════
+server.tool(
+  'monitor_import_set_progress',
+  `Polls the active import set runs in ServiceNow until they all complete (or 5 minutes elapse).
+   Use after kicking off a bulk migration to watch live progress.`,
+  { max_wait_seconds: z.number().optional().default(300) },
+  async ({ max_wait_seconds }) => {
+    try {
+      const sn = await getSn();
+      const started = Date.now();
+      let last = null;
+      while ((Date.now() - started) / 1000 < max_wait_seconds) {
+        const running = await sn.get('sys_import_set_run', {
+          sysparm_query:  'state=running',
+          sysparm_fields: 'sys_id,number,state,sys_created_on',
+          sysparm_limit:  '20',
+        });
+        last = running;
+        if (!running.length) break;
+        await new Promise(r => setTimeout(r, 5000));
+      }
+      return ok({
+        completed: !last?.length,
+        still_running: last ?? [],
+        message: !last?.length ? 'All import sets finished.' : `${last.length} import set(s) still running.`,
+      });
+    } catch (e) { return fail(e.message); }
+  }
+);
+
+// ══════════════════════════════════════════════════════════════════════════
+// TOOL: cleanup_old_import_sets — purge completed runs older than N days
+// ══════════════════════════════════════════════════════════════════════════
+server.tool(
+  'cleanup_old_import_sets',
+  `Deletes completed sys_import_set_run records older than the given number of days.
+   Run periodically to keep the instance healthy.`,
+  { days_old: z.number().optional().default(30) },
+  async ({ days_old }) => {
+    try {
+      const sn = await getSn();
+      const r = await sn.cleanupOldImportSetRuns(days_old);
+      return ok({ ...r, message: `Scanned ${r.scanned} runs older than ${days_old} days. Deleted ${r.deleted}.` });
+    } catch (e) { return fail(e.message); }
+  }
+);
+
 // ── Start ──────────────────────────────────────────────────────────────────
 const transport = new StdioServerTransport();
 await server.connect(transport);

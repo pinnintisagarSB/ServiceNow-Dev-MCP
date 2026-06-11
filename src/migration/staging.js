@@ -163,7 +163,7 @@ export class ArtifactBuilder {
   }
 
   // ── Build all Phase 4 artifacts (idempotent — skips anything already present) ─
-  async build({ stagingDef, mappings, targetTable, platform, objectName, sourceBaseUrl }) {
+  async build({ stagingDef, mappings, targetTable, platform, objectName, sourceBaseUrl, runBusinessRules = true, enforceMandatory = true, copyEmptyFields = false, choiceValues = {} }) {
     const progress = new Progress(6, 'Building ServiceNow Artifacts');
     progress.section('Setting Up ServiceNow Migration Artifacts');
 
@@ -252,9 +252,27 @@ export class ArtifactBuilder {
       progress.ok(`Transform map already exists: ${existing.transformMap.name}`);
     } else {
       const mapName = `${stagingDef.tableName}_to_${targetTable}`;
-      tmResult      = await this.sn.createTransformMap(mapName, stagingDef.tableName, targetTable);
+      tmResult      = await this.sn.createTransformMap(mapName, stagingDef.tableName, targetTable, {
+        runBusinessRules, enforceMandatory, copyEmptyFields,
+      });
       results.transformMap = { name: mapName, sys_id: tmResult.sys_id };
-      progress.ok(`Transform map created: ${mapName}`);
+      progress.ok(`Transform map created: ${mapName} (BR=${runBusinessRules}, mandatory=${enforceMandatory})`);
+    }
+
+    // 4.3b sys_choice sync — make sure target choice values exist
+    const choiceFields = classified.filter(m => m.sn_target && (m.source_type === 'picklist' || ['state','priority','category'].includes(m.sn_target)));
+    if (choiceFields.length) {
+      progress.step('Syncing target picklist values (sys_choice)');
+      for (const m of choiceFields) {
+        const vals = choiceValues[m.staging_field] ?? choiceValues[m.source_field];
+        if (!vals?.length) continue;
+        try {
+          const r = await this.sn.syncChoices(targetTable, m.sn_target, vals);
+          if (r.created.length) progress.info(`  +${r.created.length} choices added for ${m.sn_target}`);
+        } catch (e) {
+          progress.warn(`Choice sync ${m.sn_target} failed: ${e.message}`);
+        }
+      }
     }
 
     // 4.4 Field maps — only add mappings that don't already exist

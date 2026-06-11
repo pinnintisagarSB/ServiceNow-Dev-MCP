@@ -1,7 +1,8 @@
 import { Progress } from '../utils/progress.js';
+import { config }    from '../config.js';
 
-// Maximum concurrent import set runs allowed in this SN instance
-const MAX_PARALLEL_IMPORT_SETS = 5;
+// Configurable max concurrent import set runs (default 5)
+const MAX_PARALLEL_IMPORT_SETS = config.migration.maxParallelImportSets ?? 5;
 
 // Ideal records per import set batch (calculated dynamically but bounded)
 const MIN_BATCH_SIZE = 10;
@@ -15,12 +16,17 @@ const MAX_BATCH_SIZE = 200;
  * each wave to stay within the limit. Tracks every import set so none are missed.
  */
 export class BatchMigrationRunner {
-  constructor(sn) {
+  constructor(sn, opts = {}) {
     this.sn          = sn;
-    this.importSets  = [];   // all import set IDs created during this run
+    this.importSets  = [];
     this.stats       = { inserted: 0, updated: 0, ignored: 0, errors: 0, total: 0 };
     this.errorLog    = [];
     this.startTime   = null;
+    this.stopOnError = opts.stopOnError ?? config.migration.stopOnError ?? false;
+    this.useBulk     = opts.useBulk ?? false;
+    this.transformMapSysId = opts.transformMapSysId ?? null;
+    this.lockKey     = opts.lockKey ?? null;
+    this.holderId    = `${process.pid}-${Date.now()}`;
   }
 
   // ── Check how many import sets are currently running in the instance ───────
@@ -46,18 +52,36 @@ export class BatchMigrationRunner {
 
   // ── Push one batch of records, return import set info + results ───────────
   async _pushBatch(stagingTable, records, batchNum) {
+    // Bulk path: insert rows directly to staging then run one transform pass.
+    if (this.useBulk && this.transformMapSysId) {
+      try {
+        const inserted = await this.sn.bulkLoad(stagingTable, records);
+        await this.sn.executeTransform(this.transformMapSysId);
+        const ok = inserted.filter(x => typeof x === 'string').length;
+        const err = inserted.length - ok;
+        this.stats.total += records.length;
+        this.stats.inserted += ok;
+        this.stats.errors += err;
+        return { batchNum, importSetId: null, results: inserted.map(x => ({
+          status: typeof x === 'string' ? 'inserted' : 'error', error: x?.error,
+        })) };
+      } catch (e) {
+        this.stats.errors += records.length;
+        for (const rec of records) {
+          if (this.sn.logError) await this.sn.logError(stagingTable, { source_id: '', payload: rec, error: e.message, phase: 'bulk' });
+        }
+        return { batchNum, importSetId: null, results: records.map(() => ({ status: 'error', error: e.message })) };
+      }
+    }
+
     const results = [];
     let importSetId = null;
-
     for (const rec of records) {
       try {
         const res    = await this.sn.pushToImportSet(stagingTable, rec);
         const item   = Array.isArray(res) ? res[0] : res;
         const state  = item?.status ?? 'unknown';
-
-        // Capture import set ID from first record
         if (!importSetId && item?.import_set) importSetId = item.import_set;
-
         results.push({ status: state, error: item?.error_message });
         this.stats.total++;
         if      (state === 'inserted') this.stats.inserted++;
@@ -66,14 +90,15 @@ export class BatchMigrationRunner {
         else if (state === 'error') {
           this.stats.errors++;
           this.errorLog.push({ batch: batchNum, error: item?.error_message ?? 'unknown' });
+          if (this.sn.logError) await this.sn.logError(stagingTable, { source_id: '', payload: rec, error: item?.error_message ?? 'unknown', phase: 'transform' });
         }
       } catch (e) {
         this.stats.errors++;
         this.errorLog.push({ batch: batchNum, error: e.message });
+        if (this.sn.logError) await this.sn.logError(stagingTable, { source_id: '', payload: rec, error: e.message, phase: 'push' });
         results.push({ status: 'error', error: e.message });
       }
     }
-
     if (importSetId) this.importSets.push(importSetId);
     return { batchNum, importSetId, results };
   }
@@ -81,9 +106,21 @@ export class BatchMigrationRunner {
   // ── Main entry: sequenced (by dependency tier) + parallel batches ──────────
   async run(stagingTable, sequence, flattenFn) {
     this.startTime = Date.now();
-    const progress = new Progress(sequence.length + 2, 'Full Migration');
+    const progress = new Progress(sequence.length + 3, 'Full Migration');
 
     progress.section('Starting Full Migration');
+
+    // Acquire cross-session lock so two parallel runs don't fight
+    if (this.lockKey && this.sn.acquireMigrationLock) {
+      progress.step('Acquiring migration lock');
+      const lock = await this.sn.acquireMigrationLock(this.lockKey, this.holderId);
+      if (!lock.acquired) {
+        progress.warn(`Another session holds the migration lock (${lock.heldBy}). Aborting.`);
+        return { stopped: true, reason: 'lock_held', heldBy: lock.heldBy, stats: this.stats };
+      }
+      progress.ok('Lock acquired');
+    }
+    if (this.sn.ensureErrorLogTable) await this.sn.ensureErrorLogTable(stagingTable);
 
     // Check instance capacity
     progress.step('Checking how many migrations are already running in ServiceNow');
@@ -137,7 +174,9 @@ export class BatchMigrationRunner {
       progress.ok(`Tier ${tier.tier} complete`);
     }
 
-    return this._finalReport(progress);
+    const report = this._finalReport(progress);
+    await this._release();
+    return report;
   }
 
   // ── Wait until instance has capacity for another batch ─────────────────────
@@ -155,6 +194,12 @@ export class BatchMigrationRunner {
     const chunks = [];
     for (let i = 0; i < arr.length; i += size) chunks.push(arr.slice(i, i + size));
     return chunks;
+  }
+
+  async _release() {
+    if (this.lockKey && this.sn.releaseMigrationLock) {
+      try { await this.sn.releaseMigrationLock(this.lockKey); } catch (_) {}
+    }
   }
 
   _finalReport(progress) {

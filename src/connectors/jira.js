@@ -1,5 +1,6 @@
 import { config } from '../config.js';
 import { logger } from '../utils/logger.js';
+import { httpFetch } from '../utils/http.js';
 
 export class JiraConnector {
   constructor() {
@@ -10,9 +11,7 @@ export class JiraConnector {
   }
 
   async connect() {
-    const res = await fetch(`${this.baseUrl}/rest/api/3/myself`, {
-      headers: this.headers(),
-    });
+    const res = await httpFetch(`${this.baseUrl}/rest/api/3/myself`, { headers: this.headers() });
     if (!res.ok) {
       const body = await res.text();
       throw new Error(`Jira auth failed (${res.status}): ${body}`);
@@ -29,62 +28,145 @@ export class JiraConnector {
   async get(path, params = {}) {
     const url = new URL(`${this.baseUrl}${path}`);
     Object.entries(params).forEach(([k, v]) => url.searchParams.set(k, String(v)));
-    const res  = await fetch(url.toString(), { headers: this.headers() });
+    const res  = await httpFetch(url.toString(), { headers: this.headers() });
     const json = await res.json();
     if (!res.ok) throw new Error(`Jira GET ${path} → ${res.status}: ${JSON.stringify(json)}`);
     return json;
   }
 
   // ── Schema Discovery ───────────────────────────────────────────────────────
-  async getAllFields() {
-    return this.get('/rest/api/3/field');
-  }
-
-  async getProject(projectKey) {
-    return this.get(`/rest/api/3/project/${projectKey}`);
-  }
+  async getAllFields()                  { return this.get('/rest/api/3/field'); }
+  async getProject(projectKey)          { return this.get(`/rest/api/3/project/${projectKey}`); }
+  async getIssueTypes()                 { return this.get('/rest/api/3/issuetype'); }
+  async getPriorities()                 { return this.get('/rest/api/3/priority'); }
+  async getStatuses(projectKey)         { return this.get(`/rest/api/3/project/${projectKey}/statuses`); }
 
   async getSampleIssue(projectKey) {
     const result = await this.search({ jql: `project=${projectKey} ORDER BY created DESC`, maxResults: 1 });
     if (!result.issues?.length) return null;
-    const issue = result.issues[0];
-    const id = issue.key ?? issue.id;
-    if (!id) return null;
+    const id = result.issues[0].key ?? result.issues[0].id;
     return this.get(`/rest/api/3/issue/${id}`);
   }
 
-  async getIssueTypes() { return this.get('/rest/api/3/issuetype'); }
-  async getPriorities()  { return this.get('/rest/api/3/priority'); }
+  // ── Data Fetching — new /search endpoint with nextPageToken (with fallback) ─
+  async search({ jql, nextPageToken = null, maxResults = this.pageSize, fields = ['*all'], expand = [], startAt = null }) {
+    // Legacy callers pass startAt — route to legacy path
+    if (startAt !== null) return this._legacySearch({ jql, startAt, maxResults, fields });
 
-  // ── Data Fetching ──────────────────────────────────────────────────────────
-  async search({ jql, startAt = 0, maxResults = this.pageSize, fields = [] }) {
+    const body = { jql, maxResults, fields };
+    if (nextPageToken) body.nextPageToken = nextPageToken;
+    if (expand.length) body.expand = expand;
+
+    const res  = await httpFetch(`${this.baseUrl}/rest/api/3/search`, {
+      method: 'POST',
+      headers: this.headers(),
+      body: JSON.stringify(body),
+    });
+    const json = await res.json();
+    if (!res.ok) {
+      if (res.status === 404 || res.status === 410) return this._legacySearch({ jql, startAt: 0, maxResults, fields });
+      throw new Error(`Jira search → ${res.status}: ${JSON.stringify(json)}`);
+    }
+    return json;
+  }
+
+  async _legacySearch({ jql, startAt = 0, maxResults, fields }) {
     const params = { jql, startAt, maxResults };
-    if (fields.length) params.fields = fields.join(',');
+    if (fields?.length) params.fields = Array.isArray(fields) ? fields.join(',') : fields;
     return this.get('/rest/api/3/search/jql', params);
   }
 
-  async *fetchAllIssues(jql, fields = []) {
+  async *fetchAllIssues(jql, fields = ['*all']) {
+    let token = null;
     let startAt = 0;
-    let total   = Infinity;
+    let useLegacy = false;
+    while (true) {
+      const result = useLegacy
+        ? await this._legacySearch({ jql, startAt, maxResults: this.pageSize, fields })
+        : await this.search({ jql, nextPageToken: token, maxResults: this.pageSize, fields });
 
-    while (startAt < total) {
-      const result = await this.search({ jql, startAt, maxResults: this.pageSize, fields });
-      total = result.total;
-      if (!result.issues.length) break;
+      if (!result.issues?.length) break;
       yield result.issues;
-      startAt += result.issues.length;
+
+      if (result.nextPageToken !== undefined) {
+        if (!result.nextPageToken) break;
+        token = result.nextPageToken;
+      } else {
+        // legacy pagination
+        useLegacy = true;
+        startAt += result.issues.length;
+        if (startAt >= (result.total ?? 0)) break;
+      }
     }
   }
 
-  // ── ADF → Plain Text ───────────────────────────────────────────────────────
-  static adfToText(node) {
-    if (!node) return '';
-    if (node.type === 'text') return node.text ?? '';
-    if (node.content) return node.content.map(JiraConnector.adfToText).join('');
-    return '';
+  // ── Attachments / Comments / Links / Worklog ──────────────────────────────
+  async getAttachments(issueKey) {
+    const issue = await this.get(`/rest/api/3/issue/${issueKey}`, { fields: 'attachment' });
+    return issue.fields?.attachment ?? [];
+  }
+  async downloadAttachment(contentUrl) {
+    const res = await httpFetch(contentUrl, { headers: { Authorization: `Basic ${this.token}` } });
+    if (!res.ok) throw new Error(`Jira attachment download → ${res.status}`);
+    return Buffer.from(await res.arrayBuffer());
+  }
+  async getComments(issueKey) {
+    const json = await this.get(`/rest/api/3/issue/${issueKey}/comment`);
+    return (json.comments ?? []).map(c => ({
+      id:       c.id,
+      author:   c.author?.emailAddress ?? c.author?.displayName ?? '',
+      created:  c.created,
+      updated:  c.updated,
+      body:     JiraConnector.adfToText(c.body),
+      internal: !!c.jsdPublic === false,
+    }));
+  }
+  async getIssueLinks(issueKey) {
+    const issue = await this.get(`/rest/api/3/issue/${issueKey}`, { fields: 'issuelinks' });
+    return issue.fields?.issuelinks ?? [];
+  }
+  async getWorklogs(issueKey) {
+    const json = await this.get(`/rest/api/3/issue/${issueKey}/worklog`);
+    return json.worklogs ?? [];
   }
 
-  // ── Flatten Issue for Staging ──────────────────────────────────────────────
+  // ── ADF → Markdown (preserves links, code blocks, lists, mentions) ────────
+  static adfToText(node, depth = 0) {
+    if (!node) return '';
+    if (Array.isArray(node)) return node.map(n => JiraConnector.adfToText(n, depth)).join('');
+
+    const t = node.type;
+    const inner = () => (node.content ?? []).map(c => JiraConnector.adfToText(c, depth + 1)).join('');
+
+    switch (t) {
+      case 'text': {
+        let s = node.text ?? '';
+        for (const m of node.marks ?? []) {
+          if (m.type === 'link')   s = `[${s}](${m.attrs?.href ?? ''})`;
+          if (m.type === 'code')   s = '`' + s + '`';
+          if (m.type === 'strong') s = '**' + s + '**';
+          if (m.type === 'em')     s = '*' + s + '*';
+        }
+        return s;
+      }
+      case 'paragraph':    return inner() + '\n\n';
+      case 'heading':      return '#'.repeat(node.attrs?.level ?? 1) + ' ' + inner() + '\n\n';
+      case 'bulletList':
+      case 'orderedList':  return inner();
+      case 'listItem':     return '- ' + inner().trim() + '\n';
+      case 'codeBlock':    return '```' + (node.attrs?.language ?? '') + '\n' + inner() + '```\n';
+      case 'blockquote':   return '> ' + inner().trim() + '\n\n';
+      case 'mention':      return '@' + (node.attrs?.text ?? node.attrs?.displayName ?? '');
+      case 'hardBreak':    return '\n';
+      case 'rule':         return '\n---\n';
+      case 'inlineCard':   return node.attrs?.url ?? '';
+      case 'mediaSingle':
+      case 'media':        return `[attachment:${node.attrs?.id ?? ''}]`;
+      default:             return inner();
+    }
+  }
+
+  // ── Flatten Issue for Staging (legacy — kept for back-compat) ─────────────
   static flattenIssue(issue) {
     const f = issue.fields;
     return {

@@ -24,6 +24,9 @@ export const config = {
     password:      process.env.SF_PASSWORD,
     securityToken: process.env.SF_SECURITY_TOKEN ?? '',
     apiVersion:    process.env.SF_API_VERSION ?? 'v59.0',
+    jwtKey:        process.env.SF_JWT_PRIVATE_KEY ?? '',
+    jwtSubject:    process.env.SF_JWT_SUBJECT ?? '',
+    bulkThreshold: parseInt(process.env.SF_BULK_THRESHOLD ?? '50000', 10),
   },
   jira: {
     baseUrl:   process.env.JIRA_BASE_URL,
@@ -32,8 +35,12 @@ export const config = {
     pageSize:  parseInt(process.env.JIRA_PAGE_SIZE ?? '50', 10),
   },
   migration: {
-    pageSize:  parseInt(process.env.MIGRATION_PAGE_SIZE ?? '200', 10),
-    testLimit: parseInt(process.env.MIGRATION_TEST_LIMIT ?? '10', 10),
+    pageSize:        parseInt(process.env.MIGRATION_PAGE_SIZE ?? '200', 10),
+    testLimit:       parseInt(process.env.MIGRATION_TEST_LIMIT ?? '10', 10),
+    stopOnError:     process.env.MIGRATION_STOP_ON_ERROR === 'true',
+    runBusinessRules: process.env.MIGRATION_RUN_BUSINESS_RULES !== 'false',
+    enforceMandatory: process.env.MIGRATION_ENFORCE_MANDATORY !== 'false',
+    maxParallelImportSets: parseInt(process.env.SN_MAX_PARALLEL_IMPORT_SETS ?? '5', 10),
   },
 };
 

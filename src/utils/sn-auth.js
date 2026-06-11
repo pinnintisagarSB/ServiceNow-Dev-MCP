@@ -1,6 +1,7 @@
 import { createRequire } from 'module';
 import { config } from '../config.js';
 import { logger } from './logger.js';
+import { httpFetch } from './http.js';
 
 const require = createRequire(import.meta.url);
 
@@ -11,6 +12,25 @@ export async function getSnToken() {
   const now = Math.floor(Date.now() / 1000);
 
   if (_cachedToken && _cachedExpiry - now > 300) {
+    return { instanceUrl: config.servicenow.instanceUrl, token: _cachedToken, authType: 'bearer' };
+  }
+
+  // ── OAuth 2.0 Client Credentials flow (production-friendly) ────────────
+  if (process.env.SN_OAUTH_CLIENT_ID && process.env.SN_OAUTH_CLIENT_SECRET) {
+    const url = `${config.servicenow.instanceUrl}/oauth_token.do`;
+    const res = await httpFetch(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: new URLSearchParams({
+        grant_type:    'client_credentials',
+        client_id:     process.env.SN_OAUTH_CLIENT_ID,
+        client_secret: process.env.SN_OAUTH_CLIENT_SECRET,
+      }),
+    });
+    const json = await res.json();
+    if (!res.ok) throw new Error(`SN OAuth client_credentials failed: ${JSON.stringify(json)}`);
+    _cachedToken  = json.access_token;
+    _cachedExpiry = now + (json.expires_in ?? 1800);
     return { instanceUrl: config.servicenow.instanceUrl, token: _cachedToken, authType: 'bearer' };
   }
 

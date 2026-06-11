@@ -114,8 +114,9 @@ export class SchemaDiscovery {
   }
 
   // ── Auto-suggest mappings ──────────────────────────────────────────────────
-  suggestMappings(sourceFields, snFields) {
+  suggestMappings(sourceFields, snFields, { platform = 'jira', objectName = '' } = {}) {
     const snIndex = Object.fromEntries(snFields.map(f => [f.field, f]));
+    const hasCorrelationId = !!snIndex['correlation_id'];
 
     // SN fields that are good coalesce targets — unique/reference fields on the target table
     const snCoalesceFields = new Set([
@@ -132,7 +133,22 @@ export class SchemaDiscovery {
       'serial_number',      // cmdb unique field
     ]);
 
-    return sourceFields.map(sf => {
+    // Composite coalesce detection — sys_user benefits from email + employee_number
+    // pair; cmdb benefits from serial_number + asset_tag pair.
+    const compositeCoalesce = new Set();
+    const present = new Set(sourceFields.map(s => s.sn_column));
+    const compositePairs = [
+      ['email', 'employee_number'],
+      ['serial_number', 'asset_tag'],
+      ['name', 'manufacturer'],
+    ];
+    for (const pair of compositePairs) {
+      if (pair.every(p => snIndex[p] && [...present].some(c => c.endsWith(p)))) {
+        pair.forEach(p => compositeCoalesce.add(p));
+      }
+    }
+
+    const mappings = sourceFields.map(sf => {
       // Try to auto-match by common naming conventions
       const candidates = [
         sf.source_field.toLowerCase(),
@@ -177,27 +193,96 @@ export class SchemaDiscovery {
         snCoalesceFields.has(matched?.field) ||       // maps to known unique SN field
         matched?.field?.startsWith('u_');             // maps to any custom field (u_ prefix)
 
-      const coalesce = isSourceUniqueId && snTargetIsCoalesceable;
+      let coalesce = isSourceUniqueId && snTargetIsCoalesceable;
+      let coalesce_reason = coalesce
+        ? `"${sf.source_field}" is the unique identifier from the source — used as upsert key to prevent duplicates on re-run`
+        : null;
+
+      // Composite coalesce (multi-field upsert key)
+      if (matched && compositeCoalesce.has(matched.field)) {
+        coalesce = true;
+        coalesce_reason = `Part of composite upsert key — combined with the other coalesce fields to uniquely identify a record`;
+      }
 
       const sourceType = sf.sf_type ?? sf.jira_type ?? '';
       const targetType = matched?.type ?? '';
       const needs_script = this._needsScript(sourceType, targetType, sf.source_field, matched?.field);
+
+      // Reference field → generate GlideRecord lookup script automatically
+      let transform_script = null;
+      let resolved_script = false;
+      if (sf.is_reference && matched && targetType === 'reference') {
+        transform_script = this._referenceResolverScript(sf, matched);
+        resolved_script = true;
+      }
 
       return {
         staging_field:    sf.sn_column,
         source_field:     sf.source_field,
         sn_target:        matched?.field ?? null,
         coalesce,
-        coalesce_reason:  coalesce
-          ? `"${sf.source_field}" is the unique identifier from the source — used as upsert key to prevent duplicates on re-run`
-          : null,
+        coalesce_reason,
         is_reference:     sf.is_reference,
-        needs_script,
-        script_reason:    needs_script ? this._scriptReason(sourceType, targetType, sf.source_field, matched?.field) : null,
+        needs_script:     needs_script || resolved_script,
+        script_reason:    resolved_script ? 'reference field — uses GlideRecord to resolve target sys_id' :
+                          needs_script ? this._scriptReason(sourceType, targetType, sf.source_field, matched?.field) : null,
+        transform_script,
         auto_matched:     !!matched,
         source_type:      sourceType,
       };
     });
+
+    // Synthetic correlation_id mapping — the SN best-practice upsert key
+    if (hasCorrelationId) {
+      const idField = sourceFields.find(f => f.is_unique_id) ?? sourceFields.find(f => ['Id','key'].includes(f.source_field));
+      if (idField && !mappings.find(m => m.sn_target === 'correlation_id')) {
+        const prefix = platform === 'salesforce' ? 'salesforce' : 'jira';
+        mappings.push({
+          staging_field:   idField.sn_column,
+          source_field:    idField.source_field,
+          sn_target:       'correlation_id',
+          coalesce:        true,
+          coalesce_reason: `correlation_id is the SN-standard upsert key — using "${prefix}:<id>" prevents duplicates and enables reconciliation`,
+          is_reference:    false,
+          needs_script:    true,
+          script_reason:   `prefix value with "${prefix}:" so the target row is uniquely identifiable across all source systems`,
+          transform_script: `answer = '${prefix}:' + source.getValue('${idField.sn_column}');`,
+          auto_matched:    true,
+          source_type:     'string',
+          synthetic:       true,
+        });
+      }
+    }
+
+    return mappings;
+  }
+
+  // GlideRecord lookup script for a reference target (caller_id, assigned_to, etc.)
+  _referenceResolverScript(sf, matched) {
+    const target = matched.reference || 'sys_user';
+    const stagingField = sf.sn_column;
+    if (target === 'sys_user') {
+      return `
+var _v = source.getValue('${stagingField}');
+var u = new GlideRecord('sys_user');
+u.addEncodedQuery('email=' + _v + '^ORuser_name=' + _v + '^ORemployee_number=' + _v + '^ORname=' + _v);
+u.setLimit(1); u.query();
+answer = u.next() ? u.getUniqueValue() : '';`.trim();
+    }
+    if (target.startsWith('cmdb')) {
+      return `
+var _v = source.getValue('${stagingField}');
+var c = new GlideRecord('${target}');
+c.addEncodedQuery('name=' + _v + '^ORserial_number=' + _v + '^ORasset_tag=' + _v);
+c.setLimit(1); c.query();
+answer = c.next() ? c.getUniqueValue() : '';`.trim();
+    }
+    return `
+var _v = source.getValue('${stagingField}');
+var g = new GlideRecord('${target}');
+g.addEncodedQuery('name=' + _v + '^ORnumber=' + _v + '^ORsys_id=' + _v);
+g.setLimit(1); g.query();
+answer = g.next() ? g.getUniqueValue() : '';`.trim();
   }
 
   // ── Determine if a field needs an inline transform script ─────────────────
