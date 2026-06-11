@@ -33,16 +33,44 @@ export class ArtifactBuilder {
     if (m.is_reference && m.reference_value) return 'reference';
 
     // Script that touches multiple fields or uses GlideRecord → transform script
-    if (m.transform_script) {
-      const s = m.transform_script;
+    // needs_script:true with no explicit script also goes through field_map_script path
+    // (a default inline script will be generated at build time)
+    if (m.transform_script || m.needs_script) {
+      const s = m.transform_script ?? '';
       if (s.includes('GlideRecord') || (s.match(/answer\s*=/g) ?? []).length > 1) {
         return 'transform_script';
       }
-      // Everything else → field map script (co-located, simpler, visible in UI)
       return 'field_map_script';
     }
 
     return 'direct';
+  }
+
+  // ── Default inline field map scripts for common field types ──────────────
+  _defaultScript(m) {
+    const f = m.staging_field;
+    const t = m.source_type ?? '';
+    const target = m.sn_target ?? '';
+
+    // Jira priority → SN priority integer (1 = Critical/Highest … 5 = Planning/Lowest)
+    if (t === 'priority' || target === 'priority') {
+      return (
+        `var _p = source.getValue('${f}');\n` +
+        `answer = ({Highest:'1',Critical:'1',High:'2',Medium:'3',Low:'4',Lowest:'5'})[_p] || '3';`
+      );
+    }
+
+    // Jira status → SN state integer
+    if (t === 'status' || target === 'state') {
+      return (
+        `var _s = source.getValue('${f}');\n` +
+        `answer = ({'To Do':'1','Open':'1','Backlog':'1','In Progress':'2','In Review':'2',` +
+        `'Done':'7','Closed':'7','Resolved':'6',"Won't Fix":'8'})[_s] || '1';`
+      );
+    }
+
+    // Generic picklist — pass value through as-is; the mapping can be refined later
+    return `answer = source.getValue('${f}');`;
   }
 
   // ── Analyse mappings and return a human-readable plan ─────────────────────
@@ -200,7 +228,8 @@ export class ArtifactBuilder {
       const refValue = m.is_reference && m.reference_value ? m.reference_value : null;
 
       if (m.approach === 'field_map_script') {
-        const script = this._wrapScript(m.transform_script, m.staging_field);
+        const rawScript = m.transform_script ?? this._defaultScript(m);
+        const script = this._wrapScript(rawScript, m.staging_field);
         await this.sn.createFieldMap(tmResult.sys_id, m.staging_field, m.sn_target, m.coalesce, null, script);
         scriptedCount++;
       } else if (m.approach === 'reference') {
