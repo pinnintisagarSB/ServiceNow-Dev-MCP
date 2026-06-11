@@ -369,7 +369,9 @@ export class ServiceNowConnector {
 
   async createFlow(name, description, appScopeId = null) {
     const internal = name.toLowerCase().replace(/[^a-z0-9]/g, '_');
-    const body = { name, description, run_as: 'user', active: 'false', internal_name: internal };
+    // run_as=system is required for flows to execute reliably without a user session
+    // accessible_from=package_private keeps the flow scoped to its application
+    const body = { name, description, run_as: 'system', active: 'false', internal_name: internal, accessible_from: 'package_private' };
     if (appScopeId) body.sys_scope = appScopeId;
 
     const record = await this.post('sys_hub_flow', body);
@@ -390,9 +392,18 @@ export class ServiceNowConnector {
   }
 
   async createFlowVariable(flowSysId, varName, varType, isInput = false, isOutput = false) {
-    const table = isInput ? 'sys_hub_flow_input' : 'sys_hub_flow_output';
+    // sys_hub_flow_var is the correct table for flow variables in Workflow Studio
+    // (sys_hub_flow_input / sys_hub_flow_output are legacy tables from older SN versions)
     try {
-      return await this.post(table, { flow: flowSysId, name: varName, label: varName, type: varType, mandatory: 'false' });
+      return await this.post('sys_hub_flow_var', {
+        flow:      flowSysId,
+        name:      varName,
+        label:     varName,
+        type:      varType,
+        input:     isInput  ? 'true' : 'false',
+        output:    isOutput ? 'true' : 'false',
+        mandatory: 'false',
+      });
     } catch (e) {
       logger.warn(`Flow variable skipped (${varName}): ${e.message}`);
       return { skipped: true, name: varName };
@@ -464,20 +475,28 @@ export class ServiceNowConnector {
     if (!this._actionTypeCache) this._actionTypeCache = {};
     if (this._actionTypeCache[name]) return this._actionTypeCache[name];
 
-    // Try exact-prefix match first
+    // Try Global scope exact match first (avoids Spoke action types with same name)
     let results = await this.get('sys_hub_action_type_base', {
-      sysparm_query:  `nameSTARTSWITH${name}`,
+      sysparm_query:  `name=${name}^sys_scope=global`,
       sysparm_fields: 'sys_id,name',
-      sysparm_limit:  '10',
+      sysparm_limit:  '5',
     });
-
-    // Prefer exact match; fall back to first result
     let match = results.find(r => r.name === name) ?? results[0] ?? null;
 
-    // If nothing found, try a broader CONTAINS search
+    // Fall back to any scope if not found globally
     if (!match) {
       results = await this.get('sys_hub_action_type_base', {
-        sysparm_query:  `nameCONTAINS${name}`,
+        sysparm_query:  `nameSTARTSWITH${name}`,
+        sysparm_fields: 'sys_id,name',
+        sysparm_limit:  '10',
+      });
+      match = results.find(r => r.name === name) ?? results[0] ?? null;
+    }
+
+    // Broader CONTAINS search as last resort
+    if (!match) {
+      results = await this.get('sys_hub_action_type_base', {
+        sysparm_query:  `nameCONTAINS${name}^sys_scope=global`,
         sysparm_fields: 'sys_id,name',
         sysparm_limit:  '10',
       });
@@ -526,12 +545,14 @@ export class ServiceNowConnector {
       );
     }
 
-    // action_inputs is a glide_var field — must be a JSON string
+    const { randomUUID } = await import('crypto');
     const body = {
-      flow:          flowSysId,
-      action_type:   actionTypeSysId,
-      order:         String(order),
-      action_inputs: Object.keys(inputs).length ? JSON.stringify(inputs) : '',
+      flow:               flowSysId,
+      action_type:        actionTypeSysId,
+      compiled_snapshot:  actionTypeSysId,
+      order:              String(order),
+      ui_id:              randomUUID(),
+      action_inputs:      Object.keys(inputs).length ? JSON.stringify(inputs) : '',
     };
     return this.post('sys_hub_action_instance', body);
   }

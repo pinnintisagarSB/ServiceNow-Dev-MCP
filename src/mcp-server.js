@@ -1266,8 +1266,9 @@ server.tool(
         result,
         manual_build_items: builder.manualList,
         flow_designer_url:  result.flow?.sys_id
-          ? `${(await getSn()).baseUrl}/now/flow-designer/home`
+          ? `${(await getSn()).baseUrl}/now/workflow-studio/home`
           : null,
+        flow_sys_id: result.flow?.sys_id ?? null,
       });
     } catch (e) { return fail(e.message); }
   }
@@ -1963,13 +1964,23 @@ server.tool(
         variables:  [],
         elements:   [
           ...parsed.conditions.map(c => ({ ...c, kind: 'decision',   label: c.label,  name: c.label })),
-          ...parsed.actions.filter(a => a.can_auto).map(a => ({
-            kind:   a.sn_action === 'create_record' ? 'recordCreate'
-                  : a.sn_action === 'update_record' ? 'recordUpdate'
-                  : a.sn_action === 'delete_record' ? 'recordDelete'
-                  : 'action',
-            label:  a.label,
-            name:   a.label,
+          // Include all actions (both auto and manual) so flow structure is complete
+          // Manual ones become TODO stubs; auto ones become real steps or script stubs
+          ...parsed.actions.map(a => ({
+            kind:     a.sn_action === 'create_record' ? 'recordCreate'
+                    : a.sn_action === 'update_record' ? 'recordUpdate'
+                    : a.sn_action === 'delete_record' ? 'recordDelete'
+                    : 'action',
+            label:    a.label,
+            name:     a.label,
+            raw_type: a.raw_type,
+            config:   a.config,               // pass Jira config so script stubs are informative
+            can_auto: a.can_auto,
+            manual_reason: a.manual_reason,
+            // Map Jira field assignments if present in config
+            inputAssignments: a.config?.fields
+              ? Object.entries(a.config.fields).map(([k, v]) => ({ field: k, value: v }))
+              : [],
           })),
         ],
         isScreen:   false,
