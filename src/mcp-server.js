@@ -394,14 +394,24 @@ server.tool(
 server.tool(
   'analyze_dependencies',
   `Phase 3: Analyse migration dependencies before building artifacts.
-   For Jira: scans all referenced users, checks if they exist in ServiceNow,
-   identifies issue type hierarchy (Epic → Story → Task → Subtask), and proposes
-   a sequenced migration plan (Tier 1 = parents, Tier 2 = children, etc.).
+
+   For Jira:
+     - Scans all referenced users (assignee/reporter), checks if they exist in ServiceNow
+     - Identifies issue type hierarchy (Epic/Story → Task/Bug → Subtask)
+     - Proposes a sequenced migration plan (Tier 1 = parents first, Tier 2 = children, etc.)
+
+   For Salesforce:
+     - Counts records per object
+     - Detects parent/child object relationships (e.g. Account → Contact, Account → Case)
+     - Checks record owners (OwnerId) against ServiceNow sys_user
+     - Warns if a parent object is not included in the migration scope
+     - Proposes migration order (parent objects first, child objects after)
+
    Always call this after discover_schema and before build_artifacts.
    If users are missing, ask the user whether to auto-create them in SN.`,
   {
-    platform:     z.enum(['salesforce', 'jira']),
-    project_keys: z.array(z.string()).describe('Jira project keys to analyse (e.g. ["EMAL","KAN"])'),
+    platform:          z.enum(['salesforce', 'jira']),
+    project_keys:      z.array(z.string()).describe('Jira project keys or Salesforce object names to analyse (e.g. ["EMAL","KAN"] or ["Account","Contact","Case"])'),
     auto_create_users: z.boolean().default(false).describe('Create missing SN users automatically'),
   },
   async ({ platform, project_keys, auto_create_users }) => {
@@ -414,7 +424,8 @@ server.tool(
         const jira = await getJira();
         analysis   = await analyzer.analyze(platform, jira, project_keys);
       } else {
-        return fail('Dependency analysis for Salesforce not yet implemented');
+        const sf = await getSf();
+        analysis  = await analyzer.analyze(platform, sf, project_keys);
       }
 
       let usersCreated = [];
@@ -426,21 +437,25 @@ server.tool(
         instructions_for_claude: [
           'Show the dependency summary to the user.',
           analysis.users.missing.length && !auto_create_users
-            ? 'Tell the user that missing users must exist in SN for assignee/reporter references to resolve. Ask: "Should I auto-create them now?"'
+            ? 'Tell the user that missing users must exist in SN for owner/assignee/reporter references to resolve correctly. Ask: "Should I auto-create them now?"'
             : 'All users are ready.',
-          'Present the migration sequence (Tier 1 → 2 → 3) so the user understands the order.',
+          platform === 'salesforce'
+            ? 'Show the object record counts and explain the migration order (parent objects before child objects).'
+            : 'Present the migration sequence (Tier 1 → 2 → 3) so the user understands the order.',
+          analysis.warnings.length ? 'Highlight any warnings about missing parent objects.' : null,
           'After user confirms, proceed to build_artifacts.',
-        ],
+        ].filter(Boolean),
         users: {
           found:   analysis.users.found.map(u => u.email),
           missing: analysis.users.missing,
           created: usersCreated,
         },
-        issue_hierarchy: analysis.issueHierarchy,
+        hierarchy: analysis.hierarchy,
         migration_sequence: analysis.migrationSequence.map(s => ({
           tier:  s.tier,
           types: s.types,
           count: s.count,
+          note:  s.note ?? null,
         })),
         warnings: analysis.warnings,
       });
