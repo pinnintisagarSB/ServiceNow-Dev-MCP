@@ -24,7 +24,7 @@ export class SchemaDiscovery {
       is_reference:  f.type === 'reference',
       reference_to:  f.referenceTo?.[0] ?? null,
       max_length:    f.length,
-      sn_column:     `sf_${f.name.toLowerCase().replace(/[^a-z0-9]/g, '_')}`,
+      sn_column:     `u_sf_${f.name.toLowerCase().replace(/[^a-z0-9]/g, '_')}`,
       ...SalesforceConnector.mapFieldType(f.type, f.length),
     }));
   }
@@ -48,14 +48,14 @@ export class SchemaDiscovery {
       .map(id => {
         const f       = fieldMap[id];
         const jType   = f.schema?.type ?? 'string';
-        const snCol   = `jira_${id.replace('customfield_', 'cf_').toLowerCase().replace(/[^a-z0-9]/g, '_')}`;
+        const snBase  = `u_jira_${id.replace('customfield_', 'cf_').toLowerCase().replace(/[^a-z0-9]/g, '_')}`;
         return {
           source_field:  id,
           label:         f.name,
           jira_type:     jType,
           required:      false,
           is_reference:  jType === 'user',
-          sn_column:     snCol.length > 40 ? snCol.substring(0, 40) : snCol,
+          sn_column:     snBase.length > 40 ? snBase.substring(0, 40) : snBase,
           ...JiraConnector.mapFieldType(jType),
         };
       });
@@ -70,7 +70,7 @@ export class SchemaDiscovery {
         required:      true,
         is_reference:  false,
         is_unique_id:  true,
-        sn_column:     'jira_key',
+        sn_column:     'u_jira_key',
         internal_type: 'string',
         max_length:    40,
       });
@@ -152,7 +152,7 @@ export class SchemaDiscovery {
       // Try to auto-match by common naming conventions
       const candidates = [
         sf.source_field.toLowerCase(),
-        sf.sn_column.replace(/^(sf|jira)_/, ''),
+        sf.sn_column.replace(/^u_(sf|jira)_/, ''),
         // common field name aliases
         sf.source_field === 'summary'     ? 'short_description' : null,
         sf.source_field === 'description' ? 'description'       : null,
@@ -184,8 +184,8 @@ export class SchemaDiscovery {
         sf.source_field === 'Id' ||                   // Salesforce record ID
         sf.source_field === 'key' ||                  // Jira issue key
         sf.source_field === 'ExternalId' ||           // SF external ID
-        sf.sn_column === 'jira_key' ||                // jira key staging column
-        sf.sn_column === 'sf_id' ||                   // salesforce ID staging column
+        sf.sn_column === 'u_jira_key' ||              // jira key staging column
+        sf.sn_column === 'u_sf_id' ||                 // salesforce ID staging column
         sf.sn_column?.endsWith('_id') && sf.required; // required ID-like column
 
       const snTargetIsCoalesceable =

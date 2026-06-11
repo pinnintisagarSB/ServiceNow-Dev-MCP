@@ -336,7 +336,12 @@ server.tool(
    Returns full field lists + auto-suggested staging table definition + field mapping proposals.
    After calling this, STOP and present the schemas to the user for Checkpoint 1 review.
    Ask: (1) Are all needed source fields present? (2) Any fields to exclude? (3) Any corrections?
-   Only call build_artifacts after the user explicitly approves.`,
+   Only call build_artifacts after the user explicitly approves.
+
+   IMPORTANT — target table changes:
+   If the user changes the sn_table AFTER this has already been called (e.g. "use problem instead of incident"),
+   call discover_schema AGAIN from scratch with the new sn_table. Do NOT reuse the previous mappings — the
+   target fields will be completely different. Discard any prior suggested_mappings and staging_definition.`,
   {
     platform:    z.enum(['salesforce', 'jira']).describe('Source platform'),
     object_name: z.string().describe('Salesforce object (e.g. Account, Contact, Case) or Jira project key (e.g. KAN, EMAL)'),
@@ -371,6 +376,7 @@ server.tool(
             ? `Tell the user: "I've set ${coalesceFields.map(f => `'${f.staging_field}'`).join(', ')} as the upsert key(s). This means if the migration runs more than once, existing records will be updated instead of duplicated."`
             : 'Warn the user that no upsert key was found — ask them which field should be used to prevent duplicate records on re-run.',
           'Ask the user: (1) Are all needed source fields present? (2) Any fields to exclude? (3) Any mapping corrections?',
+          `If the user changes the target table (e.g. "use problem instead of ${sn_table}"), call discover_schema AGAIN with the new table. Discard these mappings entirely — do not try to adapt them.`,
           'Wait for explicit "Approved" before calling build_artifacts.',
         ],
         summary: {
