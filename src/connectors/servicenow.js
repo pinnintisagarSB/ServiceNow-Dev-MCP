@@ -1,6 +1,7 @@
 import { getSnToken, buildSnHeaders } from '../utils/sn-auth.js';
 import { logger } from '../utils/logger.js';
 import { httpFetch, sleep } from '../utils/http.js';
+import { gzipSync } from 'zlib';
 
 export class ServiceNowConnector {
   constructor() {
@@ -461,8 +462,13 @@ export class ServiceNowConnector {
     };
     const snType = typeMap[triggerType] ?? 'on_demand';
     const triggerDefSysId = await this._lookupTriggerDefinition(snType);
+    const isV2 = await this._isFlowEngineV2();
 
-    const body = { flow: flowSysId, trigger_type: snType, trigger_definition: triggerDefSysId };
+    // V2 (Washington DC+): field is "trigger" referencing sys_hub_trigger_definition
+    // V1: field is "trigger_definition"
+    // sys_hub_trigger_instance itself exists on both; sys_hub_trigger_instance_v2 does NOT exist
+    const triggerRefField = isV2 ? 'trigger' : 'trigger_definition';
+    const body = { flow: flowSysId, trigger_type: snType, [triggerRefField]: triggerDefSysId };
     if (triggerTable) body.table     = triggerTable;
     if (condition)    body.condition = condition;
     return this.post('sys_hub_trigger_instance', body);
@@ -529,8 +535,31 @@ export class ServiceNowConnector {
     return map[logicalType] ?? ['Run Script', 'Script'];
   }
 
+  // Detect whether this instance uses Flow Engine V2 (Washington DC / Xanadu+).
+  // V2 stores action inputs in sys_hub_action_instance_v2.values (gzip+base64 JSON).
+  // V1 stores them in sys_hub_action_instance.action_inputs (plain JSON string).
+  async _isFlowEngineV2() {
+    if (this._flowEngineV2 !== undefined) return this._flowEngineV2;
+    const rows = await this.get('sys_db_object', {
+      sysparm_query:  'name=sys_hub_action_instance_v2',
+      sysparm_fields: 'name',
+      sysparm_limit:  '1',
+    }).catch(() => []);
+    this._flowEngineV2 = rows.length > 0;
+    logger.info(`Flow Engine: ${this._flowEngineV2 ? 'V2 (Washington DC+)' : 'V1 (pre-Washington DC)'}`);
+    return this._flowEngineV2;
+  }
+
+  // V2 encodes inputs as: JSON array of {name, value} pairs → UTF-8 → gzip → base64
+  _compressValuesV2(inputs) {
+    const arr = Object.entries(inputs).map(([name, value]) => ({
+      name,
+      value: typeof value === 'string' ? value : JSON.stringify(value),
+    }));
+    return gzipSync(Buffer.from(JSON.stringify(arr), 'utf8')).toString('base64');
+  }
+
   async createActionInstance(flowSysId, stepName, logicalActionType, order = 100, inputs = {}) {
-    // Try each candidate name until we find one on this instance
     const candidates = this._flowActionTypeCandidates(logicalActionType);
     let actionTypeSysId = null;
     for (const name of candidates) {
@@ -541,20 +570,33 @@ export class ServiceNowConnector {
     if (!actionTypeSysId) {
       throw new Error(
         `No action type found for "${logicalActionType}" (tried: ${candidates.join(', ')}) ` +
-        `— add this step manually in Flow Designer`
+        `— add this step manually in Workflow Studio`
       );
     }
 
-    const { randomUUID } = await import('crypto');
-    const body = {
-      flow:               flowSysId,
-      action_type:        actionTypeSysId,
-      compiled_snapshot:  actionTypeSysId,
-      order:              String(order),
-      ui_id:              randomUUID(),
-      action_inputs:      Object.keys(inputs).length ? JSON.stringify(inputs) : '',
-    };
-    return this.post('sys_hub_action_instance', body);
+    const isV2 = await this._isFlowEngineV2();
+
+    if (isV2) {
+      // Flow Engine V2: write to sys_hub_action_instance_v2 with compressed values
+      const hasInputs = Object.keys(inputs).length > 0;
+      const body = {
+        flow:        flowSysId,
+        action_type: actionTypeSysId,
+        order:       String(order),
+        name:        stepName,
+        ...(hasInputs && { values: this._compressValuesV2(inputs) }),
+      };
+      return this.post('sys_hub_action_instance_v2', body);
+    } else {
+      // Flow Engine V1: write to sys_hub_action_instance with plain JSON action_inputs
+      const body = {
+        flow:          flowSysId,
+        action_type:   actionTypeSysId,
+        order:         String(order),
+        action_inputs: Object.keys(inputs).length ? JSON.stringify(inputs) : '',
+      };
+      return this.post('sys_hub_action_instance', body);
+    }
   }
 
   async createFlowBlock(flowSysId, stepName, logicalActionType, script = null, order = 100) {
