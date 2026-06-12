@@ -18,13 +18,18 @@ import { SalesforceConnector }  from './connectors/salesforce.js';
 import { JiraConnector }        from './connectors/jira.js';
 import { SchemaDiscovery }      from './migration/schema.js';
 import { ArtifactBuilder }      from './migration/staging.js';
-import { MigrationRunner }      from './migration/runner.js';
+import { MigrationRunner, topoSort } from './migration/runner.js';
 import { DependencyAnalyzer }   from './migration/dependency.js';
 import { MigrationValidator }   from './migration/validator.js';
 import { BatchMigrationRunner } from './migration/batch.js';
 import { MigrationCleanup }     from './migration/cleanup.js';
 import { FlowRetriever }           from './flows/retriever.js';
 import { JiraAutomationRetriever } from './flows/jira-automation.js';
+import { UserGroupMapper }      from './migration/user-mapping.js';
+import { PreMigrationChecker }  from './migration/pre-migration-checks.js';
+import { TransformEngine }      from './migration/transform-engine.js';
+import { AuditTrail }           from './migration/audit.js';
+import { toSnHtml }             from './utils/rich-text.js';
 import { logger }               from './utils/logger.js';
 
 // ── Connector cache (reuse within a session) ───────────────────────────────
@@ -2219,6 +2224,194 @@ server.tool(
         sn_table,
       });
     } catch (e) { return fail(e.message); }
+  }
+);
+
+// ══════════════════════════════════════════════════════════════════════════
+// TOOL: map_users
+// ══════════════════════════════════════════════════════════════════════════
+server.tool(
+  'map_users',
+  `Load all ServiceNow users and groups into memory, then resolve a list of
+   source-platform users (Jira / Salesforce) to ServiceNow sys_user sys_ids.
+   Returns a match report with matched/unmatched lists and the fallback user used.
+   Call this before running a migration that has assignee / owner / reporter fields.`,
+  {
+    source_users:   z.array(z.object({
+      email:       z.string().optional(),
+      displayName: z.string().optional(),
+      accountId:   z.string().optional(),
+    })).describe('Array of source platform users to resolve'),
+    fallback_user_email: z.string().optional().describe('SN user email to use when no match is found'),
+    fallback_group_name: z.string().optional().describe('SN group name to use when no group match is found'),
+  },
+  async ({ source_users, fallback_user_email, fallback_group_name }) => {
+    try {
+      const sn     = await getSn();
+      const mapper = new UserGroupMapper(sn);
+      await mapper.build({ fallbackUser: fallback_user_email ?? null, fallbackGroup: fallback_group_name ?? null });
+      const report = await mapper.matchSourceUsers(source_users ?? []);
+      return ok({ summary: mapper.summary(), ...report });
+    } catch (e) { return fail(e.message); }
+  }
+);
+
+// ══════════════════════════════════════════════════════════════════════════
+// TOOL: pre_migration_check
+// ══════════════════════════════════════════════════════════════════════════
+server.tool(
+  'pre_migration_check',
+  `Run all pre-migration validation checks against the target ServiceNow table before importing any data.
+   Checks: (1) picklist/choice values, (2) reference integrity, (3) required field coverage,
+   (4) business rule conflicts. Returns a pass/fail report with blocking issues and warnings.
+   Always call this before run_migration.`,
+  {
+    sn_table:        z.string().describe('Target ServiceNow table, e.g. incident'),
+    field_mappings:  z.record(z.string()).describe('{ sourceField: snField } mapping object'),
+    reference_fields: z.record(z.object({
+      table:       z.string(),
+      lookupField: z.string().optional(),
+    })).optional().describe('{ snField: { table, lookupField } } — which SN fields are reference fields'),
+    sample_records:  z.array(z.record(z.unknown())).describe('Sample of source records (20–100) for validation'),
+  },
+  async ({ sn_table, field_mappings, reference_fields, sample_records }) => {
+    try {
+      const sn      = await getSn();
+      const checker = new PreMigrationChecker(sn);
+      const result  = await checker.runAll(
+        sn_table,
+        field_mappings ?? {},
+        reference_fields ?? {},
+        sample_records ?? [],
+      );
+      return ok(result);
+    } catch (e) { return fail(e.message); }
+  }
+);
+
+// ══════════════════════════════════════════════════════════════════════════
+// TOOL: transform_preview
+// ══════════════════════════════════════════════════════════════════════════
+server.tool(
+  'transform_preview',
+  `Apply field transformation rules to a sample set of source records and return the transformed output.
+   Use this to verify date formats, boolean normalization, status mapping, and custom transforms
+   BEFORE running the full migration. Supports built-in presets: jira_status, jira_priority,
+   sf_status, sf_priority.`,
+  {
+    source_records: z.array(z.record(z.unknown())).describe('Source records to transform'),
+    rules: z.array(z.object({
+      sourceField:  z.string(),
+      targetField:  z.string().optional(),
+      type:         z.string().describe('date | boolean | number | map | trim | truncate | glide_datetime | glide_date | html_strip | preset'),
+      preset:       z.enum(['jira_status','jira_priority','sf_status','sf_priority']).optional(),
+      map:          z.record(z.string()).optional(),
+      fallback:     z.string().optional(),
+      default:      z.unknown().optional(),
+      maxLength:    z.number().optional(),
+      outputFormat: z.string().optional(),
+      toTimezone:   z.string().optional(),
+    })).describe('Transformation rules to apply'),
+  },
+  async ({ source_records, rules }) => {
+    try {
+      const resolvedRules = (rules ?? []).map(r => {
+        if (r.type === 'preset') {
+          const presets = {
+            jira_status:    TransformEngine.jiraStatusToSnState(),
+            jira_priority:  TransformEngine.jiraPriorityToSnPriority(),
+            sf_status:      TransformEngine.sfStatusToSnState(),
+            sf_priority:    TransformEngine.sfPriorityToSnPriority(),
+          };
+          return { ...presets[r.preset], sourceField: r.sourceField, targetField: r.targetField };
+        }
+        return r;
+      });
+      const engine = new TransformEngine(resolvedRules);
+      const transformed = engine.applyBatch(source_records ?? []);
+      return ok({ transformed, rules_applied: resolvedRules.length });
+    } catch (e) { return fail(e.message); }
+  }
+);
+
+// ══════════════════════════════════════════════════════════════════════════
+// TOOL: convert_rich_text
+// ══════════════════════════════════════════════════════════════════════════
+server.tool(
+  'convert_rich_text',
+  `Convert rich text from source platforms to ServiceNow-compatible HTML.
+   Supports Jira ADF (JSON document format), Salesforce HTML, and plain text.
+   Use hint="auto" to auto-detect. Returns converted HTML safe for SN fields.`,
+  {
+    values:  z.array(z.object({
+      id:    z.string().describe('Record identifier for reference'),
+      value: z.unknown().describe('Rich text value: ADF object, HTML string, or plain text'),
+    })).describe('Array of values to convert'),
+    hint: z.enum(['auto','adf','sf_html','text']).optional().default('auto').describe('Source format hint'),
+  },
+  async ({ values, hint }) => {
+    try {
+      const results = (values ?? []).map(({ id, value }) => ({
+        id,
+        html: toSnHtml(value, hint ?? 'auto'),
+      }));
+      return ok({ results, count: results.length });
+    } catch (e) { return fail(e.message); }
+  }
+);
+
+// ══════════════════════════════════════════════════════════════════════════
+// TOOL: topological_sort
+// ══════════════════════════════════════════════════════════════════════════
+server.tool(
+  'topological_sort',
+  `Sort a list of entity types / record IDs in dependency order (parents before children).
+   Useful for relationship-aware migration — e.g. migrate Epics before Stories before Sub-tasks.
+   Provide nodes (IDs) and edges ([parentId, childId] pairs).
+   Returns the sorted order.`,
+  {
+    nodes: z.array(z.string()).describe('List of record or type identifiers'),
+    edges: z.array(z.tuple([z.string(), z.string()])).describe('Dependency edges: [parent, child]'),
+  },
+  async ({ nodes, edges }) => {
+    try {
+      const sorted = topoSort(nodes ?? [], edges ?? []);
+      return ok({ sorted });
+    } catch (e) { return fail(e.message); }
+  }
+);
+
+// ══════════════════════════════════════════════════════════════════════════
+// TOOL: start_audit_session / log_audit_event
+// ══════════════════════════════════════════════════════════════════════════
+let _audit = null;
+
+server.tool(
+  'start_audit_session',
+  `Open an audit trail log file for this migration session. All subsequent migrations
+   will be recorded with before/after field values, timing, and error details.
+   Call this once at the start of any production migration.`,
+  {
+    output_path: z.string().optional().describe('Where to write the audit NDJSON log (default: ./migration-audit.ndjson)'),
+    session_id:  z.string().optional().describe('Human-readable session label'),
+  },
+  async ({ output_path, session_id }) => {
+    try {
+      _audit = new AuditTrail({ outputPath: output_path, sessionId: session_id });
+      _audit.open();
+      return ok({ message: 'Audit trail opened', output_path: _audit.outputPath, session_id: _audit.sessionId });
+    } catch (e) { return fail(e.message); }
+  }
+);
+
+server.tool(
+  'get_audit_stats',
+  `Return current audit trail statistics for the active migration session.
+   Shows counts of created, updated, skipped, and errored records, plus average time per record.`,
+  {},
+  async () => {
+    if (!_audit) return fail('No active audit session. Call start_audit_session first.');
+    return ok(_audit.stats());
   }
 );
 
