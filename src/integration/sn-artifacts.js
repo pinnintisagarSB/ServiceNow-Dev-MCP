@@ -251,8 +251,17 @@ export class SNArtifactBuilder {
     if (current.u_sync_in_progress == true) return;
 
     // ── Build payload from field map ───────────────────────────────────────
-    var fieldMapJson = gs.getProperty('${propKey}', '{}');
-    var fieldMap = JSON.parse(fieldMapJson);
+    // Bug fix: guard against null property (property may not exist on first run)
+    var fieldMapJson = gs.getProperty('${propKey}', null);
+    if (!fieldMapJson) {
+        gs.warn('${prefix}: Field map property "${propKey}" not found — skipping sync');
+        return;
+    }
+    var fieldMap;
+    try { fieldMap = JSON.parse(fieldMapJson); } catch(pe) {
+        gs.error('${prefix}: Invalid JSON in property "${propKey}": ' + pe.message);
+        return;
+    }
     var payload = { _sn_sys_id: current.sys_id.toString(), _sn_table: '${table}' };
     for (var snField in fieldMap) {
         if (fieldMap.hasOwnProperty(snField)) {
@@ -318,7 +327,12 @@ export class SNArtifactBuilder {
         retry.u_payload         = JSON.stringify(payload);
         retry.u_error           = e.message;
         retry.u_retry_count     = 0;
-        retry.u_next_retry      = new GlideDateTime();
+        // Exponential backoff: 1min, 5min, 25min, 2h, 10h for retries 0-4+
+        var backoffMinutes = [1, 5, 25, 120, 600];
+        var retryCount = 0; // first attempt
+        var nextRetry  = new GlideDateTime();
+        nextRetry.addSeconds((backoffMinutes[retryCount] || 600) * 60);
+        retry.u_next_retry      = nextRetry;
         retry.u_resolved        = false;
         retry.insert();
 
@@ -394,14 +408,35 @@ export class SNArtifactBuilder {
     return `
 (function process(request, response) {
 
+    // ── Webhook secret validation ──────────────────────────────────────────
+    var expectedSecret = gs.getProperty('${field_map_prop}.webhook_secret', null);
+    if (expectedSecret) {
+        var incomingSecret = request.getHeader('X-Webhook-Secret') || request.getHeader('X-Hub-Signature') || '';
+        if (incomingSecret !== expectedSecret) {
+            response.setStatus(401);
+            response.setBody({ status: 'error', message: 'Invalid webhook secret' });
+            return;
+        }
+    }
+
     var body = request.body.data || {};
     var externalId = body._external_id || body.id || body.key || body.Id || '';
     var snSysId    = body._sn_sys_id || '';
 
     // ── Load field map from sys_properties ────────────────────────────────
-    var fieldMapJson = gs.getProperty('${field_map_prop}', '{}');
-    var fieldMap     = JSON.parse(fieldMapJson);   // { snField: extField }
-    var inverted     = {};
+    var fieldMapJson = gs.getProperty('${field_map_prop}', null);
+    if (!fieldMapJson) {
+        response.setStatus(500);
+        response.setBody({ status: 'error', message: 'Integration field map not configured' });
+        return;
+    }
+    var fieldMap;
+    try { fieldMap = JSON.parse(fieldMapJson); } catch(pe) {
+        response.setStatus(500);
+        response.setBody({ status: 'error', message: 'Invalid field map JSON: ' + pe.message });
+        return;
+    }
+    var inverted = {};
     for (var snF in fieldMap) {
         if (fieldMap.hasOwnProperty(snF)) inverted[fieldMap[snF]] = snF;
     }
@@ -595,6 +630,90 @@ function onLoad() {
   }
 
   // ══════════════════════════════════════════════════════════════════════════
+  // 10. Scheduled Script Job — auto-retry failed syncs
+  // ══════════════════════════════════════════════════════════════════════════
+  async createRetryScheduledJob(plan) {
+    const prefix     = plan.meta.prefix;
+    const retryTable = plan.retry_table.name;
+    const correlTable = plan.correlation_table.name;
+    const msgName    = plan.outbound_a_to_b?.artifacts?.outbound_rest_message ?? `u_${prefix}_outbound`;
+    const jobName    = `${prefix}_retry_failed_syncs`;
+
+    logger.step(`Creating scheduled retry job: ${jobName}`);
+
+    const existing = await this.sn.get('sysauto_script', {
+      sysparm_query: `name=${jobName}`,
+      sysparm_limit: '1',
+    });
+    if (existing.length) { logger.info('  Scheduled job already exists'); return existing[0].sys_id; }
+
+    const script = `
+// Scheduled job: retry failed ${prefix} syncs
+// Runs every 15 minutes — processes records whose next_retry time has passed
+
+var gr = new GlideRecord('${retryTable}');
+gr.addQuery('u_resolved', false);
+gr.addQuery('u_retry_count', '<', 5);       // max 5 retries then give up
+gr.addQuery('u_next_retry', '<=', new GlideDateTime());
+gr.query();
+
+var processed = 0;
+while (gr.next()) {
+    processed++;
+    var retryCount = parseInt(gr.getValue('u_retry_count') || '0', 10);
+
+    try {
+        var payload = JSON.parse(gr.getValue('u_payload') || '{}');
+        var msg = new sn_ws.RESTMessageV2('${msgName}', 'create_or_update');
+        msg.setStringParameterNoEscape('payload', JSON.stringify(payload));
+        msg.setStringParameterNoEscape('correlation_id', payload._external_id || '');
+        msg.setStringParameterNoEscape('source_sys_id', payload._sn_sys_id || '');
+        msg.setHttpTimeout(30000);
+
+        var response = msg.execute();
+        var status   = response.getStatusCode();
+
+        if (status >= 200 && status < 300) {
+            gr.u_resolved    = true;
+            gr.u_retry_count = retryCount + 1;
+            gr.u_error       = '';
+            gr.update();
+            gs.info('${prefix} retry succeeded for ' + payload._sn_sys_id);
+        } else {
+            throw new Error('HTTP ' + status + ': ' + response.getBody());
+        }
+    } catch(e) {
+        retryCount++;
+        var backoffMinutes = [1, 5, 25, 120, 600];
+        var nextRetry = new GlideDateTime();
+        nextRetry.addSeconds((backoffMinutes[Math.min(retryCount, 4)] || 600) * 60);
+
+        gr.u_retry_count = retryCount;
+        gr.u_next_retry  = nextRetry;
+        gr.u_error       = e.message.substring(0, 4000);
+        if (retryCount >= 5) {
+            gs.error('${prefix} retry ABANDONED after 5 attempts for ' + gr.getValue('u_source_id'));
+        }
+        gr.update();
+    }
+}
+gs.info('${prefix} retry job complete — processed ' + processed + ' records');
+`.trim();
+
+    const rec = await this.sn.post('sysauto_script', {
+      name:            jobName,
+      script,
+      active:          true,
+      run_type:        'periodically',
+      run_period:      '0 0/15 * * * ?',    // every 15 minutes
+      description:     `Auto-retry failed ${prefix} sync records with exponential backoff`,
+    });
+
+    logger.ok(`  Scheduled job created (${rec.sys_id})`);
+    return rec.sys_id;
+  }
+
+  // ══════════════════════════════════════════════════════════════════════════
   // Run all SN artifacts in correct dependency order
   // ══════════════════════════════════════════════════════════════════════════
   async buildAll(plan, opts = {}) {
@@ -607,11 +726,12 @@ function onLoad() {
     results.sys_property      = await this.createSysProperty(plan);
 
     if (plan.meta.platformA === 'servicenow' || plan.meta.platformB === 'servicenow') {
-      results.outbound_rest = await this.createOutboundRest(plan, opts.targetUrl, opts.targetApiKey);
-      results.business_rule = await this.createBusinessRule(plan);
-      results.inbound_api   = await this.createInboundRestApi(plan);
-      results.ui_action     = await this.createUiAction(plan);
-      results.client_script = await this.createClientScript(plan);
+      results.outbound_rest  = await this.createOutboundRest(plan, opts.targetUrl, opts.targetApiKey);
+      results.business_rule  = await this.createBusinessRule(plan);
+      results.inbound_api    = await this.createInboundRestApi(plan);
+      results.ui_action      = await this.createUiAction(plan);
+      results.client_script  = await this.createClientScript(plan);
+      results.scheduled_job  = await this.createRetryScheduledJob(plan);
     }
 
     logger.success(`All SN artifacts created for ${plan.meta.prefix}`);

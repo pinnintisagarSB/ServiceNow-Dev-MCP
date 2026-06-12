@@ -3214,6 +3214,212 @@ server.tool(
   }
 );
 
+// ── TOOL: test_integration ────────────────────────────────────────────────
+server.tool(
+  'test_integration',
+  `Send a single test payload through the bidirectional integration end-to-end
+   and verify it arrives correctly on the other side.
+
+   For SN→external: touches a specific SN record (sets a harmless field) to
+   fire the Business Rule, then polls the correlation table to confirm the
+   external record was created/updated.
+
+   For external→SN: POSTs a test payload directly to the SN Scripted REST API
+   inbound endpoint and verifies the SN record was updated.
+
+   Returns: pass/fail verdict, response from both sides, correlation record state.`,
+  {
+    prefix:         z.string().describe('Integration prefix (from design_integration plan)'),
+    direction:      z.enum(['sn_to_external','external_to_sn']).describe('Which direction to test'),
+    sn_record_sys_id: z.string().optional().describe('For sn_to_external: sys_id of a real SN record to trigger sync on'),
+    test_payload:   z.record(z.unknown()).optional().describe('For external_to_sn: payload to POST to the inbound endpoint'),
+    sn_table:       z.string().optional().describe('SN table the record belongs to'),
+  },
+  async ({ prefix, direction, sn_record_sys_id, test_payload, sn_table }) => {
+    try {
+      const sn          = await getSn();
+      const correlTable = `u_${prefix}_correlation`;
+      const retryTable  = `u_${prefix}_sync_error`;
+
+      if (direction === 'sn_to_external') {
+        if (!sn_record_sys_id || !sn_table) return fail('sn_record_sys_id and sn_table are required for sn_to_external test');
+
+        // Touch the record to fire the Business Rule (set u_sync_in_progress = false to ensure BR fires)
+        await sn.patch(sn_table, sn_record_sys_id, { u_sync_in_progress: false });
+
+        // Wait 3 seconds for async processing, then check correlation table
+        await new Promise(r => setTimeout(r, 3000));
+
+        const corrRows = await sn.get(correlTable, {
+          sysparm_query: `u_record_sys_id_a=${sn_record_sys_id}`,
+          sysparm_fields: 'u_record_id_b,u_last_sync,u_sync_error,u_sync_direction',
+          sysparm_limit: '1',
+        });
+
+        const errors = await sn.get(retryTable, {
+          sysparm_query: `u_source_id=${sn_record_sys_id}^u_resolved=false`,
+          sysparm_fields: 'u_error,sys_created_on',
+          sysparm_limit: '1',
+        });
+
+        const passed = corrRows.length > 0 && !corrRows[0].u_sync_error && !errors.length;
+
+        return ok({
+          verdict: passed ? 'PASS' : 'FAIL',
+          correlation_record: corrRows[0] ?? null,
+          sync_error: errors[0]?.u_error ?? null,
+          instructions_for_claude: [
+            passed
+              ? `Test passed — SN record ${sn_record_sys_id} was synced to external platform. External ID: ${corrRows[0]?.u_record_id_b}`
+              : `Test failed — ${errors[0]?.u_error ?? 'No correlation record created. Check the Business Rule is active and the Outbound REST Message credentials are set.'}`,
+          ],
+        });
+      }
+
+      if (direction === 'external_to_sn') {
+        if (!test_payload) return fail('test_payload is required for external_to_sn test');
+
+        // POST directly to the SN Scripted REST API
+        const apiPath = `/api/x_snmig/${prefix}/sync`;
+        const result  = await sn.post(apiPath.replace('/api/', ''), test_payload).catch(e => ({ error: e.message }));
+
+        return ok({
+          verdict: result?.status === 'updated' || result?.status === 'ok' ? 'PASS' : 'FAIL',
+          response: result,
+          instructions_for_claude: [
+            result?.status === 'updated' || result?.status === 'ok'
+              ? `Test passed — inbound payload was applied to SN record ${result?.sys_id}`
+              : `Test failed — ${result?.error ?? result?.message ?? JSON.stringify(result)}. Check the Scripted REST API is active and the correlation field is populated.`,
+          ],
+        });
+      }
+
+      return fail(`Unknown direction: ${direction}`);
+    } catch (e) { return fail(e.message); }
+  }
+);
+
+// ── TOOL: disable_integration ─────────────────────────────────────────────
+server.tool(
+  'disable_integration',
+  `Pause a bidirectional integration by deactivating the Business Rule (outbound)
+   and the Scripted REST API (inbound) without deleting them.
+   Use this for maintenance windows, debugging, or bulk imports where you don't
+   want sync to fire. Call enable_integration to resume.`,
+  {
+    prefix: z.string().describe('Integration prefix'),
+  },
+  async ({ prefix }) => {
+    try {
+      const sn      = await getSn();
+      const brName  = `${prefix}_sync_outbound`;
+      const apiName = `${prefix}_inbound_api`;
+      const results = {};
+
+      const br = await sn.get('sys_script', { sysparm_query: `name=${brName}`, sysparm_limit: '1' });
+      if (br.length) {
+        await sn.patch('sys_script', br[0].sys_id, { active: false });
+        results.business_rule = 'deactivated';
+      } else results.business_rule = 'not_found';
+
+      const api = await sn.get('sys_ws_definition', { sysparm_query: `name=${apiName}`, sysparm_limit: '1' });
+      if (api.length) {
+        await sn.patch('sys_ws_definition', api[0].sys_id, { active: false });
+        results.scripted_rest_api = 'deactivated';
+      } else results.scripted_rest_api = 'not_found';
+
+      const job = await sn.get('sysauto_script', { sysparm_query: `name=${prefix}_retry_failed_syncs`, sysparm_limit: '1' });
+      if (job.length) {
+        await sn.patch('sysauto_script', job[0].sys_id, { active: false });
+        results.retry_job = 'deactivated';
+      } else results.retry_job = 'not_found';
+
+      return ok({
+        instructions_for_claude: [`Integration "${prefix}" paused. No syncs will fire in either direction until enable_integration is called.`],
+        prefix,
+        status: 'disabled',
+        artifacts: results,
+      });
+    } catch (e) { return fail(e.message); }
+  }
+);
+
+// ── TOOL: enable_integration ──────────────────────────────────────────────
+server.tool(
+  'enable_integration',
+  `Resume a paused bidirectional integration by re-activating the Business Rule,
+   Scripted REST API, and retry scheduled job.`,
+  {
+    prefix: z.string().describe('Integration prefix'),
+  },
+  async ({ prefix }) => {
+    try {
+      const sn      = await getSn();
+      const results = {};
+
+      const br = await sn.get('sys_script', { sysparm_query: `name=${prefix}_sync_outbound`, sysparm_limit: '1' });
+      if (br.length) { await sn.patch('sys_script', br[0].sys_id, { active: true }); results.business_rule = 'activated'; }
+
+      const api = await sn.get('sys_ws_definition', { sysparm_query: `name=${prefix}_inbound_api`, sysparm_limit: '1' });
+      if (api.length) { await sn.patch('sys_ws_definition', api[0].sys_id, { active: true }); results.scripted_rest_api = 'activated'; }
+
+      const job = await sn.get('sysauto_script', { sysparm_query: `name=${prefix}_retry_failed_syncs`, sysparm_limit: '1' });
+      if (job.length) { await sn.patch('sysauto_script', job[0].sys_id, { active: true }); results.retry_job = 'activated'; }
+
+      return ok({
+        instructions_for_claude: [`Integration "${prefix}" is now active. Syncs will resume in both directions.`],
+        prefix,
+        status: 'enabled',
+        artifacts: results,
+      });
+    } catch (e) { return fail(e.message); }
+  }
+);
+
+// ── TOOL: update_field_mappings ────────────────────────────────────────────
+server.tool(
+  'update_field_mappings',
+  `Update the field mapping configuration for an existing integration without
+   recreating any artifacts. The mapping is stored in a sys_property record —
+   this tool updates that property and returns the new active mapping.
+
+   Use when adding new fields to sync, removing fields, or correcting a mapping
+   mistake. Changes take effect immediately on the next sync event.`,
+  {
+    prefix:         z.string().describe('Integration prefix'),
+    field_mappings: z.record(z.string()).describe('Complete NEW field mapping { snField: externalField }. Replaces the existing mapping entirely.'),
+    merge:          z.boolean().optional().default(false).describe('If true, merge with existing mapping instead of replacing it'),
+  },
+  async ({ prefix, field_mappings, merge }) => {
+    try {
+      const sn      = await getSn();
+      const propKey = `x_snmig.${prefix}.field_map`;
+
+      const existing = await sn.get('sys_properties', { sysparm_query: `name=${propKey}`, sysparm_limit: '1' });
+      if (!existing.length) return fail(`Property ${propKey} not found — has the integration been created with create_sn_integration_artifacts?`);
+
+      let newMapping = field_mappings;
+      if (merge) {
+        const current = JSON.parse(existing[0].value || '{}');
+        newMapping = { ...current, ...field_mappings };
+      }
+
+      await sn.patch('sys_properties', existing[0].sys_id, { value: JSON.stringify(newMapping, null, 2) });
+
+      return ok({
+        instructions_for_claude: [
+          `Field mapping updated for "${prefix}". Changes are live immediately — the next sync event will use the new mapping.`,
+          `Total mapped fields: ${Object.keys(newMapping).length}`,
+        ],
+        prefix,
+        prop_key:       propKey,
+        active_mapping: newMapping,
+        field_count:    Object.keys(newMapping).length,
+      });
+    } catch (e) { return fail(e.message); }
+  }
+);
+
 // ── TOOL: retry_failed_syncs ──────────────────────────────────────────────
 server.tool(
   'retry_failed_syncs',
@@ -3221,11 +3427,12 @@ server.tool(
    For each failed record, re-fires the Business Rule by touching the source record.
    Pass dry_run=true to see what would be retried without actually doing it.`,
   {
-    prefix:  z.string().describe('Integration prefix'),
+    prefix:       z.string().describe('Integration prefix'),
+    source_table: z.string().optional().describe('Source SN table name (required if not derivable from prefix, e.g. "incident")'),
     dry_run: z.boolean().optional().default(false),
     limit:   z.number().optional().default(50).describe('Max records to retry in one call'),
   },
-  async ({ prefix, dry_run, limit }) => {
+  async ({ prefix, source_table, dry_run, limit }) => {
     try {
       const sn         = await getSn();
       const retryTable = `u_${prefix}_sync_error`;
@@ -3246,8 +3453,9 @@ server.tool(
           // Mark as resolved (business rule will re-queue if it fails again)
           await sn.patch(retryTable, row.sys_id, { u_resolved: true });
           // Touch the source record to re-trigger the business rule
-          const sourceTable = prefix.replace(/^[a-z]+_[a-z]+_/, '');
-          await sn.patch(sourceTable, row.u_source_id, { u_sync_in_progress: false }).catch(() => null);
+          // source_table param is explicit; fallback to last segment of prefix
+          const tbl = source_table ?? prefix.split('_').slice(2).join('_') || prefix;
+          await sn.patch(tbl, row.u_source_id, { u_sync_in_progress: false }).catch(() => null);
           results.push({ source_id: row.u_source_id, status: 'queued' });
         } catch (e) {
           results.push({ source_id: row.u_source_id, status: 'error', error: e.message });

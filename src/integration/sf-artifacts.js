@@ -77,6 +77,10 @@ export class SFArtifactBuilder {
  */
 public class ${className} implements Queueable, Database.AllowsCallouts {
 
+    // Static bypass flag — set to true by the inbound REST handler before
+    // updating SF records, so this trigger does not fire a callout back out.
+    public static Boolean bypassTrigger = false;
+
     private String recordId;
     private String objectType;
     private String action; // 'create_or_update' | 'delete'
@@ -91,9 +95,11 @@ public class ${className} implements Queueable, Database.AllowsCallouts {
         // ── Load the record ────────────────────────────────────────────────
         SObject record;
         try {
+            // Bug fix: Dynamic SOQL strings don't support bind vars — use escapeSingleQuotes
+            String safeId = String.escapeSingleQuotes(recordId);
             record = Database.query(
                 'SELECT Id, ' + getFieldList() + ' FROM ' + objectType +
-                ' WHERE Id = :recordId LIMIT 1'
+                ' WHERE Id = \'' + safeId + '\' LIMIT 1'
             );
         } catch (Exception e) {
             System.debug(LoggingLevel.ERROR, '${className}: Failed to load record ' + recordId + ': ' + e.getMessage());
@@ -134,11 +140,11 @@ ${fieldBuildLines}
                 if (extId == null) extId = (String) respBody.get('sys_id');
 
                 // Store the external ID back on the SF record for future syncs
+                // Bug fix: newSObject() takes no args — set Id field separately
                 if (String.isNotBlank(extId) && String.isBlank(externalId)) {
-                    SObject toUpdate = record.getSObjectType().newSObject(recordId);
+                    SObject toUpdate = record.getSObjectType().newSObject();
+                    toUpdate.put('Id', recordId);
                     toUpdate.put('${prefix}__Ext_Id__c', extId);
-                    // Suppress trigger re-fire: use system context or a bypass flag
-                    // TriggerBypass__c.${prefix}__Bypass__c = true  ← set before update
                     Database.update(toUpdate, false);
                 }
                 System.debug('${className}: Sync OK — SF ' + recordId + ' → ${target} ' + extId);
@@ -188,8 +194,9 @@ ${Object.keys(fieldMaps).map(f => `        fields.add('${f}');`).join('\n')}
 trigger ${trigName} on ${sfTable} (${sfEvents.join(', ')}) {
 
     // ── Bypass check (prevents infinite loop on inbound sync updates) ──────
-    // Set ${prefix}__SyncBypass__c = true on the user/session when updating from inbound sync
-    if (${prefix}__TriggerBypass__mdt.getInstance('${prefix}')?.${prefix}__Active__c == true) return;
+    // bypassTrigger is set to true by the inbound Apex REST class before
+    // it updates SF records, so we don't fire a callout back out.
+    if (${calloutCls}.bypassTrigger) return;
 
     List<String> recordIds = new List<String>();
     List<SObject> records  = Trigger.isDelete ? Trigger.old : Trigger.new;
@@ -254,16 +261,19 @@ global class ${className} {
             SObject rec;
             Boolean isNew = false;
 
+            // Bug fix: Dynamic SOQL strings don't support bind vars
             if (String.isNotBlank(sfId)) {
+                String safeId = String.escapeSingleQuotes(sfId);
                 List<SObject> found = Database.query(
-                    'SELECT Id FROM ${sfTable} WHERE Id = :sfId LIMIT 1'
+                    'SELECT Id FROM ${sfTable} WHERE Id = \'' + safeId + '\' LIMIT 1'
                 );
                 if (!found.isEmpty()) rec = found[0];
             }
 
             if (rec == null && String.isNotBlank(externalId)) {
+                String safeExtId = String.escapeSingleQuotes(externalId);
                 List<SObject> found = Database.query(
-                    'SELECT Id FROM ${sfTable} WHERE ${prefix}__Ext_Id__c = :externalId LIMIT 1'
+                    'SELECT Id FROM ${sfTable} WHERE ${prefix}__Ext_Id__c = \'' + safeExtId + '\' LIMIT 1'
                 );
                 if (!found.isEmpty()) rec = found[0];
             }
@@ -274,19 +284,22 @@ global class ${className} {
             }
 
             // ── Loop prevention ────────────────────────────────────────────
-            // Set bypass flag so our trigger doesn't fire back
-            // ${prefix}__TriggerBypass__mdt — set via test or bypass mechanism
+            // Insert a Custom Metadata record to signal bypass to the trigger.
+            // The trigger checks: ${prefix}__TriggerBypass__mdt.getInstance(UserInfo.getUserId())
+            // We use a thread-local static flag as the most reliable approach:
+            ${this._toClassName(prefix)}SyncCallout.bypassTrigger = true;
 
             // ── Apply field mappings ───────────────────────────────────────
 ${fieldAssignLines}
             if (String.isNotBlank(externalId)) rec.put('${prefix}__Ext_Id__c', externalId);
 
-            // ── Save ───────────────────────────────────────────────────────
+            // ── Save (trigger bypass is active) ───────────────────────────
             if (isNew) {
                 Database.insert(rec, false);
             } else {
                 Database.update(rec, false);
             }
+            ${this._toClassName(prefix)}SyncCallout.bypassTrigger = false;
 
             resp.statusCode = 200;
             result.put('status', 'ok');
