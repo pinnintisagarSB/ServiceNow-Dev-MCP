@@ -123,6 +123,32 @@ export class SalesforceConnector {
     return json;
   }
 
+  async patch(path, body) {
+    const res = await httpFetch(`${this.instanceUrl}${path}`, {
+      method: 'PATCH',
+      headers: { ...this.headers(), 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+    this._readLimits(res);
+    if (res.status === 204) return { updated: true };
+    const text = await res.text();
+    const json = text ? JSON.parse(text) : {};
+    if (!res.ok) throw new Error(`SF PATCH ${path} → ${res.status}: ${JSON.stringify(json[0] ?? json)}`);
+    return json;
+  }
+
+  async delete(path) {
+    const res = await httpFetch(`${this.instanceUrl}${path}`, {
+      method: 'DELETE', headers: this.headers(),
+    });
+    this._readLimits(res);
+    if (res.status === 204) return { deleted: true };
+    const text = await res.text();
+    const json = text ? JSON.parse(text) : {};
+    if (!res.ok) throw new Error(`SF DELETE ${path} → ${res.status}: ${JSON.stringify(json[0] ?? json)}`);
+    return json;
+  }
+
   // ── Schema Discovery ───────────────────────────────────────────────────────
   async describeObject(objectName) {
     return this.get(`/services/data/${this.apiVersion}/sobjects/${objectName}/describe`);

@@ -4834,6 +4834,596 @@ Common use: adding custom states, priorities, categories, or types.`,
   }
 );
 
+// ═══════════════════════════════════════════════════════════════════════════
+// CRUD TOOLS — general-purpose Create / Read / Update / Delete
+// Covers ServiceNow, Jira, and Salesforce via a single unified interface.
+// Delete operations always require confirm=true to prevent accidents.
+// ═══════════════════════════════════════════════════════════════════════════
+
+// ── Shared helpers ─────────────────────────────────────────────────────────
+const _snApiPath  = (table, sysId) => sysId ? `/api/now/table/${table}/${sysId}` : `/api/now/table/${table}`;
+const _sfSobject  = (obj, id, ver)  => id ? `/services/data/${ver}/sobjects/${obj}/${id}` : `/services/data/${ver}/sobjects/${obj}`;
+const _jiraIssue  = (key) => `/rest/api/3/issue/${key}`;
+
+// ══════════════════════════════════════════════════════════════════════════
+// SERVICENOW CRUD
+// ══════════════════════════════════════════════════════════════════════════
+
+// ── TOOL: sn_create ───────────────────────────────────────────────────────
+server.tool(
+  'sn_create',
+  `Create a record in any ServiceNow table via the Table API.
+
+Examples:
+  table="incident"  fields={short_description:"Server down", priority:"1", category:"hardware"}
+  table="sc_task"   fields={short_description:"Provision laptop", assigned_to:"john.doe"}
+  table="sys_user"  fields={user_name:"jsmith", first_name:"John", last_name:"Smith", email:"j@co.com"}
+  table="u_my_custom_table"  fields={u_field:"value"}
+
+Returns the created record including its sys_id.`,
+  {
+    table:  z.string().describe('ServiceNow table name (e.g. "incident", "sc_task", "sys_user")'),
+    fields: z.record(z.unknown()).describe('Field name → value pairs to set on the new record'),
+    return_fields: z.string().optional().describe('Comma-separated fields to return (default: all)'),
+  },
+  async ({ table, fields, return_fields }) => {
+    try {
+      const sn     = await getSn();
+      const params = return_fields ? { sysparm_fields: return_fields } : {};
+      // SN POST doesn't accept sysparm_fields as query param — fetch after create
+      const created = await sn.post(table, fields);
+      const sysId   = created?.sys_id ?? created;
+      if (return_fields && sysId) {
+        const record = await sn.getById(table, sysId, { sysparm_fields: return_fields });
+        return ok({ created: true, sys_id: sysId, record });
+      }
+      return ok({ created: true, sys_id: sysId, record: created });
+    } catch (e) { return fail(e.message); }
+  }
+);
+
+// ── TOOL: sn_read ─────────────────────────────────────────────────────────
+server.tool(
+  'sn_read',
+  `Read one or many records from any ServiceNow table.
+
+  - Provide sys_id to fetch a single record by ID
+  - Provide query (encoded query string) to search multiple records
+  - Leave both blank to get the first N records
+
+Examples:
+  table="incident" sys_id="abc123..."
+  table="incident" query="active=true^priority=1^assigned_to=javascript:gs.getUserID()" limit=10
+  table="sys_user" query="active=true^email=john@company.com"
+  table="sc_cat_item" query="active=true^nameLIKElaptop" fields="name,short_description,price"`,
+  {
+    table:  z.string().describe('ServiceNow table name'),
+    sys_id: z.string().optional().describe('Fetch a single record by sys_id'),
+    query:  z.string().optional().describe('Encoded query string (e.g. "active=true^priority=1")'),
+    fields: z.string().optional().describe('Comma-separated field names to return'),
+    limit:  z.number().optional().default(20).describe('Max records for multi-record reads'),
+    order_by: z.string().optional().describe('Field to order by (prefix with - for descending, e.g. "-sys_created_on")'),
+  },
+  async ({ table, sys_id, query, fields, limit, order_by }) => {
+    try {
+      const sn = await getSn();
+      if (sys_id) {
+        const params = {};
+        if (fields) params.sysparm_fields = fields;
+        const record = await sn.getById(table, sys_id, params);
+        return ok({ table, sys_id, record });
+      }
+      const params = { sysparm_limit: String(limit ?? 20) };
+      if (query)    params.sysparm_query   = query;
+      if (fields)   params.sysparm_fields  = fields;
+      if (order_by) params.sysparm_order_by = order_by.startsWith('-')
+        ? undefined : order_by;
+      if (order_by?.startsWith('-')) params.sysparm_order_by_desc = order_by.slice(1);
+      const records = await sn.get(table, params);
+      return ok({ table, count: records.length, records });
+    } catch (e) { return fail(e.message); }
+  }
+);
+
+// ── TOOL: sn_update ───────────────────────────────────────────────────────
+server.tool(
+  'sn_update',
+  `Update a ServiceNow record by sys_id (PATCH — only the fields you provide are changed).
+
+Examples:
+  table="incident" sys_id="abc123" fields={state:"6", close_notes:"Resolved by restart"}
+  table="sys_user" sys_id="xyz456" fields={title:"Senior Engineer", department:"Engineering"}
+  table="sc_task"  sys_id="def789" fields={assigned_to:"jane.doe", state:"2"}
+
+Returns the updated record.`,
+  {
+    table:  z.string().describe('ServiceNow table name'),
+    sys_id: z.string().describe('sys_id of the record to update'),
+    fields: z.record(z.unknown()).describe('Field name → new value pairs (only changed fields needed)'),
+    return_fields: z.string().optional().describe('Comma-separated fields to return after update'),
+  },
+  async ({ table, sys_id, fields, return_fields }) => {
+    try {
+      const sn      = await getSn();
+      const updated = await sn.patch(table, sys_id, fields);
+      if (return_fields) {
+        const record = await sn.getById(table, sys_id, { sysparm_fields: return_fields });
+        return ok({ updated: true, sys_id, record });
+      }
+      return ok({ updated: true, sys_id, record: updated });
+    } catch (e) { return fail(e.message); }
+  }
+);
+
+// ── TOOL: sn_delete ───────────────────────────────────────────────────────
+server.tool(
+  'sn_delete',
+  `Delete a ServiceNow record by sys_id.
+
+SAFETY: You must pass confirm=true explicitly — this cannot be undone.
+
+Examples:
+  table="incident" sys_id="abc123" confirm=true
+  table="u_staging_jira_kan" sys_id="xyz456" confirm=true
+
+To preview what will be deleted without actually deleting, pass confirm=false (default).`,
+  {
+    table:   z.string().describe('ServiceNow table name'),
+    sys_id:  z.string().describe('sys_id of the record to delete'),
+    confirm: z.boolean().describe('Must be true to execute — prevents accidental deletes'),
+  },
+  async ({ table, sys_id, confirm }) => {
+    try {
+      if (!confirm) {
+        const sn     = await getSn();
+        const record = await sn.getById(table, sys_id, { sysparm_fields: 'sys_id,number,name,short_description,sys_created_on' }).catch(() => ({ sys_id }));
+        return ok({
+          confirm_required: true,
+          preview:   { table, sys_id, record },
+          warning:   'Set confirm=true to permanently delete this record. This cannot be undone.',
+        });
+      }
+      const sn = await getSn();
+      await sn.delete(table, sys_id);
+      return ok({ deleted: true, table, sys_id });
+    } catch (e) { return fail(e.message); }
+  }
+);
+
+// ══════════════════════════════════════════════════════════════════════════
+// JIRA CRUD
+// ══════════════════════════════════════════════════════════════════════════
+
+// ── TOOL: jira_create ─────────────────────────────────────────────────────
+server.tool(
+  'jira_create',
+  `Create any Jira resource. Set resource_type to choose what to create.
+
+resource_type options:
+  issue        — Create an issue/ticket (most common)
+  comment      — Add a comment to an issue
+  subtask      — Create a sub-task under a parent issue
+  component    — Add a component to a project
+  version      — Create a version/release in a project
+  label        — Labels are set on issues, not created separately
+
+Issue example:
+  resource_type="issue"
+  project_key="KAN"
+  issue_type="Task"
+  summary="Set up monitoring for prod servers"
+  description="Install Datadog agent on all prod nodes"
+  priority="High"
+  assignee="jsmith"
+  labels=["ops","monitoring"]
+
+Comment example:
+  resource_type="comment"
+  issue_key="KAN-42"
+  body="Picked up — will update by EOD"`,
+  {
+    resource_type: z.enum(['issue','comment','subtask','component','version']),
+    // Issue / subtask
+    project_key:  z.string().optional().describe('Jira project key (e.g. "KAN")'),
+    issue_type:   z.string().optional().default('Task').describe('Issue type: Task, Bug, Story, Epic, Sub-task'),
+    summary:      z.string().optional().describe('Issue summary / title'),
+    description:  z.string().optional().describe('Issue description (plain text — will be wrapped in ADF)'),
+    priority:     z.string().optional().describe('Priority: Highest, High, Medium, Low, Lowest'),
+    assignee:     z.string().optional().describe('Assignee account ID or username'),
+    labels:       z.array(z.string()).optional(),
+    parent_key:   z.string().optional().describe('Parent issue key (required for subtask)'),
+    extra_fields: z.record(z.unknown()).optional().describe('Any extra fields to set on the issue'),
+    // Comment
+    issue_key:    z.string().optional().describe('Issue key to comment on (e.g. "KAN-42")'),
+    body:         z.string().optional().describe('Comment body text'),
+    // Component
+    name:         z.string().optional().describe('Component or version name'),
+    component_lead: z.string().optional().describe('Component lead account ID'),
+    // Version
+    release_date: z.string().optional().describe('Release date (YYYY-MM-DD)'),
+  },
+  async ({ resource_type, project_key, issue_type, summary, description, priority, assignee, labels, parent_key, extra_fields, issue_key, body, name, component_lead, release_date }) => {
+    try {
+      const jira = await getJira();
+
+      if (resource_type === 'issue' || resource_type === 'subtask') {
+        const fields = {
+          project:   { key: project_key },
+          issuetype: { name: resource_type === 'subtask' ? 'Sub-task' : (issue_type ?? 'Task') },
+          summary:   summary ?? '(no summary)',
+          ...(description && { description: { type: 'doc', version: 1, content: [{ type: 'paragraph', content: [{ type: 'text', text: description }] }] } }),
+          ...(priority    && { priority: { name: priority } }),
+          ...(assignee    && { assignee: { accountId: assignee } }),
+          ...(labels      && { labels }),
+          ...(parent_key  && { parent: { key: parent_key } }),
+          ...(extra_fields ?? {}),
+        };
+        const result = await jira.post('/rest/api/3/issue', { fields });
+        return ok({ created: true, resource_type, key: result.key, id: result.id, url: `${jira.baseUrl}/browse/${result.key}` });
+      }
+
+      if (resource_type === 'comment') {
+        const result = await jira.post(`/rest/api/3/issue/${issue_key}/comment`, {
+          body: { type: 'doc', version: 1, content: [{ type: 'paragraph', content: [{ type: 'text', text: body ?? '' }] }] },
+        });
+        return ok({ created: true, resource_type, comment_id: result.id, issue_key });
+      }
+
+      if (resource_type === 'component') {
+        const result = await jira.post('/rest/api/3/component', {
+          name, project: project_key,
+          ...(component_lead && { leadAccountId: component_lead }),
+        });
+        return ok({ created: true, resource_type, id: result.id, name: result.name });
+      }
+
+      if (resource_type === 'version') {
+        const result = await jira.post('/rest/api/3/version', {
+          name, projectId: project_key,
+          ...(release_date && { releaseDate: release_date }),
+          released: false, archived: false,
+        });
+        return ok({ created: true, resource_type, id: result.id, name: result.name });
+      }
+
+      return fail(`Unknown resource_type: ${resource_type}`);
+    } catch (e) { return fail(e.message); }
+  }
+);
+
+// ── TOOL: jira_read ───────────────────────────────────────────────────────
+server.tool(
+  'jira_read',
+  `Read Jira issues, projects, users, or boards.
+
+resource_type options:
+  issue        — Get one issue by key (e.g. "KAN-42")
+  search       — JQL search across all projects
+  project      — Get project metadata
+  user         — Find a user by email or display name
+  board        — List boards in a project
+  sprint       — List sprints on a board
+  transitions  — Get available transitions for an issue (for status changes)
+  comments     — Get comments on an issue
+
+Examples:
+  resource_type="issue"  issue_key="KAN-42"
+  resource_type="search" jql="project=KAN AND status='In Progress' AND assignee=currentUser()" limit=20
+  resource_type="user"   query="john.smith@company.com"`,
+  {
+    resource_type: z.enum(['issue','search','project','user','board','sprint','transitions','comments']),
+    issue_key:     z.string().optional().describe('Issue key (e.g. "KAN-42")'),
+    jql:           z.string().optional().describe('JQL query for search'),
+    project_key:   z.string().optional().describe('Project key'),
+    query:         z.string().optional().describe('User search query (email or display name)'),
+    board_id:      z.string().optional().describe('Board ID for sprint queries'),
+    fields:        z.string().optional().describe('Comma-separated fields (default: all)'),
+    limit:         z.number().optional().default(20),
+  },
+  async ({ resource_type, issue_key, jql, project_key, query, board_id, fields, limit }) => {
+    try {
+      const jira = await getJira();
+
+      if (resource_type === 'issue') {
+        const params = fields ? { fields } : {};
+        const issue  = await jira.get(_jiraIssue(issue_key), params);
+        return ok({ resource_type, issue_key, issue });
+      }
+
+      if (resource_type === 'search') {
+        const result = await jira.search({ jql: jql ?? 'ORDER BY created DESC', maxResults: limit ?? 20, fields: fields ? fields.split(',') : ['*all'] });
+        const issues = result.issues ?? result;
+        return ok({ resource_type, jql, count: issues.length, issues });
+      }
+
+      if (resource_type === 'project') {
+        const project = await jira.getProject(project_key);
+        return ok({ resource_type, project_key, project });
+      }
+
+      if (resource_type === 'user') {
+        const users = await jira.get('/rest/api/3/user/search', { query: query ?? '', maxResults: limit ?? 10 });
+        return ok({ resource_type, query, count: users.length, users });
+      }
+
+      if (resource_type === 'board') {
+        const result = await jira.get('/rest/agile/1.0/board', { projectKeyOrId: project_key ?? '', maxResults: limit ?? 20 });
+        return ok({ resource_type, project_key, boards: result.values ?? [] });
+      }
+
+      if (resource_type === 'sprint') {
+        const result = await jira.get(`/rest/agile/1.0/board/${board_id}/sprint`, { maxResults: limit ?? 20 });
+        return ok({ resource_type, board_id, sprints: result.values ?? [] });
+      }
+
+      if (resource_type === 'transitions') {
+        const result = await jira.get(`/rest/api/3/issue/${issue_key}/transitions`);
+        return ok({ resource_type, issue_key, transitions: result.transitions ?? [] });
+      }
+
+      if (resource_type === 'comments') {
+        const result = await jira.getComments(issue_key);
+        const comments = result.comments ?? result;
+        return ok({ resource_type, issue_key, count: comments.length, comments });
+      }
+
+      return fail(`Unknown resource_type: ${resource_type}`);
+    } catch (e) { return fail(e.message); }
+  }
+);
+
+// ── TOOL: jira_update ─────────────────────────────────────────────────────
+server.tool(
+  'jira_update',
+  `Update a Jira issue or transition it to a new status.
+
+update_type options:
+  fields      — Update issue fields (summary, description, priority, assignee, labels, etc.)
+  transition  — Move issue to a new status (uses transition ID from jira_read transitions)
+  comment     — Edit an existing comment
+
+Fields update example:
+  issue_key="KAN-42" update_type="fields"
+  fields={summary:"Updated title", priority:{name:"High"}, assignee:{accountId:"abc123"}}
+
+Transition example:
+  issue_key="KAN-42" update_type="transition" transition_id="31"
+  (Get transition IDs first with: jira_read resource_type="transitions" issue_key="KAN-42")`,
+  {
+    issue_key:     z.string().describe('Issue key (e.g. "KAN-42")'),
+    update_type:   z.enum(['fields','transition','comment']),
+    fields:        z.record(z.unknown()).optional().describe('Fields to update'),
+    transition_id: z.string().optional().describe('Transition ID (from jira_read transitions)'),
+    comment_id:    z.string().optional().describe('Comment ID to edit'),
+    comment_body:  z.string().optional().describe('New comment text'),
+  },
+  async ({ issue_key, update_type, fields, transition_id, comment_id, comment_body }) => {
+    try {
+      const jira = await getJira();
+
+      if (update_type === 'fields') {
+        await jira.put(_jiraIssue(issue_key), { fields: fields ?? {} });
+        return ok({ updated: true, issue_key, update_type, fields_set: Object.keys(fields ?? {}) });
+      }
+
+      if (update_type === 'transition') {
+        await jira.post(`${_jiraIssue(issue_key)}/transitions`, {
+          transition: { id: transition_id },
+        });
+        return ok({ updated: true, issue_key, update_type, transition_id });
+      }
+
+      if (update_type === 'comment') {
+        const result = await jira.put(`${_jiraIssue(issue_key)}/comment/${comment_id}`, {
+          body: { type: 'doc', version: 1, content: [{ type: 'paragraph', content: [{ type: 'text', text: comment_body ?? '' }] }] },
+        });
+        return ok({ updated: true, issue_key, comment_id, update_type });
+      }
+
+      return fail(`Unknown update_type: ${update_type}`);
+    } catch (e) { return fail(e.message); }
+  }
+);
+
+// ── TOOL: jira_delete ─────────────────────────────────────────────────────
+server.tool(
+  'jira_delete',
+  `Delete a Jira resource.
+
+SAFETY: You must pass confirm=true — deletions in Jira are permanent.
+
+resource_type options:
+  issue    — Delete an issue (and all its comments, attachments, sub-tasks)
+  comment  — Delete a specific comment from an issue
+
+Examples:
+  resource_type="issue"   issue_key="KAN-42" confirm=true
+  resource_type="comment" issue_key="KAN-42" comment_id="10234" confirm=true`,
+  {
+    resource_type: z.enum(['issue','comment']),
+    issue_key:     z.string().describe('Issue key'),
+    comment_id:    z.string().optional().describe('Comment ID (required for comment delete)'),
+    confirm:       z.boolean().describe('Must be true to execute — prevents accidental deletes'),
+  },
+  async ({ resource_type, issue_key, comment_id, confirm }) => {
+    try {
+      if (!confirm) {
+        return ok({
+          confirm_required: true,
+          preview:  { resource_type, issue_key, comment_id },
+          warning:  'Set confirm=true to permanently delete. This cannot be undone. Issue deletion removes all sub-tasks, comments, and attachments.',
+        });
+      }
+      const jira = await getJira();
+      if (resource_type === 'issue') {
+        await jira.delete(`${_jiraIssue(issue_key)}?deleteSubtasks=true`);
+        return ok({ deleted: true, resource_type, issue_key });
+      }
+      if (resource_type === 'comment') {
+        await jira.delete(`${_jiraIssue(issue_key)}/comment/${comment_id}`);
+        return ok({ deleted: true, resource_type, issue_key, comment_id });
+      }
+      return fail(`Unknown resource_type: ${resource_type}`);
+    } catch (e) { return fail(e.message); }
+  }
+);
+
+// ══════════════════════════════════════════════════════════════════════════
+// SALESFORCE CRUD
+// ══════════════════════════════════════════════════════════════════════════
+
+// ── TOOL: sf_create ───────────────────────────────────────────────────────
+server.tool(
+  'sf_create',
+  `Create a record in any Salesforce object (Account, Case, Contact, Lead, Opportunity, or any custom object).
+
+Examples:
+  object="Case"    fields={Subject:"Server outage", Status:"New", Priority:"High", Origin:"Web"}
+  object="Account" fields={Name:"Acme Corp", Industry:"Technology", BillingCity:"San Francisco"}
+  object="Contact" fields={FirstName:"Jane", LastName:"Smith", Email:"jane@acme.com", AccountId:"001..."}
+  object="Lead"    fields={FirstName:"Bob", LastName:"Jones", Company:"StartupCo", Status:"Open - Not Contacted"}
+
+Returns the Id of the created record.`,
+  {
+    object: z.string().describe('Salesforce object API name (e.g. "Case", "Account", "Contact", "MyCustomObject__c")'),
+    fields: z.record(z.unknown()).describe('Field API name → value pairs'),
+  },
+  async ({ object, fields }) => {
+    try {
+      const sf   = await getSf();
+      const result = await sf.post(`/services/data/${sf.apiVersion}/sobjects/${object}`, fields);
+      return ok({ created: true, object, id: result.id, success: result.success, errors: result.errors ?? [] });
+    } catch (e) { return fail(e.message); }
+  }
+);
+
+// ── TOOL: sf_read ─────────────────────────────────────────────────────────
+server.tool(
+  'sf_read',
+  `Read Salesforce records.
+
+read_type options:
+  by_id   — Fetch a single record by Salesforce Id
+  query   — SOQL SELECT query (most flexible)
+  describe — Object schema (fields, types, picklist values)
+
+Examples:
+  read_type="by_id"   object="Case" id="500..."  fields="Id,CaseNumber,Subject,Status,Priority"
+  read_type="query"   soql="SELECT Id, Subject, Status FROM Case WHERE Status = 'New' LIMIT 20"
+  read_type="describe" object="Case"
+  read_type="query"   soql="SELECT Id, Name, Industry FROM Account WHERE BillingState = 'CA' LIMIT 50"`,
+  {
+    read_type: z.enum(['by_id','query','describe']),
+    object:    z.string().optional().describe('Object API name (required for by_id and describe)'),
+    id:        z.string().optional().describe('Salesforce record Id (15 or 18 character)'),
+    fields:    z.string().optional().describe('Comma-separated field names for by_id reads'),
+    soql:      z.string().optional().describe('Full SOQL query for query read_type'),
+    limit:     z.number().optional().default(20).describe('Limit for queries without LIMIT clause'),
+  },
+  async ({ read_type, object, id, fields, soql, limit }) => {
+    try {
+      const sf = await getSf();
+
+      if (read_type === 'by_id') {
+        const path = `/services/data/${sf.apiVersion}/sobjects/${object}/${id}`;
+        const params = fields ? { fields } : {};
+        const record = await sf.get(path, params);
+        return ok({ read_type, object, id, record });
+      }
+
+      if (read_type === 'query') {
+        let finalSoql = soql ?? `SELECT Id FROM ${object} LIMIT ${limit}`;
+        if (!finalSoql.toUpperCase().includes('LIMIT')) finalSoql += ` LIMIT ${limit}`;
+        const result = await sf.query(finalSoql);
+        return ok({ read_type, soql: finalSoql, total_size: result.totalSize, done: result.done, records: result.records ?? [] });
+      }
+
+      if (read_type === 'describe') {
+        const schema = await sf.describeObject(object);
+        return ok({
+          read_type, object,
+          label:      schema.label,
+          key_prefix: schema.keyPrefix,
+          field_count: schema.fields?.length ?? 0,
+          fields:     (schema.fields ?? []).map(f => ({
+            name:         f.name,
+            label:        f.label,
+            type:         f.type,
+            required:     !f.nillable,
+            updateable:   f.updateable,
+            createable:   f.createable,
+            picklist:     f.picklistValues?.length ? f.picklistValues.map(p => p.value) : null,
+          })),
+        });
+      }
+
+      return fail(`Unknown read_type: ${read_type}`);
+    } catch (e) { return fail(e.message); }
+  }
+);
+
+// ── TOOL: sf_update ───────────────────────────────────────────────────────
+server.tool(
+  'sf_update',
+  `Update a Salesforce record by Id (PATCH — only provided fields are changed).
+
+Examples:
+  object="Case"    id="500..." fields={Status:"In Progress", Priority:"Critical"}
+  object="Account" id="001..." fields={AnnualRevenue:5000000, NumberOfEmployees:250}
+  object="Contact" id="003..." fields={Title:"VP Engineering", MobilePhone:"+1-555-0100"}
+
+Returns {updated: true} on success.`,
+  {
+    object: z.string().describe('Salesforce object API name'),
+    id:     z.string().describe('Salesforce record Id'),
+    fields: z.record(z.unknown()).describe('Field API name → new value pairs'),
+  },
+  async ({ object, id, fields }) => {
+    try {
+      const sf = await getSf();
+      await sf.patch(`/services/data/${sf.apiVersion}/sobjects/${object}/${id}`, fields);
+      return ok({ updated: true, object, id, fields_updated: Object.keys(fields) });
+    } catch (e) { return fail(e.message); }
+  }
+);
+
+// ── TOOL: sf_delete ───────────────────────────────────────────────────────
+server.tool(
+  'sf_delete',
+  `Delete a Salesforce record by Id.
+
+SAFETY: You must pass confirm=true — Salesforce deletes go to the Recycle Bin (recoverable for 15 days), but this still removes the live record immediately.
+
+Examples:
+  object="Case"    id="500..." confirm=true
+  object="Lead"    id="00Q..." confirm=true
+
+Pass confirm=false (default) to preview what would be deleted first.`,
+  {
+    object:  z.string().describe('Salesforce object API name'),
+    id:      z.string().describe('Salesforce record Id'),
+    confirm: z.boolean().describe('Must be true to execute the delete'),
+  },
+  async ({ object, id, confirm }) => {
+    try {
+      const sf = await getSf();
+      if (!confirm) {
+        // Preview — fetch the record first to show what would be deleted
+        const record = await sf.query(`SELECT Id, Name FROM ${object} WHERE Id = '${id}' LIMIT 1`)
+          .then(r => r.records?.[0] ?? { Id: id })
+          .catch(() => ({ Id: id }));
+        return ok({
+          confirm_required: true,
+          preview:  { object, id, record },
+          warning:  'Set confirm=true to delete. Record moves to Recycle Bin (recoverable for 15 days).',
+        });
+      }
+      await sf.delete(`/services/data/${sf.apiVersion}/sobjects/${object}/${id}`);
+      return ok({ deleted: true, object, id, note: 'Record is now in the Salesforce Recycle Bin. Can be recovered within 15 days.' });
+    } catch (e) { return fail(e.message); }
+  }
+);
+
 // ── Start: stdio (CLI) or HTTP/SSE (web Claude Code / remote) ────────────
 // Set MCP_MODE=http (and optionally MCP_PORT) to run as an HTTP server.
 // Default is stdio for local Claude Code CLI use.

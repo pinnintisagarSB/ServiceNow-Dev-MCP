@@ -34,6 +34,48 @@ export class JiraConnector {
     return json;
   }
 
+  async post(path, body) {
+    const res  = await httpFetch(`${this.baseUrl}${path}`, {
+      method: 'POST', headers: this.headers(), body: JSON.stringify(body),
+    });
+    const text = await res.text();
+    const json = text ? JSON.parse(text) : {};
+    if (!res.ok) throw new Error(`Jira POST ${path} → ${res.status}: ${JSON.stringify(json)}`);
+    return json;
+  }
+
+  async put(path, body) {
+    const res  = await httpFetch(`${this.baseUrl}${path}`, {
+      method: 'PUT', headers: this.headers(), body: JSON.stringify(body),
+    });
+    const text = await res.text();
+    const json = text ? JSON.parse(text) : {};
+    if (!res.ok) throw new Error(`Jira PUT ${path} → ${res.status}: ${JSON.stringify(json)}`);
+    return json;
+  }
+
+  async patch(path, body) {
+    const res  = await httpFetch(`${this.baseUrl}${path}`, {
+      method: 'PATCH', headers: { ...this.headers(), 'Content-Type': 'application/json;charset=UTF-8' },
+      body: JSON.stringify(body),
+    });
+    const text = await res.text();
+    const json = text ? JSON.parse(text) : {};
+    if (!res.ok) throw new Error(`Jira PATCH ${path} → ${res.status}: ${JSON.stringify(json)}`);
+    return json;
+  }
+
+  async delete(path) {
+    const res  = await httpFetch(`${this.baseUrl}${path}`, {
+      method: 'DELETE', headers: this.headers(),
+    });
+    if (res.status === 204) return { deleted: true };
+    const text = await res.text();
+    const json = text ? JSON.parse(text) : {};
+    if (!res.ok) throw new Error(`Jira DELETE ${path} → ${res.status}: ${JSON.stringify(json)}`);
+    return json;
+  }
+
   // ── Schema Discovery ───────────────────────────────────────────────────────
   async getAllFields()                  { return this.get('/rest/api/3/field'); }
   async getProject(projectKey)          { return this.get(`/rest/api/3/project/${projectKey}`); }
