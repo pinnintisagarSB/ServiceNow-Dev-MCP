@@ -30,6 +30,10 @@ import { PreMigrationChecker }  from './migration/pre-migration-checks.js';
 import { TransformEngine }      from './migration/transform-engine.js';
 import { AuditTrail }           from './migration/audit.js';
 import { toSnHtml }             from './utils/rich-text.js';
+import { IntegrationDesigner }  from './integration/designer.js';
+import { SNArtifactBuilder }    from './integration/sn-artifacts.js';
+import { JiraArtifactBuilder }  from './integration/jira-artifacts.js';
+import { SFArtifactBuilder }    from './integration/sf-artifacts.js';
 import { logger }               from './utils/logger.js';
 
 // ── Connector cache (reuse within a session) ───────────────────────────────
@@ -2412,6 +2416,276 @@ server.tool(
   async () => {
     if (!_audit) return fail('No active audit session. Call start_audit_session first.');
     return ok(_audit.stats());
+  }
+);
+
+// ══════════════════════════════════════════════════════════════════════════
+// BIDIRECTIONAL INTEGRATION TOOLS
+// ══════════════════════════════════════════════════════════════════════════
+
+// ── TOOL: design_integration ───────────────────────────────────────────────
+server.tool(
+  'design_integration',
+  `Analyse a user's bidirectional integration requirement and produce a complete,
+   structured integration plan. Supports all platform combinations:
+     servicenow ↔ jira | servicenow ↔ salesforce | jira ↔ salesforce
+
+   The plan specifies every artifact that must be created on each platform:
+   - Correlation table (cross-platform ID mapping)
+   - Retry/error table (dead-letter queue)
+   - Business Rules, Scripted REST APIs, Outbound REST Messages (ServiceNow)
+   - Apex Trigger, Queueable class, Named Credential (Salesforce)
+   - Webhook, Automation rule (Jira)
+   - Best-practice checklist (loop prevention, auth, idempotency, etc.)
+
+   Call this FIRST before any create_integration_* tool. Pass the result to
+   the other tools to actually create the artifacts.`,
+  {
+    platform_a:    z.enum(['servicenow','jira','salesforce']).describe('Source/primary platform'),
+    platform_b:    z.enum(['servicenow','jira','salesforce']).describe('Target/secondary platform'),
+    direction:     z.enum(['a_to_b','b_to_a','bidirectional']).default('bidirectional').describe('Sync direction'),
+    table_a:       z.string().describe('Table/object in platform A (e.g. incident, Issue, Case)'),
+    table_b:       z.string().describe('Table/object in platform B (e.g. incident, Issue, Case)'),
+    field_mappings: z.record(z.string()).describe('{ platformA_field: platformB_field } mapping'),
+    trigger_a: z.object({
+      events:     z.array(z.string()).optional().describe('Events that trigger A→B sync'),
+      conditions: z.array(z.string()).optional().describe('Filter conditions (e.g. "state=on_hold")'),
+    }).optional().describe('What triggers syncing FROM platform A TO platform B'),
+    trigger_b: z.object({
+      events:     z.array(z.string()).optional().describe('Events that trigger B→A sync'),
+      conditions: z.array(z.string()).optional().describe('Filter conditions'),
+    }).optional().describe('What triggers syncing FROM platform B TO platform A'),
+    options: z.object({
+      prefix:           z.string().optional().describe('Short identifier prefix for all artifact names'),
+      sync_comments:    z.boolean().optional().default(false),
+      sync_attachments: z.boolean().optional().default(false),
+    }).optional(),
+  },
+  async ({ platform_a, platform_b, direction, table_a, table_b, field_mappings, trigger_a, trigger_b, options }) => {
+    try {
+      if (platform_a === platform_b) return fail('platform_a and platform_b must be different');
+      const designer = new IntegrationDesigner();
+      const plan = designer.design({
+        platformA:    platform_a,
+        platformB:    platform_b,
+        direction:    direction ?? 'bidirectional',
+        tableA:       table_a,
+        tableB:       table_b,
+        fieldMappings: field_mappings ?? {},
+        triggerA:     trigger_a ?? {},
+        triggerB:     trigger_b ?? {},
+        options:      options ?? {},
+      });
+      return ok({
+        instructions_for_claude: [
+          `Integration plan created for ${platform_a} ↔ ${platform_b} (${table_a} ↔ ${table_b}).`,
+          `Prefix: ${plan.meta.prefix}`,
+          `Next: call create_sn_integration_artifacts to build the ServiceNow side,`,
+          `then create_jira_integration_artifacts or create_sf_integration_artifacts for the other platform.`,
+          `Share the checklist with the user and confirm each item before going live.`,
+        ],
+        plan,
+      });
+    } catch (e) { return fail(e.message); }
+  }
+);
+
+// ── TOOL: create_sn_integration_artifacts ─────────────────────────────────
+server.tool(
+  'create_sn_integration_artifacts',
+  `Create all ServiceNow-side artifacts for a bidirectional integration:
+   - Correlation table (cross-platform ID tracking)
+   - Retry/error table (dead-letter queue for failed syncs)
+   - Sync-in-progress flag field (loop prevention)
+   - sys_properties entry (field mapping config)
+   - Outbound REST Message + HTTP method (for SN→external calls)
+   - Business Rule (fires on record change, calls outbound REST)
+   - Scripted REST API + POST operation (inbound endpoint for external→SN)
+   - UI Action "Sync Now" button
+   - Client Script (shows sync status on form)
+
+   Requires the integration plan from design_integration.`,
+  {
+    plan:        z.record(z.unknown()).describe('The plan object returned by design_integration'),
+    target_url:  z.string().optional().describe('Base URL of the target platform API (e.g. https://your-domain.atlassian.net)'),
+    target_api_key: z.string().optional().describe('API key or token for the target platform (stored in Named Credentials later)'),
+  },
+  async ({ plan, target_url, target_api_key }) => {
+    try {
+      const sn      = await getSn();
+      const builder = new SNArtifactBuilder(sn);
+      const results = await builder.buildAll(plan, { targetUrl: target_url, targetApiKey: target_api_key });
+      return ok({
+        instructions_for_claude: [
+          'ServiceNow artifacts created successfully.',
+          `Inbound endpoint path: /api/x_snmig/${plan.meta?.prefix}/sync`,
+          'Share this endpoint URL with the user — they need to register it as the webhook/callback in the partner platform.',
+          'Outbound REST Message created — tell the user to open it in SN and set the correct credentials/connection alias.',
+          'Next: call create_jira_integration_artifacts or create_sf_integration_artifacts.',
+        ],
+        artifacts: results,
+        inbound_endpoint: `/api/x_snmig/${plan.meta?.prefix}/sync`,
+        sn_outbound_rest_name: `u_${plan.meta?.prefix}_outbound`,
+      });
+    } catch (e) { return fail(e.message); }
+  }
+);
+
+// ── TOOL: create_jira_integration_artifacts ────────────────────────────────
+server.tool(
+  'create_jira_integration_artifacts',
+  `Create Jira-side artifacts for a bidirectional integration:
+   - Registers a Jira webhook (calls the inbound endpoint when issues change)
+   - Generates a Jira Automation rule JSON (ready to import in Jira UI)
+   - Returns step-by-step instructions for importing the automation rule
+
+   The automation rule includes loop-prevention via issue labels.
+   Requires the integration plan from design_integration.`,
+  {
+    plan:         z.record(z.unknown()).describe('Plan from design_integration'),
+    inbound_url:  z.string().optional().describe('The inbound endpoint URL the other platform exposes (e.g. the SN Scripted REST API URL)'),
+    webhook_secret: z.string().optional().describe('Shared secret to add as a header for webhook security'),
+  },
+  async ({ plan, inbound_url, webhook_secret }) => {
+    try {
+      const jira    = await getJira();
+      const builder = new JiraArtifactBuilder(jira);
+      const results = await builder.buildAll(plan, { inboundUrl: inbound_url, webhookSecret: webhook_secret });
+      return ok({
+        instructions_for_claude: [
+          'Jira artifacts generated.',
+          results.webhook
+            ? `Webhook registered (id: ${results.webhook.id ?? results.webhook.self}).`
+            : 'Webhook could not be registered automatically — share the manual instructions with the user.',
+          'Share the automation_rule.instructions with the user — they need to import the rule in Jira UI.',
+          'Remind the user to set the loop-prevention label condition in the automation rule.',
+        ],
+        artifacts: results,
+      });
+    } catch (e) { return fail(e.message); }
+  }
+);
+
+// ── TOOL: create_sf_integration_artifacts ─────────────────────────────────
+server.tool(
+  'create_sf_integration_artifacts',
+  `Generate all Salesforce-side code and configuration for a bidirectional integration:
+   - Named Credential XML (paste into Metadata API or create in Setup UI)
+   - Apex Queueable callout class (async HTTP call to the partner platform)
+   - Apex Trigger (fires on insert/update, enqueues the callout class)
+   - Inbound Apex REST class (receives sync calls from the partner platform)
+   - Step-by-step deployment instructions
+
+   Note: Apex code is GENERATED and returned as strings — the user must deploy
+   it via Developer Console, VS Code + SFDX, or Metadata API.
+   Requires the integration plan from design_integration.`,
+  {
+    plan:       z.record(z.unknown()).describe('Plan from design_integration'),
+    target_url: z.string().optional().describe('Base URL of the partner platform (used in Named Credential)'),
+  },
+  async ({ plan, target_url }) => {
+    try {
+      const sf      = await getSf().catch(() => null);
+      const builder = new SFArtifactBuilder(sf);
+      const results = builder.buildAll(plan, { targetUrl: target_url });
+      return ok({
+        instructions_for_claude: [
+          'Salesforce artifacts generated (Apex code + Named Credential config).',
+          'Walk the user through deployment_instructions step by step.',
+          `Inbound Apex REST endpoint: ${results.inbound_apex_rest?.endpoint}`,
+          'Tell the user to register this endpoint URL as the webhook/callback in the partner platform.',
+          'Remind the user that Salesforce callouts must be async — the generated Queueable class handles this.',
+        ],
+        artifacts: results,
+      });
+    } catch (e) { return fail(e.message); }
+  }
+);
+
+// ── TOOL: get_integration_status ──────────────────────────────────────────
+server.tool(
+  'get_integration_status',
+  `Check the health of a running bidirectional integration by querying:
+   - Correlation table: how many records are linked
+   - Retry/error table: how many failed syncs are pending
+   - Recent sync activity (last N records synced)
+
+   Use this to monitor the integration after it goes live.`,
+  {
+    prefix:        z.string().describe('The integration prefix (from the plan, e.g. sn_jira_incident)'),
+    last_n_errors: z.number().optional().default(10).describe('How many recent errors to return'),
+  },
+  async ({ prefix, last_n_errors }) => {
+    try {
+      const sn   = await getSn();
+      const correlTable = `u_${prefix}_correlation`;
+      const retryTable  = `u_${prefix}_sync_error`;
+
+      const [correlRows, errorRows, recentSync] = await Promise.all([
+        sn.get(correlTable, { sysparm_query: 'u_sync_enabled=true', sysparm_fields: 'sys_id,u_platform_b,u_last_sync,u_sync_error', sysparm_limit: '1000' }).catch(() => []),
+        sn.get(retryTable,  { sysparm_query: 'u_resolved=false^ORDERBYDESCsys_created_on', sysparm_fields: 'u_source_id,u_error,u_retry_count,sys_created_on', sysparm_limit: String(last_n_errors ?? 10) }).catch(() => []),
+        sn.get(correlTable, { sysparm_query: 'u_last_syncRELATIVEGE@hour@ago@1', sysparm_fields: 'u_record_sys_id_a,u_record_id_b,u_last_sync,u_sync_direction', sysparm_limit: '20', sysparm_orderby: 'u_last_sync^DESC' }).catch(() => []),
+      ]);
+
+      const withErrors = correlRows.filter(r => r.u_sync_error);
+
+      return ok({
+        summary: {
+          total_linked_records:  correlRows.length,
+          records_with_errors:   withErrors.length,
+          pending_retries:       errorRows.length,
+          synced_last_hour:      recentSync.length,
+        },
+        recent_sync_activity: recentSync,
+        pending_errors:        errorRows,
+        records_with_sync_errors: withErrors.slice(0, 10),
+      });
+    } catch (e) { return fail(e.message); }
+  }
+);
+
+// ── TOOL: retry_failed_syncs ──────────────────────────────────────────────
+server.tool(
+  'retry_failed_syncs',
+  `Retry all failed sync attempts from the integration error/retry table.
+   For each failed record, re-fires the Business Rule by touching the source record.
+   Pass dry_run=true to see what would be retried without actually doing it.`,
+  {
+    prefix:  z.string().describe('Integration prefix'),
+    dry_run: z.boolean().optional().default(false),
+    limit:   z.number().optional().default(50).describe('Max records to retry in one call'),
+  },
+  async ({ prefix, dry_run, limit }) => {
+    try {
+      const sn         = await getSn();
+      const retryTable = `u_${prefix}_sync_error`;
+
+      const pending = await sn.get(retryTable, {
+        sysparm_query:  'u_resolved=false^u_source_platform=servicenow',
+        sysparm_fields: 'sys_id,u_source_id,u_error,u_retry_count',
+        sysparm_limit:  String(limit ?? 50),
+      });
+
+      if (dry_run) {
+        return ok({ dry_run: true, would_retry: pending.length, records: pending });
+      }
+
+      const results = [];
+      for (const row of pending) {
+        try {
+          // Mark as resolved (business rule will re-queue if it fails again)
+          await sn.patch(retryTable, row.sys_id, { u_resolved: true });
+          // Touch the source record to re-trigger the business rule
+          const sourceTable = prefix.replace(/^[a-z]+_[a-z]+_/, '');
+          await sn.patch(sourceTable, row.u_source_id, { u_sync_in_progress: false }).catch(() => null);
+          results.push({ source_id: row.u_source_id, status: 'queued' });
+        } catch (e) {
+          results.push({ source_id: row.u_source_id, status: 'error', error: e.message });
+        }
+      }
+
+      return ok({ retried: results.length, results });
+    } catch (e) { return fail(e.message); }
   }
 );
 
