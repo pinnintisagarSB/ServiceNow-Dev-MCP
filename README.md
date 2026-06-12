@@ -1,51 +1,58 @@
 # ServiceNow Dev MCP
 
-> AI-powered ServiceNow developer toolkit for **Claude Code** — 90 tools that help you build, review, test, document, and deploy ServiceNow artifacts faster and with fewer errors.
+> AI-powered ServiceNow developer toolkit for **Claude Code** — 116 tools covering script generation, code review, portal & catalog development, notifications, user & group management, CRUD operations, dictionary overrides, data migration, bidirectional integrations, ATF testing, performance analysis, technical documentation, and issue diagnosis.
 
 ---
 
 ## What is this?
 
-**ServiceNow Dev MCP** is a [Model Context Protocol](https://modelcontextprotocol.io) server that connects Claude Code directly to your ServiceNow instance. Instead of switching between tabs, writing boilerplate from scratch, or Googling best practices, you just describe what you need and Claude handles it end-to-end.
+**ServiceNow Dev MCP** is a [Model Context Protocol](https://modelcontextprotocol.io) server that connects Claude Code directly to your ServiceNow, Jira, and Salesforce instances. Instead of switching between tabs, writing boilerplate from scratch, or Googling best practices, you just describe what you need and Claude handles it end-to-end.
 
 ```
 "Create a Business Rule that sets priority to Critical when the category is Security"
 "Clone the sc-cat-item widget and add a real-time search bar"
 "Review this Script Include for performance issues"
+"Create a user John Smith with role itil and add him to the Network Operations group"
+"Make the business_service field mandatory on incident but not on task"
 "Generate full technical documentation for my HR application"
-"My widget is showing a blank white box — help me diagnose it"
+"My widget shows a blank white box — help me diagnose it"
+"Create a high-priority Jira ticket and link it to incident INC0012345"
+"Migrate all Jira issues from project KAN to the incident table in ServiceNow"
 ```
 
 ---
 
-## Capabilities at a glance
+## Capabilities
 
 | Category | What it does |
 |---|---|
-| **Script Generation** | Generate Business Rules, Script Includes, Client Scripts, UI Actions, Scripted REST APIs, Scheduled Jobs, Fix Scripts, and Widgets with best practices baked in |
-| **Code Review** | Static analysis across 20 rules — anti-patterns, performance, security, null-safety. Scores 0–10 with per-issue fix guidance |
-| **Service Portal** | Analyze portals, find/clone/create/update widgets, scaffold new portals with CSS-variable themes |
-| **Service Catalog** | Create catalog items with typed variables, client scripts, and UI policies; clone existing items; manage categories and record producers |
-| **Notifications** | Build email notifications with responsive HTML templates, push notifications, email scripts, and analyze existing notifications for issues |
-| **Table Explorer** | Full schema discovery — fields, Business Rules, Client Scripts, ACLs, relationships, parent hierarchy |
-| **ATF Testing** | Generate Automated Test Framework test suites for BRs, Script Includes, REST APIs, forms, and tables |
-| **Performance** | Detect slow scripts, missing indexes, Business Rules without conditions, error pattern analysis |
-| **Technical Docs** | Generate full project documentation from live SN data (data model, BRs, APIs, security, ops guide) |
-| **Issue Diagnosis** | 60+ catalogued issues with step-by-step diagnosis, copy-paste fixes, and prevention tips |
-| **Data Migration** | Migrate Jira/Salesforce data into any ServiceNow table with full artifact generation |
-| **Bidirectional Integration** | Design and implement SN↔Jira, SN↔Salesforce integrations with Business Rules, Scripted REST, Apex code |
+| **Script Generation** | Business Rules, Script Includes, Client Scripts, UI Actions, Scripted REST APIs, Scheduled Jobs, Fix Scripts, Widgets — best practices built in |
+| **Code Review** | 20-rule static analyser — anti-patterns, performance, security, null-safety. Score 0–10 with per-issue fix guidance |
+| **Service Portal** | Analyze portals, find / clone / create / update widgets, scaffold new portals with CSS-variable themes |
+| **Service Catalog** | Catalog items with typed variables, client scripts, UI policies; clone existing items; categories; record producers |
+| **Notifications** | Email notifications with HTML templates, push notifications, email scripts, notification analysis |
+| **User & Group Management** | Create users/groups, assign roles, manage membership — ServiceNow, Jira, and Salesforce |
+| **CRUD Operations** | Full Create / Read / Update / Delete on any table/object across all three platforms |
+| **Dictionary Overrides** | Create, inspect, and delete field overrides on child tables with correct `override_X` flag handling |
+| **Table Explorer** | Schema discovery — fields, BRs, Client Scripts, ACLs, relationships, parent hierarchy |
+| **ATF Testing** | Generate Automated Test Framework suites for BRs, SIs, REST APIs, forms, tables |
+| **Performance Analysis** | Slow script detection, missing index suggestions, BR audits, error pattern analysis |
+| **Technical Docs** | Full project documentation generated from live SN data; feature one-pagers |
+| **Issue Diagnosis** | 60+ catalogued issues with step-by-step diagnosis, copy-paste fixes, prevention tips |
+| **Data Migration** | Migrate Jira / Salesforce data into any ServiceNow table with full artifact generation |
+| **Bidirectional Integration** | Design and implement SN↔Jira, SN↔Salesforce integrations with BRs, Scripted REST, Apex |
 
 ---
 
-## Tool count: 90 tools
+## Tool count: 116
 
 <details>
 <summary><strong>Developer Productivity (35 tools)</strong></summary>
 
 | Tool | What it does |
 |---|---|
-| `generate_script` | Generate any SN artifact (BR, SI, CS, UI Action, REST, Scheduled Job, Fix Script, Widget) |
-| `review_script` | Code review: 20 rules, score 0–10, per-issue fix guidance |
+| `generate_script` | Generate any SN artifact with best practices |
+| `review_script` | Code review — 20 rules, score 0–10, fix guidance |
 | `list_review_rules` | Browse all 20 review rules by category |
 | `explore_table` | Full schema: fields, BRs, Client Scripts, ACLs, relationships, hierarchy |
 | `find_table` | Search tables by keyword |
@@ -58,27 +65,77 @@
 | `scaffold_application` | Full app scaffold: table + BRs + SI + UI Actions + ACLs + ATF + docs |
 | `health_check_instance` | Instance health score with actionable findings |
 | `explain_api` | Explain SN APIs (GlideRecord, GlideAggregate, RESTMessageV2, etc.) |
-| `analyze_portal` | Analyze a complete Service Portal (pages, widgets, theme, usage) |
+| `analyze_portal` | Analyze a complete Service Portal |
 | `find_widget` | Search widgets by name, ID, or keyword |
-| `clone_widget` | Clone a widget with modifications (all 4 sections) |
+| `clone_widget` | Clone a widget with modifications |
 | `create_widget` | Generate a complete widget from a requirement |
-| `update_widget` | Build PATCH payload for specific widget sections |
+| `update_widget` | PATCH specific widget sections |
 | `create_portal` | Scaffold a new portal with theme and pages |
 | `create_catalog_item` | Catalog item with variables, client scripts, UI policies |
 | `clone_catalog_item` | Clone a live catalog item from SN |
 | `create_catalog_category` | Create a catalog category |
-| `get_catalog_item` | Fetch catalog item and variables for inspection |
+| `get_catalog_item` | Fetch catalog item and variables |
 | `create_notification` | Email notification with responsive HTML template |
-| `analyze_notifications` | Analyze and find issues in existing notifications |
+| `analyze_notifications` | Audit and find issues in existing notifications |
 | `create_push_notification` | Push notification for Now Mobile |
-| `create_email_script` | Dynamic email script (Email Script record) |
+| `create_email_script` | Dynamic email script (sys_script_email) |
 | `generate_project_doc` | Full project technical doc from live SN data |
-| `generate_feature_doc` | Feature one-pager for sprint/change docs |
+| `generate_feature_doc` | Feature one-pager for sprint / change docs |
 | `diagnose_issue` | Diagnose any SN issue from a symptom description |
-| `get_issue_guide` | Step-by-step guided fix for a specific known issue |
-| `list_common_issues` | Browse 60+ catalogued SN issues by category |
-| `get_field_choices` | Get all choice list values for a field |
-| `create_choice` | Add a new choice to a field's choice list |
+| `get_issue_guide` | Step-by-step guided fix for a known issue |
+| `list_common_issues` | Browse 60+ catalogued issues by category |
+| `get_field_choices` | Get choice list values for any field |
+| `create_choice` | Add a new value to a choice list |
+
+</details>
+
+<details>
+<summary><strong>User & Group Management (11 tools)</strong></summary>
+
+| Tool | Platform | What it does |
+|---|---|---|
+| `sn_create_user` | ServiceNow | Create sys_user — roles + groups in one call, manager resolution, auto username |
+| `sn_create_group` | ServiceNow | Create sys_user_group — duplicate check, members, roles, parent group |
+| `sn_manage_group_members` | ServiceNow | Add / remove / list group members |
+| `sn_assign_roles` | ServiceNow | Assign or revoke roles on users or groups |
+| `sn_get_user` | ServiceNow | Full user profile with roles and group memberships |
+| `sn_get_group` | ServiceNow | Group detail with member list and assigned roles |
+| `sn_list_roles` | ServiceNow | Browse sys_user_role with keyword filter |
+| `jira_create_group` | Jira | Create group and add initial members |
+| `jira_manage_group_members` | Jira | Add / remove / list Jira group members |
+| `sf_create_user` | Salesforce | Create User with all required system fields |
+| `sf_manage_group` | Salesforce | Create Public Groups / Queues, manage members |
+
+</details>
+
+<details>
+<summary><strong>CRUD Operations (12 tools)</strong></summary>
+
+| Tool | Platform | What it does |
+|---|---|---|
+| `sn_create` | ServiceNow | Create any record in any table |
+| `sn_read` | ServiceNow | Read by sys_id or encoded query |
+| `sn_update` | ServiceNow | PATCH a record — only changed fields |
+| `sn_delete` | ServiceNow | Delete with confirm=true safety gate |
+| `jira_create` | Jira | Create issues, comments, subtasks, components, versions |
+| `jira_read` | Jira | Read issues, JQL search, projects, users, boards, sprints, transitions |
+| `jira_update` | Jira | Update fields, transition status, edit comments |
+| `jira_delete` | Jira | Delete issues or comments with confirm gate |
+| `sf_create` | Salesforce | Create any sObject record |
+| `sf_read` | Salesforce | Read by Id, SOQL query, or object describe |
+| `sf_update` | Salesforce | PATCH a record — only changed fields |
+| `sf_delete` | Salesforce | Delete with confirm gate (recoverable via Recycle Bin) |
+
+</details>
+
+<details>
+<summary><strong>Dictionary Overrides (3 tools)</strong></summary>
+
+| Tool | What it does |
+|---|---|
+| `create_dictionary_override` | Create or update a field override on a child table. Correctly sets both the value **and** the required `override_X=true` flag — the step most developers miss. Supports: mandatory, default_value, column_label, read_only, display, calculation, choice, dependent. Dry-run mode available. |
+| `get_dictionary_overrides` | List all active overrides on a table or field — shows which flags are set and their effective values |
+| `delete_dictionary_override` | Delete an override, reverting the field to parent table defaults. Requires confirm=true. |
 
 </details>
 
@@ -87,7 +144,7 @@
 
 | Tool | What it does |
 |---|---|
-| `get_config` | Show current credential/connection status |
+| `get_config` | Show credential/connection status |
 | `configure_credentials` | Set per-session credentials (web Claude Code) |
 | `connect` | Test connectivity to SN / Jira / Salesforce |
 | `check_migration_state` | Scan SN for existing artifacts, return gap analysis |
@@ -97,14 +154,14 @@
 | `run_test_migration` | Push sample records, field-level data quality report |
 | `run_full_migration` | Full migration in dependency order with parallel batches |
 | `map_users` | Map source users to SN users |
-| `pre_migration_check` | Pre-flight validation before migration starts |
+| `pre_migration_check` | Pre-flight validation |
 | `transform_preview` | Preview a transform rule on sample data |
 | `convert_rich_text` | Convert Jira ADF / Salesforce HTML to SN HTML |
 | `topological_sort` | Dependency-ordered migration sequence |
 | `start_audit_session` | Start an audit trail for a migration |
-| `get_audit_stats` | Get migration audit statistics |
-| `reconcile_migration` | Field-level comparison: source vs SN records |
-| `reconcile_staging` | Compare staging vs target (PASS/PARTIAL/FAIL verdict) |
+| `get_audit_stats` | Migration audit statistics |
+| `reconcile_migration` | Field-level comparison: source vs SN |
+| `reconcile_staging` | Compare staging vs target (PASS/PARTIAL/FAIL) |
 | `migration_test_report` | Full migration test report |
 | `fetch_sn_records` | Query any SN table |
 | `analyze_transform_map` | Audit an existing transform map |
@@ -123,11 +180,11 @@
 | Tool | What it does |
 |---|---|
 | `design_integration` | Design a full bidirectional integration plan (SN↔Jira, SN↔SF, SF↔Jira) |
-| `create_sn_integration_artifacts` | Create SN Business Rules, Scripted REST APIs, Correlation/Retry tables |
-| `create_jira_integration_artifacts` | Create Jira webhooks and automation rules |
-| `create_sf_integration_artifacts` | Create Salesforce Apex triggers, Named Credentials, REST callout classes |
+| `create_sn_integration_artifacts` | Business Rules, Scripted REST APIs, correlation/retry tables |
+| `create_jira_integration_artifacts` | Jira webhooks and automation rules |
+| `create_sf_integration_artifacts` | Salesforce Apex triggers, Named Credentials, REST callout classes |
 | `get_integration_status` | Check sync health and error counts |
-| `retry_failed_syncs` | Retry records in the error/dead-letter table |
+| `retry_failed_syncs` | Retry records in the dead-letter table |
 | `test_integration` | End-to-end integration test |
 | `disable_integration` | Pause all syncs (maintenance mode) |
 | `enable_integration` | Resume syncs after maintenance |
@@ -142,8 +199,8 @@
 ### 1. Clone and install
 
 ```bash
-git clone https://github.com/pinnintisagarSB/SN-Migration-Agent.git
-cd SN-Migration-Agent
+git clone https://github.com/pinnintisagarSB/ServiceNow-Dev-MCP.git
+cd ServiceNow-Dev-MCP
 npm install
 ```
 
@@ -162,12 +219,12 @@ SN_USERNAME=admin
 SN_PASSWORD=yourpassword
 SN_SCOPE_PREFIX=u
 
-# Jira (required for Jira migration tools)
+# Jira (required for Jira tools)
 JIRA_BASE_URL=https://yourcompany.atlassian.net
 JIRA_EMAIL=your_email@example.com
 JIRA_API_TOKEN=your_api_token
 
-# Salesforce (required for Salesforce migration/integration tools)
+# Salesforce (required for Salesforce tools)
 SF_LOGIN_URL=https://login.salesforce.com
 SF_CLIENT_ID=your_consumer_key
 SF_CLIENT_SECRET=your_consumer_secret
@@ -183,6 +240,7 @@ claude mcp add sn-dev-mcp node "$(pwd)/src/mcp-server.js"
 ```
 
 Verify:
+
 ```bash
 claude mcp list
 # sn-dev-mcp: node /path/to/... ✔ Connected
@@ -190,59 +248,83 @@ claude mcp list
 
 ### 4. Restart Claude Code
 
-Close and reopen Claude Code. All 90 tools are now available.
+Close and reopen Claude Code. All 116 tools are now available. Type `/mcp` to confirm.
 
 ---
 
-## Usage examples
+## Example prompts
 
-### Developer productivity
-
+### Script development
 ```
-Generate a Business Rule on the incident table that sends a Slack webhook
-when priority changes to Critical
+Generate a Business Rule on incident that creates a Jira ticket when priority changes to 1
 
-Review this Script Include for performance and security issues:
-[paste code]
+Review this Script Include for performance and security issues — [paste code]
 
-Explore the change_request table — show me all fields, BRs, ACLs, and relationships
+Clone the "sc-cat-item" widget and rename it "My Catalog Item"
 
-Clone the "sc-cat-item" widget and rename it "My Catalog Item" — I want to add
-a related items panel below the main content
+Create a catalog item for a Laptop Request with employee name (mandatory),
+model (dropdown), justification (text), and manager approval (yes/no)
 
-Create a catalog item for a Laptop Request with these variables:
-- Employee name (text, mandatory)
-- Laptop model (dropdown: MacBook Pro 14, MacBook Pro 16, Dell XPS 15)
-- Justification (multi-line)
-- Manager approval needed? (yes/no)
+Create an email notification for when an incident is assigned —
+send to the assigned user and their manager
+```
 
-Create a notification for when an incident is assigned to a group —
-send to the group manager with the incident number and priority in the subject
+### User & group management
+```
+Create user Jane Smith, email jane@company.com, title "Senior Analyst",
+role itil, add to groups "Service Desk" and "Change Approvers"
 
-My widget shows a blank white box when it loads — diagnose the issue
+Create a group "Network Operations APAC" managed by john.doe,
+add members [alice, bob, carol], assign role itil
 
-Generate full technical documentation for our IT Asset application
-(tables: u_asset, u_asset_request, u_asset_category)
+What roles and groups does david.jones have?
+
+Add sarah.connor to the "Problem Management" group
+
+Remove the admin role from temp.contractor@company.com
+```
+
+### CRUD across platforms
+```
+Create a high-priority incident in ServiceNow for the network outage in Building 3
+
+Find all open Jira tickets assigned to john@company.com in project OPS
+
+Update Salesforce Case 500ABC — set Status to Escalated, Priority to Critical
+
+Create a Jira comment on KAN-55: "Picked up, will update by EOD"
+
+Move Jira ticket KAN-55 to Done status
+```
+
+### Dictionary overrides
+```
+Make the business_service field mandatory on incident but not on task
+
+Rename the caller_id label to "Requested By" on sc_request
+
+Hide the parent field on hr_case
+
+Show me all dictionary overrides on the change_request table
 ```
 
 ### Data migration
-
 ```
 Migrate all Jira issues from project KAN to the incident table
 
 Run a test migration of 5 records first and show me the field quality report
 
-Clean up all test records without touching the transform map
+Design a bidirectional integration between ServiceNow incidents and Jira issues
 ```
 
-### Integration
-
+### Debugging & docs
 ```
-Design a bidirectional integration between ServiceNow incidents and Jira issues.
-When an incident is put On Hold, create a Jira ticket.
-When that ticket is resolved, close the incident.
+My widget shows a blank white box when it loads — diagnose the issue
 
-Create all the ServiceNow artifacts for the SN↔Jira integration
+The email notification for incidents isn't being received — what could be wrong?
+
+Generate full technical documentation for our IT Asset application
+(tables: u_asset, u_asset_request)
 ```
 
 ---
@@ -251,31 +333,31 @@ Create all the ServiceNow artifacts for the SN↔Jira integration
 
 ```
 src/
-├── mcp-server.js              # 90 MCP tools — single entry point
+├── mcp-server.js              # 116 MCP tools — single entry point
 ├── connectors/
 │   ├── servicenow.js          # SN Table API, Import Set API, bulk ops
 │   ├── salesforce.js          # SF REST + Tooling API + Bulk API 2.0
-│   └── jira.js                # Jira REST API v3
+│   └── jira.js                # Jira REST API v3 — full CRUD
 ├── developer/
 │   ├── script-builder.js      # Generate BR, SI, CS, UI Action, REST, Job, Widget
 │   ├── code-reviewer.js       # 20-rule static analyser
-│   ├── table-explorer.js      # Schema discovery — fields, BRs, ACLs, relationships
+│   ├── table-explorer.js      # Schema: fields, BRs, ACLs, relationships
 │   ├── test-generator.js      # ATF test suite generator
 │   ├── perf-analyzer.js       # Slow scripts, indexes, error patterns
 │   ├── doc-generator.js       # Markdown API docs per artifact
-│   ├── portal-builder.js      # Analyze / clone / create / update SP widgets & portals
-│   ├── catalog-builder.js     # Catalog items, variables, categories, record producers
-│   ├── notification-builder.js # Email & push notifications, email scripts
+│   ├── portal-builder.js      # SP widget / portal builder
+│   ├── catalog-builder.js     # Catalog items, variables, categories
+│   ├── notification-builder.js # Email & push notifications
 │   ├── tech-doc-writer.js     # Full project docs from live SN data
 │   └── issue-guide.js         # 60+ issue catalogue with guided fixes
 ├── migration/
-│   ├── schema.js              # Schema discovery + staging + mapping suggestions
+│   ├── schema.js              # Schema discovery + mapping suggestions
 │   ├── staging.js             # Artifact builder (idempotent)
-│   ├── runner.js              # Migration runner with topo sort + ETA tracker
+│   ├── runner.js              # Migration runner with topo sort + ETA
 │   ├── batch.js               # Parallel batch runner + dedup
 │   ├── dependency.js          # User/hierarchy analysis
 │   ├── validator.js           # Field-level data quality report
-│   ├── transform-engine.js    # 15+ transform types with preset mappings
+│   ├── transform-engine.js    # 15+ transform types
 │   ├── reconciler.js          # 3-layer reconciliation (PASS/PARTIAL/FAIL)
 │   ├── audit.js               # NDJSON audit trail
 │   ├── user-mapping.js        # Source → SN user mapping
@@ -283,9 +365,9 @@ src/
 │   └── cleanup.js             # Delete records and artifacts
 ├── integration/
 │   ├── designer.js            # Integration plan designer
-│   ├── sn-artifacts.js        # SN Business Rules, Scripted REST, correlation tables
+│   ├── sn-artifacts.js        # SN BRs, Scripted REST, correlation tables
 │   ├── jira-artifacts.js      # Jira webhooks + automation rules
-│   └── sf-artifacts.js        # Salesforce Apex triggers, callout classes, REST handler
+│   └── sf-artifacts.js        # Salesforce Apex triggers, callout classes
 ├── flows/
 │   ├── retriever.js           # Salesforce flow parser
 │   └── jira-automation.js     # Jira automation retriever
@@ -301,46 +383,41 @@ src/
 
 ### Local CLI (default)
 
-Standard `stdio` mode — Claude Code CLI, VS Code extension, JetBrains plugin.
-
 ```bash
 node src/mcp-server.js
 ```
 
-### HTTP/SSE mode (web Claude Code)
-
-For use with [claude.ai/code](https://claude.ai/code) or remote deployments.
+### HTTP/SSE (web Claude Code or remote deployment)
 
 ```bash
 MCP_MODE=http MCP_PORT=3000 node src/mcp-server.js
-# SSE endpoint: http://localhost:3000/sse
 ```
 
-Update `.mcp.json` in your repo root to point at the deployed URL:
+Update `.mcp.json` with your deployed URL:
 
 ```json
 {
   "mcpServers": {
     "sn-dev-mcp": {
       "type": "http",
-      "url": "https://your-deployed-server.example.com/sse"
+      "url": "https://your-server.example.com/sse"
     }
   }
 }
 ```
 
-In HTTP mode, use the `configure_credentials` tool to set per-session credentials — credentials are held in memory only and never logged.
+In HTTP mode, use `configure_credentials` to set per-session credentials — never logged or persisted.
 
 ---
 
-## ServiceNow permissions required
+## Permissions required
 
 | Capability | Minimum role |
 |---|---|
-| Read any table | `read` on the table ACL |
-| Create scripts, BRs, SIs, widgets | `admin` |
-| Create catalog items | `catalog_admin` |
-| Create notifications | `admin` |
+| Read any table | `read` ACL on the table |
+| Scripts, BRs, widgets, notifications | `admin` |
+| Catalog items | `catalog_admin` |
+| User / group management | `admin` or `user_admin` |
 | Data migration (staging tables, transform maps) | `import_admin` |
 | ATF tests | `atf_test_designer` |
 | Background scripts | `admin` |
@@ -351,37 +428,24 @@ In HTTP mode, use the `configure_credentials` tool to set per-session credential
 
 - **Node.js 18+**
 - **Claude Code** (CLI, desktop app, web, or IDE extension)
-- **ServiceNow** developer or sub-production instance (PDI recommended for development)
+- **ServiceNow** developer or sub-production instance (PDI recommended)
 - **Jira** Cloud API token (for Jira tools)
 - **Salesforce** Connected App credentials (for Salesforce tools)
 
 ---
 
-## Issue categories in the guide
+## Tool growth
 
-Use `list_common_issues` or `diagnose_issue` in Claude Code:
-
-| Category | Examples |
-|---|---|
-| `business_rule` | BR not firing, infinite loop, BR slowing transactions |
-| `client_script` | CS not running, GlideAjax not returning data |
-| `portal_widget` | Widget blank, c.server.update() not working |
-| `catalog` | Item not visible, UI Policy not working |
-| `notification` | Email not sent, no recipients |
-| `scripted_rest` | 401/403/500 errors |
-| `performance` | Slow lists, missing indexes |
-| `security` | Records visible to wrong users |
-| `atf` | Test failing unexpectedly |
-| `deployment` | Update set conflicts, works in dev not prod |
-
----
-
-## Contributing
-
-This MCP is designed to grow. New tools can be added by:
+The MCP is designed to grow with every use case. New tools are added by:
 
 1. Adding a method to an existing module in `src/developer/` or `src/integration/`
 2. Registering a `server.tool()` in `src/mcp-server.js`
-3. Committing and pushing — no build step required
+3. Pushing — no build step required
 
-The tool count grows with every use case. Current: **90 tools**.
+| Version | Tools | Key additions |
+|---|---|---|
+| 1.0 | 27 | Data migration (Jira → SN, SF → SN) |
+| 1.5 | 55 | Bidirectional integrations, reconciliation, audit |
+| 2.0 | 90 | Developer toolkit: scripts, review, portal, catalog, notifications, docs, issue guide |
+| 2.1 | 105 | Full CRUD (SN + Jira + SF), dictionary overrides |
+| 2.2 | 116 | User & group management across all 3 platforms |
