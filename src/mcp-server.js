@@ -23,9 +23,7 @@ import { DependencyAnalyzer }   from './migration/dependency.js';
 import { MigrationValidator }   from './migration/validator.js';
 import { BatchMigrationRunner } from './migration/batch.js';
 import { MigrationCleanup }     from './migration/cleanup.js';
-import { FlowRetriever }        from './flows/retriever.js';
-import { FlowBuilder }          from './flows/builder.js';
-import { FlowSdkCodegen }       from './flows/sdk-codegen.js';
+import { FlowRetriever }           from './flows/retriever.js';
 import { JiraAutomationRetriever } from './flows/jira-automation.js';
 import { logger }               from './utils/logger.js';
 
@@ -1228,281 +1226,263 @@ server.tool(
 );
 
 // ══════════════════════════════════════════════════════════════════════════
-// TOOL: build_flow  (Phase F5 → Summary)
+// TOOL: generate_migration_guide
+// Replaces build_flow / build_subflow / build_jira_automation / create_custom_action
+// Produces a clear numbered step-by-step guide for replicating the flow
+// manually in ServiceNow Workflow Studio — no Table API calls.
 // ══════════════════════════════════════════════════════════════════════════
 server.tool(
-  'build_flow',
-  `Phase F5: Create the ServiceNow flow artifacts (sys_hub_flow, variables, trigger, steps).
-   Only call after Checkpoint F1 (understanding confirmed) AND Checkpoint F2 (translation plan approved).
-   Returns what was automated and what needs manual build in Flow Designer.`,
+  'generate_migration_guide',
+  `Generates a clear, numbered step-by-step guide for manually building a
+   Salesforce or Jira flow/automation inside ServiceNow Workflow Studio.
+
+   Does NOT touch ServiceNow via API — it only produces a human guide.
+   Call this after analyze_flow or analyze_jira_automation.
+
+   The guide covers every click: where to go, what to name things,
+   which trigger to choose, how to add each step and fill in its fields.`,
   {
-    flow_api_name:  z.string(),
-    sn_table:       z.string(),
-    flow_scope:     z.string().optional().describe('Scope prefix e.g. x_mig — flow name becomes scope_ApiName'),
-    field_mappings: z.record(z.string()).optional().describe('SF field name → SN field name map'),
-    app_scope_id:   z.string().optional().describe('sys_id of the SN scoped app (if using scoped app)'),
-  },
-  async ({ flow_api_name, sn_table, flow_scope, field_mappings, app_scope_id }) => {
-    try {
-      const sn        = await getSn();
-      const retriever = new FlowRetriever(await getSf());
-      const builder   = new FlowBuilder(sn);
-      const raw       = await retriever.getFlowMetadata(flow_api_name);
-      const structure = retriever.parseFlowStructure(raw);
-
-      // Pre-populate subflow registry from any subflow elements so Call Subflow
-      // steps get the correct sys_id if those subflows were already migrated
-      for (const el of structure.elements ?? []) {
-        if (el.kind === 'subflow' && el.flowName) {
-          const existing = await sn.findSubflow(el.flowName).catch(() => null);
-          if (existing?.sys_id) builder.subflowRegistry[el.flowName] = existing.sys_id;
-        }
-      }
-
-      const result = await builder.build({
-        flowStructure:  structure,
-        snTableName:    sn_table,
-        fieldMappings:  field_mappings ?? {},
-        flowScope:      flow_scope ?? null,
-        appScopeId:     app_scope_id ?? null,
-      });
-
-      return ok({
-        instructions_for_claude: [
-          'Show the flow build summary to the user.',
-          'If there are manual_build_items, present each one with the step-by-step guide.',
-          'For Screen Flows, explain what needs to be built as a Service Catalog item in Now Experience.',
-          'Ask the user to test the flow in their dev instance before promoting.',
-        ],
-        result,
-        manual_build_items: builder.manualList,
-        flow_designer_url:  result.flow?.sys_id
-          ? `${(await getSn()).baseUrl}/now/workflow-studio/home`
-          : null,
-        flow_sys_id: result.flow?.sys_id ?? null,
-      });
-    } catch (e) { return fail(e.message); }
-  }
-);
-
-// ══════════════════════════════════════════════════════════════════════════
-// TOOL: build_subflow  — creates a reusable SN subflow from a parsed structure
-// ══════════════════════════════════════════════════════════════════════════
-server.tool(
-  'build_subflow',
-  `Creates a ServiceNow Subflow (no trigger, callable by flows and scripts).
-   Use this when migrating Salesforce AutoLaunchedFlows, Jira rule chains, or
-   any reusable logic block that other flows will call.
-   Returns the subflow sys_id so you can reference it in parent flow steps.`,
-  {
-    name:           z.string().describe('Subflow name (will be prefixed with flow_scope if provided)'),
-    description:    z.string().optional().describe('What this subflow does'),
-    flow_scope:     z.string().optional().describe('Scope prefix e.g. jira, sf'),
-    app_scope_id:   z.string().optional().describe('sys_id of the scoped app'),
-    variables:      z.array(z.object({
-      name:      z.string(),
-      dataType:  z.string().default('String'),
-      isInput:   z.boolean().default(false),
-      isOutput:  z.boolean().default(false),
-    })).optional().describe('Input/output variables for the subflow'),
-    elements:       z.array(z.object({
-      kind:  z.string(),
-      label: z.string().optional(),
-      name:  z.string().optional(),
-    })).optional().describe('Steps inside the subflow'),
-    sn_table:       z.string().optional().describe('Target SN table the subflow operates on'),
-    field_mappings: z.record(z.string()).optional(),
-  },
-  async ({ name, description, flow_scope, app_scope_id, variables, elements, sn_table, field_mappings }) => {
-    try {
-      const sn = await getSn();
-      const builder = new FlowBuilder(sn);
-      const flowStructure = {
-        apiName:   name.toLowerCase().replace(/[^a-z0-9]/g, '_'),
-        type:      'subflow',
-        isSubflow: true,
-        label:     name,
-        trigger:   null,
-        variables: variables ?? [],
-        elements:  elements ?? [],
-        isScreen:  false,
-      };
-      const result = await builder.build({
-        flowStructure,
-        snTableName:   sn_table ?? null,
-        fieldMappings: field_mappings ?? {},
-        flowScope:     flow_scope ?? null,
-        appScopeId:    app_scope_id ?? null,
-      });
-      return ok({
-        instructions_for_claude: [
-          `Tell the user: Subflow "${result.flow?.name}" created with sys_id ${result.flow?.sys_id}.`,
-          'Share the Workflow Studio URL so they can view and configure it.',
-          result.steps?.manual
-            ? `${result.steps.manual} TODO stub step(s) need manual configuration — show the manual_build_items.`
-            : 'All steps were created successfully.',
-        ],
-        result,
-        manual_build_items: builder.manualList,
-        workflow_studio_url: result.flow?.sys_id
-          ? `${(await getSn()).baseUrl}/now/workflow-studio/builder?table=sys_hub_flow&sysId=${result.flow.sys_id}`
-          : null,
-      });
-    } catch (e) { return fail(e.message); }
-  }
-);
-
-// ══════════════════════════════════════════════════════════════════════════
-// TOOL: create_custom_action  — builds an Action Designer action type
-// ══════════════════════════════════════════════════════════════════════════
-server.tool(
-  'create_custom_action',
-  `Creates a reusable custom Action in ServiceNow Action Designer (sys_hub_action_type_definition).
-   Use this to migrate Salesforce Apex actions, Jira webhook actions, or any complex
-   reusable logic that should be packaged as a Flow Designer action step.
-   The action can then be referenced in flows/subflows as a step.`,
-  {
-    name:         z.string().describe('Action name shown in Flow Designer step picker'),
-    description:  z.string().optional(),
-    app_scope_id: z.string().optional().describe('sys_id of the scoped app'),
-    inputs:       z.array(z.object({
-      name:      z.string(),
-      label:     z.string().optional(),
-      type:      z.string().default('string'),
-      mandatory: z.boolean().default(false),
-    })).optional().describe('Input variables for this action'),
-    outputs: z.array(z.object({
-      name:  z.string(),
-      label: z.string().optional(),
-      type:  z.string().default('string'),
-    })).optional().describe('Output variables this action produces'),
-    script: z.string().optional().describe('GlideScript body for the action\'s script step'),
-  },
-  async ({ name, description, app_scope_id, inputs, outputs, script }) => {
-    try {
-      const sn = await getSn();
-      const result = await sn.createCustomAction(
-        name,
-        description ?? `Migrated action: ${name}`,
-        inputs ?? [],
-        outputs ?? [],
-        script ?? null,
-        app_scope_id ?? null,
-      );
-      return ok({
-        instructions_for_claude: [
-          `Tell the user: Custom action "${name}" created (sys_id: ${result.sys_id}).`,
-          'They can find it in Flow Designer → Action Designer → Custom Actions.',
-          'It will appear in the step picker when building flows.',
-          script ? 'Review the script in Action Designer before activating.' : '⚠️ No script was provided — add the business logic manually in Action Designer.',
-        ],
-        action: result,
-        action_designer_url: `${(await getSn()).baseUrl}/now/workflow-studio/action-designer`,
-      });
-    } catch (e) { return fail(e.message); }
-  }
-);
-
-// ══════════════════════════════════════════════════════════════════════════
-// TOOL: generate_flow_sdk_code  — generates official @servicenow/sdk TypeScript
-// ══════════════════════════════════════════════════════════════════════════
-server.tool(
-  'generate_flow_sdk_code',
-  `Generates official ServiceNow SDK TypeScript code for a flow, subflow, or custom action
-   using the @servicenow/sdk/automation Fluent Flow API (Flow(), Subflow(), Action() constructors).
-
-   This is the officially supported approach — the generated code can be deployed to ServiceNow
-   with: snc deploy  (requires ServiceNow CLI + @servicenow/sdk installed in the SN project)
-
-   When to prefer this over build_flow/build_subflow (direct Table API):
-   - When the user has the SN SDK CLI toolchain set up
-   - When they want version-controlled TypeScript code for the flow
-   - When they encountered Table API errors on their SN version
-
-   Output includes a ready-to-deploy .ts file and deployment instructions.`,
-  {
-    flow_structure: z.object({
-      apiName:     z.string().describe('Internal/API name for the flow (used as TypeScript export name)'),
-      label:       z.string().optional(),
+    source_platform: z.enum(['salesforce', 'jira']).describe('Where the flow comes from'),
+    flow_analysis:   z.object({
+      name:        z.string(),
       description: z.string().optional(),
-      type:        z.string().default('record').describe('record | scheduled | on_demand | subflow | autolaunched'),
-      isSubflow:   z.boolean().default(false),
-      _sourcePlatform: z.string().optional().describe('jira | salesforce'),
-      trigger:     z.object({
-        when:       z.string().optional().describe('created | updated | createdOrUpdated'),
-        condition:  z.string().optional().describe('SN encoded query for trigger condition'),
-        runType:    z.string().optional().describe('daily | weekly | monthly | periodically | once'),
+      type:        z.string().describe('record | scheduled | screen | subflow | autolaunched | jira_rule'),
+      trigger: z.object({
+        object:    z.string().optional().describe('Salesforce object / Jira project'),
+        when:      z.string().optional().describe('created | updated | createdOrUpdated | scheduled | manual'),
+        condition: z.string().optional().describe('Entry condition / filter'),
+        schedule:  z.string().optional().describe('e.g. daily at 08:00'),
       }).optional(),
       variables: z.array(z.object({
-        name:      z.string(),
-        label:     z.string().optional(),
-        dataType:  z.string().optional(),
-        isInput:   z.boolean().default(false),
-        isOutput:  z.boolean().default(false),
-        mandatory: z.boolean().default(false),
+        name:     z.string(),
+        type:     z.string().optional(),
+        isInput:  z.boolean().optional(),
+        isOutput: z.boolean().optional(),
       })).default([]),
-      elements: z.array(z.object({
-        name:              z.string().optional(),
-        label:             z.string().optional(),
-        kind:              z.string().describe('recordCreate | recordUpdate | recordDelete | recordLookup | decision | loop | subflow | assignment | action'),
-        inputAssignments:  z.array(z.object({ field: z.string(), value: z.string() })).optional(),
-        filterConditions:  z.array(z.object({ field: z.string(), operator: z.string().optional(), value: z.string() })).optional(),
-        conditions:        z.array(z.object({ leftValueReference: z.string().optional(), operator: z.string().optional(), rightValue: z.object({ stringValue: z.string().optional() }).optional() })).optional(),
-        subflowName:       z.string().optional(),
-        config:            z.record(z.unknown()).optional(),
-        raw_type:          z.string().optional(),
+      steps: z.array(z.object({
+        order:       z.number(),
+        label:       z.string(),
+        type:        z.string().describe('recordCreate | recordUpdate | recordDelete | recordLookup | decision | loop | notification | script | subflow | approval | wait | screen'),
+        table:       z.string().optional(),
+        fields:      z.record(z.string()).optional().describe('field → value mappings'),
+        condition:   z.string().optional(),
+        script:      z.string().optional(),
+        notes:       z.string().optional().describe('Extra context or why this step is needed'),
+        manual_only: z.boolean().default(false).describe('True if this cannot be automated and must be done manually'),
       })).default([]),
-    }).describe('Parsed flow structure from Jira or Salesforce'),
-    sn_table_name:  z.string().optional().describe('ServiceNow target table (e.g. incident, problem)'),
-    field_mappings: z.record(z.string()).default({}).describe('Source field name → SN field name map'),
-    artifact_type:  z.enum(['flow', 'subflow', 'action']).default('flow'),
-    // For custom action type:
-    action_inputs:  z.array(z.object({ name: z.string(), dataType: z.string().optional(), label: z.string().optional(), mandatory: z.boolean().default(false) })).optional(),
-    action_outputs: z.array(z.object({ name: z.string(), dataType: z.string().optional(), label: z.string().optional() })).optional(),
-    action_script:  z.string().optional(),
+    }).describe('Parsed flow structure from analyze_flow or analyze_jira_automation'),
+    sn_table:       z.string().describe('ServiceNow target table (e.g. incident, problem, sc_req_item)'),
+    field_mappings: z.record(z.string()).default({}).describe('Source field → SN field name'),
+    sn_instance_url: z.string().optional().describe('SN instance URL for direct links (e.g. https://yourinstance.service-now.com)'),
   },
-  async ({ flow_structure, sn_table_name, field_mappings, artifact_type, action_inputs, action_outputs, action_script }) => {
+  async ({ source_platform, flow_analysis, sn_table, field_mappings, sn_instance_url }) => {
     try {
-      const gen = new FlowSdkCodegen();
-      let code;
+      const sn   = await getSn();
+      const base = sn_instance_url ?? process.env.SN_INSTANCE_URL?.replace(/\/$/, '') ?? 'https://your-instance.service-now.com';
+      const fa   = flow_analysis;
 
-      if (artifact_type === 'action') {
-        code = gen.generateCustomAction(
-          flow_structure.label ?? flow_structure.apiName,
-          flow_structure.description,
-          action_inputs ?? [],
-          action_outputs ?? [],
-          action_script,
-        );
-      } else if (artifact_type === 'subflow' || flow_structure.isSubflow || (flow_structure.type ?? '').toLowerCase() === 'subflow') {
-        code = gen.generateSubflow(flow_structure, sn_table_name, field_mappings);
-      } else {
-        code = gen.generateFlow(flow_structure, sn_table_name, field_mappings);
-      }
+      const mapField = (f) => field_mappings[f] ?? f;
+      const isSubflow = ['subflow','autolaunched','autolaunchedflow'].includes((fa.type ?? '').toLowerCase());
+      const isScheduled = (fa.type ?? '').toLowerCase().includes('sched') || fa.trigger?.when === 'scheduled';
 
-      const internalName = flow_structure.apiName.toLowerCase().replace(/[^a-z0-9]/g, '_').replace(/^_+|_+$/g, '');
-      const fileName = `${internalName}.ts`;
+      // ── Step-type → SN action name ─────────────────────────────────────
+      const actionNames = {
+        recordCreate:  'Create Record',
+        recordUpdate:  'Update Record',
+        recordDelete:  'Delete Record',
+        recordLookup:  'Look Up Record',
+        notification:  'Send Notification',
+        script:        'Run Script',
+        approval:      'Ask for Approval',
+        wait:          'Wait for Condition',
+        subflow:       'Flow Logic → Subflow',
+        decision:      'Flow Logic → If',
+        loop:          'Flow Logic → For Each',
+      };
+
+      // ── Trigger description ─────────────────────────────────────────────
+      const triggerLines = (() => {
+        const t = fa.trigger ?? {};
+        if (isSubflow) {
+          return [
+            '(Subflows have no trigger — they are called by other flows)',
+            'In the "Type" dropdown at the top, select **Subflow**',
+          ];
+        }
+        if (isScheduled) {
+          return [
+            'Click **Trigger** → choose **Scheduled**',
+            `Set frequency: **${t.schedule ?? 'Daily at 08:00'}**`,
+            t.condition ? `Set run condition: \`${t.condition}\`` : null,
+          ].filter(Boolean);
+        }
+        const when = { created:'Created', updated:'Updated', createdOrUpdated:'Created or Updated', before:'Before Save', after:'After Save' }[t.when ?? 'createdOrUpdated'] ?? 'Created or Updated';
+        return [
+          'Click **Trigger** → choose **Record**',
+          `Table: **${sn_table}**`,
+          `When: **${when}**`,
+          t.condition ? `Condition (click "Add filter"): \`${t.condition}\`` : 'Leave condition blank to run on every record',
+          fa.source_platform === 'salesforce' && t.when === 'before' ? '⚠ Before-save flows → set "When to run" to **Before** in advanced trigger settings' : null,
+        ].filter(Boolean);
+      })();
+
+      // ── Build step guide ────────────────────────────────────────────────
+      const stepGuides = fa.steps.map((step, idx) => {
+        const num   = idx + 1;
+        const sType = step.type ?? 'script';
+        const aName = actionNames[sType] ?? 'Run Script';
+        const lines = [`**Step ${num} — ${step.label}**`];
+
+        if (step.manual_only) {
+          lines.push('⚠️  **MANUAL STEP** — cannot be fully automated, build by hand:');
+        }
+
+        // Where to click
+        lines.push(`Click the **+** button → **Action** → search for "**${aName}**" → select it`);
+        lines.push(`Label the step: **"${step.label}"**`);
+
+        // Step-specific instructions
+        if (sType === 'decision') {
+          lines.push(`This is a branch. Choose **Flow Logic → If**`);
+          lines.push(`Condition: \`${step.condition ?? 'set your condition here'}\``);
+          lines.push('Add the True-branch steps inside the If block, then add False/Else steps below');
+        } else if (sType === 'loop') {
+          lines.push('Choose **Flow Logic → For Each**');
+          lines.push(`Collection: set to the record list variable from the previous Look Up step`);
+          lines.push('Add loop body steps inside the For Each block');
+        } else if (sType === 'recordCreate') {
+          lines.push(`Table: **${step.table ?? sn_table}**`);
+          if (step.fields && Object.keys(step.fields).length) {
+            lines.push('Fields to set:');
+            Object.entries(step.fields).forEach(([f,v]) => lines.push(`  • ${mapField(f)} = \`${v}\``));
+          } else {
+            lines.push('Click **Add Field Value** and set each field you want to populate');
+          }
+        } else if (sType === 'recordUpdate') {
+          lines.push(`Table: **${step.table ?? sn_table}**`);
+          lines.push('Record: drag the trigger record data pill into the "Record" field');
+          if (step.fields && Object.keys(step.fields).length) {
+            lines.push('Fields to update:');
+            Object.entries(step.fields).forEach(([f,v]) => lines.push(`  • ${mapField(f)} = \`${v}\``));
+          } else {
+            lines.push('Click **Add Field Value** and set each field to update');
+          }
+        } else if (sType === 'recordDelete') {
+          lines.push(`Table: **${step.table ?? sn_table}**`);
+          lines.push('Record: drag the trigger record data pill into the "Record" field');
+        } else if (sType === 'recordLookup') {
+          lines.push(`Table: **${step.table ?? sn_table}**`);
+          lines.push(`Conditions: ${step.condition ?? 'add query filters to find the right record(s)'}`);
+          lines.push('Save the output as a flow variable for use in later steps');
+        } else if (sType === 'notification') {
+          lines.push('Choose **Send Notification**');
+          lines.push(step.fields?.to ? `To: ${step.fields.to}` : 'To: drag the user/email data pill');
+          lines.push(step.fields?.subject ? `Subject: "${step.fields.subject}"` : 'Subject: set notification subject');
+          lines.push('Or choose an existing **Notification** record from your SN instance');
+        } else if (sType === 'approval') {
+          lines.push('Choose **Ask for Approval**');
+          lines.push('Table: set to the record being approved');
+          lines.push('Approvers: add users or groups who must approve');
+          lines.push('Add a branch for Approved / Rejected outcomes');
+        } else if (sType === 'subflow') {
+          lines.push('Choose **Flow Logic → Subflow**');
+          lines.push(`Subflow: search for "${step.label}" (build and publish the subflow first)`);
+          lines.push('Map input values by dragging data pills from parent flow variables');
+        } else {
+          // script / fallback
+          if (step.script) {
+            lines.push('Choose **Run Script**');
+            lines.push('Paste this script into the Script field:');
+            lines.push('```javascript');
+            lines.push(step.script.trim());
+            lines.push('```');
+          } else {
+            lines.push(`Choose **${aName}** and configure it for: ${step.notes ?? step.label}`);
+          }
+        }
+
+        if (step.notes && sType !== 'script') lines.push(`📝 Note: ${step.notes}`);
+        return lines.join('\n');
+      });
+
+      // ── Variables guide ─────────────────────────────────────────────────
+      const varLines = fa.variables?.length ? fa.variables.map(v =>
+        `• **${v.name}** (${v.type ?? 'String'})${v.isInput ? ' — Input' : ''}${v.isOutput ? ' — Output' : ''}`
+      ) : ['(No variables needed)'];
+
+      // ── Compose the full guide ──────────────────────────────────────────
+      const guide = [
+        `# ServiceNow Migration Guide`,
+        `**Source:** ${source_platform === 'salesforce' ? 'Salesforce' : 'Jira'} → **"${fa.name}"**`,
+        `**Target table:** \`${sn_table}\``,
+        `**Flow type:** ${isSubflow ? 'Subflow' : isScheduled ? 'Scheduled Flow' : 'Record-Triggered Flow'}`,
+        fa.description ? `**Description:** ${fa.description}` : null,
+        '',
+        '---',
+        '',
+        '## 1 — Open Workflow Studio',
+        `1. Go to: **${base}/flow-designer.do**`,
+        '2. Click **New** (top-right) → choose **Flow** (or **Subflow** if this is a reusable subflow)',
+        `3. Name: **"${fa.name}"**`,
+        `4. Description: "${fa.description ?? fa.name}"`,
+        '5. Run as: **System** (recommended for automation flows)',
+        '6. Click **Submit**',
+        '',
+        '---',
+        '',
+        '## 2 — Configure the Trigger',
+        ...triggerLines.map((l, i) => `${i + 1}. ${l}`),
+        '',
+        '---',
+        '',
+        ...(fa.variables?.length ? [
+          '## 3 — Add Flow Variables (optional)',
+          'Variables let you pass data between steps.',
+          '1. Click the **Variables** tab (top of the canvas)',
+          '2. Click **+** to add each variable:',
+          ...varLines,
+          '',
+          '---',
+          '',
+        ] : []),
+        `## ${fa.variables?.length ? 4 : 3} — Add Steps`,
+        'Click the **+** button after the trigger to add your first step.',
+        'Add each step in order — the canvas flows top to bottom.',
+        '',
+        ...stepGuides.map((g, i) => `### Step ${i + 1}\n${g}`).flatMap(s => [s, '']),
+        '---',
+        '',
+        `## ${fa.variables?.length ? 5 : 4} — Save and Activate`,
+        '1. Click **Save** (top-right) to save the draft',
+        '2. Review the canvas — make sure all steps are connected',
+        '3. Click **Activate** to publish the flow',
+        '4. Test: trigger the flow manually or create a test record',
+        '',
+        '---',
+        '',
+        '## Tips',
+        '• **Data pills**: Drag values from the right-hand panel into step fields — this links live data (e.g. the trigger record\'s fields) into your steps',
+        '• **Conditions**: Use the filter builder — click "Add filter" then pick field / operator / value',
+        '• **Scripts**: In Run Script steps, use `current` for the trigger record, `fd_data` for flow variable data',
+        '• **Subflows**: Build and activate subflows before the parent flow — parent flows call them by name',
+        `• **Workflow Studio URL**: ${base}/flow-designer.do`,
+      ].filter(s => s !== null).join('\n');
 
       return ok({
-        file_name: fileName,
-        typescript_code: code,
-        deployment_instructions: [
-          '1. Install the SN SDK: npm install -g @servicenow/sdk',
-          '2. In your ServiceNow project: snc init  (if not already done)',
-          `3. Save the code as: src/flows/${fileName}`,
-          '4. Deploy to your SN instance: snc deploy --config=app.config.json',
-          '5. Open Workflow Studio to verify and activate the flow',
-        ],
-        notes: [
-          'TODOs in the code mark elements that need manual review (conditions, field references).',
-          'wfa.dataPill() references connect flow variable values between steps.',
-          'Subflows must be deployed before parent flows that call them.',
-          'Use action.core.* for built-in SN actions; import custom actions from their own files.',
-        ],
+        guide,
+        summary: {
+          flow_name:   fa.name,
+          flow_type:   isSubflow ? 'subflow' : isScheduled ? 'scheduled' : 'record_triggered',
+          sn_table,
+          total_steps: fa.steps.length,
+          manual_steps: fa.steps.filter(s => s.manual_only).length,
+          workflow_studio_url: `${base}/flow-designer.do`,
+        },
       });
     } catch (e) { return fail(e.message); }
   }
 );
+
 
 // ══════════════════════════════════════════════════════════════════════════
 // TOOL: fetch_sn_records  (utility)
