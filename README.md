@@ -1,70 +1,143 @@
-# SN Data Migration — MCP Server
+# ServiceNow Dev MCP
 
-An MCP (Model Context Protocol) server for **Claude Code** that migrates data from **Salesforce** or **Jira** into any **ServiceNow** table. Claude drives the entire workflow — it asks you questions at each step, waits for your review and approval, and only proceeds when you say so. No manual commands or scripts needed.
-
----
-
-## What it does
-
-### Data migration (any source → any ServiceNow table)
-
-- Checks ServiceNow for existing artifacts before doing anything — skips what's already set up
-- Discovers source and target schemas side by side
-- Auto-suggests a staging table definition and field mappings for your review
-- Builds all ServiceNow artifacts: staging table, columns, transform map, field maps, transform scripts, data source, REST message
-- Analyses dependencies before migrating (Jira: users, Epic→Story→Task→Subtask hierarchy)
-- Runs a small test migration (configurable sample size) and produces a field-level data quality report
-- Runs the full migration in batches with up to 5 parallel import sets
-- Cleans up both migrated records and the migration setup itself when needed
-
-### Flow migration (Salesforce → ServiceNow Flow Designer)
-
-- Lists and retrieves Salesforce flow metadata via the Tooling API
-- Analyses triggers, variables, and elements
-- Builds the ServiceNow flow automatically where possible
-- Produces a step-by-step manual build guide for Screen Flows and complex elements
+> AI-powered ServiceNow developer toolkit for **Claude Code** — 90 tools that help you build, review, test, document, and deploy ServiceNow artifacts faster and with fewer errors.
 
 ---
 
-## Architecture
+## What is this?
+
+**ServiceNow Dev MCP** is a [Model Context Protocol](https://modelcontextprotocol.io) server that connects Claude Code directly to your ServiceNow instance. Instead of switching between tabs, writing boilerplate from scratch, or Googling best practices, you just describe what you need and Claude handles it end-to-end.
 
 ```
-src/
-├── mcp-server.js          # All MCP tools — entry point
-├── connectors/
-│   ├── servicenow.js      # SN Table API + Import Set API + artifact builders
-│   ├── salesforce.js      # SF REST + Tooling API + SOQL pagination
-│   └── jira.js            # Jira REST API v3
-├── migration/
-│   ├── schema.js          # Schema discovery + staging table + mapping suggestions
-│   ├── staging.js         # Artifact builder — idempotent, classifies field map vs transform script
-│   ├── runner.js          # Test migration + paginated full migration (Salesforce)
-│   ├── batch.js           # Parallel batch runner — max 5 import sets, dynamic batch sizing
-│   ├── dependency.js      # Jira user/hierarchy analysis, migration sequence planner
-│   ├── validator.js       # Source → staging → target field-level data quality report
-│   └── cleanup.js         # Delete migrated records and/or migration artifacts
-├── flows/
-│   ├── retriever.js       # Salesforce flow metadata parser
-│   └── builder.js         # ServiceNow flow artifact builder
-└── utils/
-    ├── logger.js          # Structured console logging
-    ├── progress.js        # Plain-English step tracker for non-technical users
-    └── sn-auth.js         # ServiceNow auth (basic or SDK OAuth)
+"Create a Business Rule that sets priority to Critical when the category is Security"
+"Clone the sc-cat-item widget and add a real-time search bar"
+"Review this Script Include for performance issues"
+"Generate full technical documentation for my HR application"
+"My widget is showing a blank white box — help me diagnose it"
 ```
 
 ---
 
-## Requirements
+## Capabilities at a glance
 
-- **Node.js 18+**
-- **Claude Code** (CLI, desktop app, or IDE extension) with MCP support
-- **ServiceNow** instance — user needs `admin` or `import_admin` role to create staging tables and transform maps
-- **Jira** Cloud account + API token (for Jira migrations)
-- **Salesforce** Connected App with OAuth credentials (for Salesforce migrations)
+| Category | What it does |
+|---|---|
+| **Script Generation** | Generate Business Rules, Script Includes, Client Scripts, UI Actions, Scripted REST APIs, Scheduled Jobs, Fix Scripts, and Widgets with best practices baked in |
+| **Code Review** | Static analysis across 20 rules — anti-patterns, performance, security, null-safety. Scores 0–10 with per-issue fix guidance |
+| **Service Portal** | Analyze portals, find/clone/create/update widgets, scaffold new portals with CSS-variable themes |
+| **Service Catalog** | Create catalog items with typed variables, client scripts, and UI policies; clone existing items; manage categories and record producers |
+| **Notifications** | Build email notifications with responsive HTML templates, push notifications, email scripts, and analyze existing notifications for issues |
+| **Table Explorer** | Full schema discovery — fields, Business Rules, Client Scripts, ACLs, relationships, parent hierarchy |
+| **ATF Testing** | Generate Automated Test Framework test suites for BRs, Script Includes, REST APIs, forms, and tables |
+| **Performance** | Detect slow scripts, missing indexes, Business Rules without conditions, error pattern analysis |
+| **Technical Docs** | Generate full project documentation from live SN data (data model, BRs, APIs, security, ops guide) |
+| **Issue Diagnosis** | 60+ catalogued issues with step-by-step diagnosis, copy-paste fixes, and prevention tips |
+| **Data Migration** | Migrate Jira/Salesforce data into any ServiceNow table with full artifact generation |
+| **Bidirectional Integration** | Design and implement SN↔Jira, SN↔Salesforce integrations with Business Rules, Scripted REST, Apex code |
 
 ---
 
-## Setup
+## Tool count: 90 tools
+
+<details>
+<summary><strong>Developer Productivity (35 tools)</strong></summary>
+
+| Tool | What it does |
+|---|---|
+| `generate_script` | Generate any SN artifact (BR, SI, CS, UI Action, REST, Scheduled Job, Fix Script, Widget) |
+| `review_script` | Code review: 20 rules, score 0–10, per-issue fix guidance |
+| `list_review_rules` | Browse all 20 review rules by category |
+| `explore_table` | Full schema: fields, BRs, Client Scripts, ACLs, relationships, hierarchy |
+| `find_table` | Search tables by keyword |
+| `get_table_acls` | All ACL rules for a table |
+| `generate_atf_tests` | ATF test suites for BRs, SIs, REST APIs, forms, tables |
+| `analyze_performance` | Slow scripts, index gaps, error patterns, BR audit |
+| `find_sys_logs` | Search system logs by keyword / source / level |
+| `run_background_script` | Create and run Fix Script records (dry_run safe) |
+| `generate_docs` | Markdown API docs for SIs, BRs, tables, REST APIs, applications |
+| `scaffold_application` | Full app scaffold: table + BRs + SI + UI Actions + ACLs + ATF + docs |
+| `health_check_instance` | Instance health score with actionable findings |
+| `explain_api` | Explain SN APIs (GlideRecord, GlideAggregate, RESTMessageV2, etc.) |
+| `analyze_portal` | Analyze a complete Service Portal (pages, widgets, theme, usage) |
+| `find_widget` | Search widgets by name, ID, or keyword |
+| `clone_widget` | Clone a widget with modifications (all 4 sections) |
+| `create_widget` | Generate a complete widget from a requirement |
+| `update_widget` | Build PATCH payload for specific widget sections |
+| `create_portal` | Scaffold a new portal with theme and pages |
+| `create_catalog_item` | Catalog item with variables, client scripts, UI policies |
+| `clone_catalog_item` | Clone a live catalog item from SN |
+| `create_catalog_category` | Create a catalog category |
+| `get_catalog_item` | Fetch catalog item and variables for inspection |
+| `create_notification` | Email notification with responsive HTML template |
+| `analyze_notifications` | Analyze and find issues in existing notifications |
+| `create_push_notification` | Push notification for Now Mobile |
+| `create_email_script` | Dynamic email script (Email Script record) |
+| `generate_project_doc` | Full project technical doc from live SN data |
+| `generate_feature_doc` | Feature one-pager for sprint/change docs |
+| `diagnose_issue` | Diagnose any SN issue from a symptom description |
+| `get_issue_guide` | Step-by-step guided fix for a specific known issue |
+| `list_common_issues` | Browse 60+ catalogued SN issues by category |
+| `get_field_choices` | Get all choice list values for a field |
+| `create_choice` | Add a new choice to a field's choice list |
+
+</details>
+
+<details>
+<summary><strong>Data Migration (30 tools)</strong></summary>
+
+| Tool | What it does |
+|---|---|
+| `get_config` | Show current credential/connection status |
+| `configure_credentials` | Set per-session credentials (web Claude Code) |
+| `connect` | Test connectivity to SN / Jira / Salesforce |
+| `check_migration_state` | Scan SN for existing artifacts, return gap analysis |
+| `discover_schema` | Pull source + target schemas, auto-suggest mappings |
+| `analyze_dependencies` | Jira hierarchy analysis, user mapping, migration sequence |
+| `build_artifacts` | Create staging table, transform map, field maps (idempotent) |
+| `run_test_migration` | Push sample records, field-level data quality report |
+| `run_full_migration` | Full migration in dependency order with parallel batches |
+| `map_users` | Map source users to SN users |
+| `pre_migration_check` | Pre-flight validation before migration starts |
+| `transform_preview` | Preview a transform rule on sample data |
+| `convert_rich_text` | Convert Jira ADF / Salesforce HTML to SN HTML |
+| `topological_sort` | Dependency-ordered migration sequence |
+| `start_audit_session` | Start an audit trail for a migration |
+| `get_audit_stats` | Get migration audit statistics |
+| `reconcile_migration` | Field-level comparison: source vs SN records |
+| `reconcile_staging` | Compare staging vs target (PASS/PARTIAL/FAIL verdict) |
+| `migration_test_report` | Full migration test report |
+| `fetch_sn_records` | Query any SN table |
+| `analyze_transform_map` | Audit an existing transform map |
+| `get_report_data` | Structured data for sign-off documents |
+| `cleanup_migration` | Delete migrated records (with confirmation) |
+| `cleanup_artifacts` | Delete all migration setup artifacts |
+| `list_sf_flows` | List Salesforce flows |
+| `analyze_flow` | Parse Salesforce flow structure |
+| `build_flow` | Build equivalent SN Flow Designer flow |
+
+</details>
+
+<details>
+<summary><strong>Bidirectional Integration (25 tools)</strong></summary>
+
+| Tool | What it does |
+|---|---|
+| `design_integration` | Design a full bidirectional integration plan (SN↔Jira, SN↔SF, SF↔Jira) |
+| `create_sn_integration_artifacts` | Create SN Business Rules, Scripted REST APIs, Correlation/Retry tables |
+| `create_jira_integration_artifacts` | Create Jira webhooks and automation rules |
+| `create_sf_integration_artifacts` | Create Salesforce Apex triggers, Named Credentials, REST callout classes |
+| `get_integration_status` | Check sync health and error counts |
+| `retry_failed_syncs` | Retry records in the error/dead-letter table |
+| `test_integration` | End-to-end integration test |
+| `disable_integration` | Pause all syncs (maintenance mode) |
+| `enable_integration` | Resume syncs after maintenance |
+| `update_field_mappings` | Update field mappings in a live integration |
+
+</details>
+
+---
+
+## Quick start
 
 ### 1. Clone and install
 
@@ -80,340 +153,235 @@ npm install
 cp .env.example .env
 ```
 
-Open `.env` and fill in your values. The sections below explain each credential.
+Edit `.env`:
 
----
-
-#### ServiceNow credentials
-
-| Variable | Description |
-|---|---|
-| `SN_INSTANCE_URL` | Full URL of your SN instance, e.g. `https://dev12345.service-now.com` |
-| `SN_USERNAME` | ServiceNow username (basic auth) |
-| `SN_PASSWORD` | ServiceNow password (basic auth) |
-| `SN_USE_SDK_AUTH` | Set `true` to use OAuth via `@servicenow/sdk` instead of username/password |
-| `SN_SCOPE_PREFIX` | Table name prefix — `u` for global scope, `x_myapp` for scoped app |
-
-**Basic auth (recommended for most setups):**
 ```env
+# ServiceNow (required for all tools)
 SN_INSTANCE_URL=https://yourinstance.service-now.com
 SN_USERNAME=admin
 SN_PASSWORD=yourpassword
-SN_USE_SDK_AUTH=false
 SN_SCOPE_PREFIX=u
-```
 
-**OAuth via ServiceNow SDK (optional):**
-```bash
-npx @servicenow/sdk auth --add https://yourinstance.service-now.com
-```
-Then set `SN_USE_SDK_AUTH=true` and leave `SN_USERNAME` / `SN_PASSWORD` blank.
-
-**Required SN roles:**
-- `import_admin` — create staging tables, transform maps, field maps
-- `rest_api_explorer` — push records via Import Set REST API
-
----
-
-#### Jira credentials
-
-Generate an API token at [id.atlassian.com → Security → API tokens](https://id.atlassian.com/manage-profile/security/api-tokens).
-
-```env
+# Jira (required for Jira migration tools)
 JIRA_BASE_URL=https://yourcompany.atlassian.net
 JIRA_EMAIL=your_email@example.com
-JIRA_API_TOKEN=your_api_token_here
-JIRA_PAGE_SIZE=50
-```
+JIRA_API_TOKEN=your_api_token
 
----
-
-#### Salesforce credentials
-
-Create a **Connected App** in Salesforce: Setup → App Manager → New Connected App. Enable OAuth and add the `Full access (full)` scope.
-
-```env
+# Salesforce (required for Salesforce migration/integration tools)
 SF_LOGIN_URL=https://login.salesforce.com
-SF_CLIENT_ID=your_connected_app_consumer_key
-SF_CLIENT_SECRET=your_connected_app_consumer_secret
+SF_CLIENT_ID=your_consumer_key
+SF_CLIENT_SECRET=your_consumer_secret
 SF_USERNAME=your_sf_username@example.com
 SF_PASSWORD=your_sf_password
-SF_SECURITY_TOKEN=your_sf_security_token
-SF_API_VERSION=v59.0
+SF_SECURITY_TOKEN=your_security_token
 ```
-
-> **Security token:** Reset at Salesforce → My Settings → Personal → Reset My Security Token. Leave it blank if your IP address is whitelisted in Salesforce.
-
----
-
-#### Migration settings
-
-```env
-MIGRATION_TEST_LIMIT=5     # Records to use in the test migration (default: 5)
-MIGRATION_PAGE_SIZE=200    # Records per page for Salesforce pagination
-LOG_LEVEL=info
-```
-
----
 
 ### 3. Register with Claude Code
 
-Run this once from inside the project folder:
-
 ```bash
-cd SN-Migration-Agent
-claude mcp add sn-migration node "$(pwd)/src/mcp-server.js"
+claude mcp add sn-dev-mcp node "$(pwd)/src/mcp-server.js"
 ```
 
-This registers the server in your local Claude Code config. The server starts automatically whenever Claude Code opens this project.
-
-**Verify the registration:**
+Verify:
 ```bash
 claude mcp list
+# sn-dev-mcp: node /path/to/... ✔ Connected
 ```
 
-You should see:
+### 4. Restart Claude Code
+
+Close and reopen Claude Code. All 90 tools are now available.
+
+---
+
+## Usage examples
+
+### Developer productivity
 
 ```
-sn-migration: node /path/to/SN-Migration-Agent/src/mcp-server.js - ✔ Connected
+Generate a Business Rule on the incident table that sends a Slack webhook
+when priority changes to Critical
+
+Review this Script Include for performance and security issues:
+[paste code]
+
+Explore the change_request table — show me all fields, BRs, ACLs, and relationships
+
+Clone the "sc-cat-item" widget and rename it "My Catalog Item" — I want to add
+a related items panel below the main content
+
+Create a catalog item for a Laptop Request with these variables:
+- Employee name (text, mandatory)
+- Laptop model (dropdown: MacBook Pro 14, MacBook Pro 16, Dell XPS 15)
+- Justification (multi-line)
+- Manager approval needed? (yes/no)
+
+Create a notification for when an incident is assigned to a group —
+send to the group manager with the incident number and priority in the subject
+
+My widget shows a blank white box when it loads — diagnose the issue
+
+Generate full technical documentation for our IT Asset application
+(tables: u_asset, u_asset_request, u_asset_category)
 ```
 
-### 4. Test the server starts cleanly
+### Data migration
+
+```
+Migrate all Jira issues from project KAN to the incident table
+
+Run a test migration of 5 records first and show me the field quality report
+
+Clean up all test records without touching the transform map
+```
+
+### Integration
+
+```
+Design a bidirectional integration between ServiceNow incidents and Jira issues.
+When an incident is put On Hold, create a Jira ticket.
+When that ticket is resolved, close the incident.
+
+Create all the ServiceNow artifacts for the SN↔Jira integration
+```
+
+---
+
+## Architecture
+
+```
+src/
+├── mcp-server.js              # 90 MCP tools — single entry point
+├── connectors/
+│   ├── servicenow.js          # SN Table API, Import Set API, bulk ops
+│   ├── salesforce.js          # SF REST + Tooling API + Bulk API 2.0
+│   └── jira.js                # Jira REST API v3
+├── developer/
+│   ├── script-builder.js      # Generate BR, SI, CS, UI Action, REST, Job, Widget
+│   ├── code-reviewer.js       # 20-rule static analyser
+│   ├── table-explorer.js      # Schema discovery — fields, BRs, ACLs, relationships
+│   ├── test-generator.js      # ATF test suite generator
+│   ├── perf-analyzer.js       # Slow scripts, indexes, error patterns
+│   ├── doc-generator.js       # Markdown API docs per artifact
+│   ├── portal-builder.js      # Analyze / clone / create / update SP widgets & portals
+│   ├── catalog-builder.js     # Catalog items, variables, categories, record producers
+│   ├── notification-builder.js # Email & push notifications, email scripts
+│   ├── tech-doc-writer.js     # Full project docs from live SN data
+│   └── issue-guide.js         # 60+ issue catalogue with guided fixes
+├── migration/
+│   ├── schema.js              # Schema discovery + staging + mapping suggestions
+│   ├── staging.js             # Artifact builder (idempotent)
+│   ├── runner.js              # Migration runner with topo sort + ETA tracker
+│   ├── batch.js               # Parallel batch runner + dedup
+│   ├── dependency.js          # User/hierarchy analysis
+│   ├── validator.js           # Field-level data quality report
+│   ├── transform-engine.js    # 15+ transform types with preset mappings
+│   ├── reconciler.js          # 3-layer reconciliation (PASS/PARTIAL/FAIL)
+│   ├── audit.js               # NDJSON audit trail
+│   ├── user-mapping.js        # Source → SN user mapping
+│   ├── pre-migration-checks.js # Pre-flight validation
+│   └── cleanup.js             # Delete records and artifacts
+├── integration/
+│   ├── designer.js            # Integration plan designer
+│   ├── sn-artifacts.js        # SN Business Rules, Scripted REST, correlation tables
+│   ├── jira-artifacts.js      # Jira webhooks + automation rules
+│   └── sf-artifacts.js        # Salesforce Apex triggers, callout classes, REST handler
+├── flows/
+│   ├── retriever.js           # Salesforce flow parser
+│   └── jira-automation.js     # Jira automation retriever
+└── utils/
+    ├── logger.js              # Structured logging
+    ├── rich-text.js           # ADF → HTML, SF HTML → SN HTML
+    └── sn-auth.js             # Basic auth + SDK OAuth
+```
+
+---
+
+## Running modes
+
+### Local CLI (default)
+
+Standard `stdio` mode — Claude Code CLI, VS Code extension, JetBrains plugin.
 
 ```bash
 node src/mcp-server.js
 ```
 
-Expected output:
+### HTTP/SSE mode (web Claude Code)
 
+For use with [claude.ai/code](https://claude.ai/code) or remote deployments.
+
+```bash
+MCP_MODE=http MCP_PORT=3000 node src/mcp-server.js
+# SSE endpoint: http://localhost:3000/sse
 ```
-[info]  sn-data-migration MCP server running
+
+Update `.mcp.json` in your repo root to point at the deployed URL:
+
+```json
+{
+  "mcpServers": {
+    "sn-dev-mcp": {
+      "type": "http",
+      "url": "https://your-deployed-server.example.com/sse"
+    }
+  }
+}
 ```
 
-Press `Ctrl+C` to stop. If you see an error about a missing `.env` variable, open `.env` and fill in the missing value.
-
-### 5. Restart Claude Code
-
-Close and reopen Claude Code (or reload your IDE extension). The `sn-migration` tools will be available in your next session.
-
-**Verify tools are loaded** — type `/mcp` in the Claude Code chat window. You should see `sn-migration` listed with all its tools.
+In HTTP mode, use the `configure_credentials` tool to set per-session credentials — credentials are held in memory only and never logged.
 
 ---
 
-## Using the MCP in Claude Code chat
+## ServiceNow permissions required
 
-Once registered, just talk to Claude naturally — no commands or tool names needed:
-
-```
-can you migrate jira data to servicenow
-```
-
-Claude will automatically call `get_config` first, confirm credentials are in place, then walk through the full workflow step by step.
-
-Other example prompts:
-
-```
-migrate Jira project KAN to the incident table in ServiceNow
-migrate Salesforce Account records to ServiceNow core_company
-check if the migration setup already exists before doing anything
-run a test migration of 5 records first
-clean up all the test records that were created
-delete all the migration tables and transform maps
-```
-
-> **Tip:** Type `/mcp` at any time to see all available tools and their current status.
-
----
-
-## Full migration workflow
-
-### Step 1 — Check existing setup
-
-Before building anything, Claude calls `check_migration_state` to scan ServiceNow:
-
-- If all artifacts already exist → Claude skips straight to test migration
-- If some are missing → Claude shows the gap and only creates what's needed
-- If nothing exists → Claude starts fresh
-
-### Step 2 — Analyse dependencies (Jira only)
-
-`analyze_dependencies` scans the Jira project before any data is moved:
-
-- Finds all users referenced in issues and checks which ones exist in ServiceNow
-- If users are missing, offers to create them automatically (required for assignee/reporter fields to resolve correctly)
-- Identifies the issue hierarchy (Epic → Story → Task/Bug → Subtask)
-- Builds a sequenced migration plan so parent issues always migrate before their children
-
-### Step 3 — Discover schemas
-
-`discover_schema` pulls the source fields and target ServiceNow fields side by side:
-
-- Shows all Jira fields / Salesforce object fields with their types
-- Shows all ServiceNow target table fields
-- Auto-suggests a staging table name and field mappings
-- Highlights unmapped fields and asks for your corrections
-
-**Checkpoint 1:** Review and approve the schema before continuing.
-
-### Step 4 — Build artifacts
-
-`build_artifacts` creates everything in ServiceNow — **only for what doesn't already exist**:
-
-| Artifact | ServiceNow table |
+| Capability | Minimum role |
 |---|---|
-| Staging table | `sys_db_object` |
-| Staging columns | `sys_dictionary` |
-| Transform map | `sys_transform_map` |
-| Field maps | `sys_transform_entry` |
-| Transform scripts (complex only) | `sys_transform_script` |
-| Data source | `sys_data_source` |
-| REST message | `sys_rest_message` |
+| Read any table | `read` on the table ACL |
+| Create scripts, BRs, SIs, widgets | `admin` |
+| Create catalog items | `catalog_admin` |
+| Create notifications | `admin` |
+| Data migration (staging tables, transform maps) | `import_admin` |
+| ATF tests | `atf_test_designer` |
+| Background scripts | `admin` |
 
-The builder automatically classifies each mapping:
+---
 
-| Approach | When it's used |
+## Requirements
+
+- **Node.js 18+**
+- **Claude Code** (CLI, desktop app, web, or IDE extension)
+- **ServiceNow** developer or sub-production instance (PDI recommended for development)
+- **Jira** Cloud API token (for Jira tools)
+- **Salesforce** Connected App credentials (for Salesforce tools)
+
+---
+
+## Issue categories in the guide
+
+Use `list_common_issues` or `diagnose_issue` in Claude Code:
+
+| Category | Examples |
 |---|---|
-| **Direct** | Plain value copy, no transformation needed |
-| **Field map script** | Inline script on the field map (`use_source_script=true`) — picklist, priority, status value translation |
-| **Reference** | Resolves a reference field (e.g. `caller_id`) by display value — no script needed |
-| **Transform script** | Separate `sys_transform_script` — only when a GlideRecord lookup or multi-field logic is required |
-
-**Checkpoint 3:** Verify the transform map in ServiceNow before pushing data.
-
-### Step 5 — Test migration
-
-`run_test_migration` pushes a small sample (default 5 records) and produces a data quality report:
-
-```
-Field-by-Field Data Quality:
-Staging Column                  → SN Field                  Staging    Target
-─────────────────────────────────────────────────────────────────────────────
-u_jira_summary                  → short_description         100% ✓     100% ✓
-u_jira_priority                 → priority                  100% ✓     100% ✓
-u_jira_assignee                 → assigned_to               80%  ~     80%  ~
-u_jira_description              → description               100% ✓     100% ✓
-u_jira_environment              → u_environment             0%   ✗  ⚠ BLANK IN STAGING
-```
-
-- `BLANK IN STAGING` — data didn't arrive from the source (source mapping issue)
-- `BLANK IN TARGET` — data was in staging but didn't reach the target record (transform issue)
-
-**Checkpoint 4:** Review the report, fix any issues, approve the full run.
-
-### Step 6 — Full migration
-
-`run_full_migration` migrates all records with:
-
-- **Dependency ordering** (Jira): Tier 1 (Epic/Story) → Tier 2 (Task/Bug) → Tier 3 (Subtask)
-- **Dynamic batch sizing**: total records ÷ 10, clamped to 10–200 per import set
-- **Parallel import sets**: up to 5 running concurrently — checks `sys_import_set_run` before each wave
-- **Capacity waiting**: if the instance is already at the 5-import-set limit, waits up to 60 seconds and retries
-- **Error tracking**: every import set ID is recorded and reported so no batch is missed
+| `business_rule` | BR not firing, infinite loop, BR slowing transactions |
+| `client_script` | CS not running, GlideAjax not returning data |
+| `portal_widget` | Widget blank, c.server.update() not working |
+| `catalog` | Item not visible, UI Policy not working |
+| `notification` | Email not sent, no recipients |
+| `scripted_rest` | 401/403/500 errors |
+| `performance` | Slow lists, missing indexes |
+| `security` | Records visible to wrong users |
+| `atf` | Test failing unexpectedly |
+| `deployment` | Update set conflicts, works in dev not prod |
 
 ---
 
-## Cleanup
+## Contributing
 
-### Delete migrated records
+This MCP is designed to grow. New tools can be added by:
 
-`cleanup_migration` removes the records created in the staging table and in the target table (e.g. incidents). Use this to roll back a test run before running the real migration.
+1. Adding a method to an existing module in `src/developer/` or `src/integration/`
+2. Registering a `server.tool()` in `src/mcp-server.js`
+3. Committing and pushing — no build step required
 
-```
-Delete all the test migration records for project KAN
-```
-
-Claude discovers what exists first and shows you the count. You must confirm before anything is deleted.
-
-### Delete all migration artifacts (full reset)
-
-`cleanup_artifacts` removes all the ServiceNow configuration that was created during setup — use this when you want a completely clean slate or need to redo the field mappings from scratch.
-
-Deletes in safe order to avoid dependency errors:
-
-1. Field maps (`sys_transform_entry`)
-2. Transform scripts (`sys_transform_script`)
-3. Transform map (`sys_transform_map`)
-4. Staging column definitions (`sys_dictionary`)
-5. Staging table (`sys_db_object`)
-6. Data source (`sys_data_source`)
-7. REST message (`sys_rest_message`)
-
-```
-Delete all the migration tables and transform maps from ServiceNow
-```
-
-Same two-phase pattern: Claude shows you exactly what will be deleted, then waits for your explicit confirmation.
-
----
-
-## MCP Tools reference
-
-| Tool | Phase | What it does |
-|---|---|---|
-| `check_migration_state` | Start | Scans SN for existing artifacts, returns gap analysis and recommendation |
-| `connect` | Start | Tests connections to SN / Salesforce / Jira |
-| `discover_schema` | 2 | Pulls source + target schemas side by side, auto-suggests mappings |
-| `analyze_dependencies` | 3 | Jira: checks users exist in SN, builds hierarchy + sequenced migration plan |
-| `build_artifacts` | 4 | Creates staging table, transform map, field maps in SN (idempotent — skips what exists) |
-| `run_test_migration` | 5 | Pushes sample records, returns field-level source→staging→target quality report |
-| `run_full_migration` | 6 | Migrates all records in dependency order with parallel batches |
-| `analyze_transform_map` | Utility | Audits an existing transform map, flags orphan scripts and issues |
-| `fetch_sn_records` | Utility | Queries any SN table — check staging results, verify target records |
-| `get_report_data` | Reporting | Returns structured data for a client sign-off Word/Excel document |
-| `cleanup_migration` | Cleanup | Deletes migrated staging rows and target records (with confirmation) |
-| `cleanup_artifacts` | Cleanup | Deletes all migration setup artifacts — tables, maps, scripts (with confirmation) |
-| `list_sf_flows` | Flow F2 | Lists available Salesforce flows with their types |
-| `analyze_flow` | Flow F3 | Parses flow structure, asks clarifying questions |
-| `build_flow` | Flow F5 | Builds the equivalent flow in SN Flow Designer |
-
----
-
-## Supported source → target combinations
-
-The server is fully generic — any Jira project or Salesforce object can be migrated to any ServiceNow table:
-
-| Source | Example ServiceNow target tables |
-|---|---|
-| Jira project | `incident`, `problem`, `change_request`, `hr_case`, `sc_request`, any custom table |
-| Salesforce Case | `incident`, `sn_si_incident` |
-| Salesforce Account | `core_company`, `customer_account` |
-| Salesforce Contact | `sys_user`, `customer_contact` |
-| Salesforce Opportunity | Any custom table |
-
-The staging table name is auto-derived from the source (e.g. `u_stg_jira_kan`, `u_stg_sf_account`) but can be overridden with the `staging_table` parameter.
-
----
-
-## Troubleshooting
-
-**Auth errors with `SN_USE_SDK_AUTH=true`**
-OAuth tokens expire. Switch to basic auth: set `SN_USE_SDK_AUTH=false` and fill in `SN_USERNAME` and `SN_PASSWORD`.
-
-**Staging columns are empty after migration**
-ServiceNow's Import Set API processes records immediately — staging data is transient and may not persist after the transform runs. Check the target table (e.g. incidents) instead; the data should be there.
-
-**Priority / status always shows a default value**
-Check the transform map in ServiceNow (System Import Sets → Transform Maps). Field maps for `priority` and `state` should have `use_source_script=true` with an inline script. Use `analyze_transform_map` to audit.
-
-**`Cannot find package 'dotenv'`**
-Run commands from the project root: `cd /path/to/SN-Migration-Agent && node ...`
-
-**Permission denied creating the staging table**
-Your SN user needs the `import_admin` role. Ask your ServiceNow admin, or create the table manually: System Definition → Tables → New → set parent to `sys_import_set_row`.
-
-**Jira API returning 410 Gone**
-The old `/rest/api/3/search` endpoint is deprecated. This repo already uses `/rest/api/3/search/jql` — make sure you have the latest version.
-
-**ServiceNow at import set limit**
-If you see "ServiceNow already has 5 import sets running", wait a few minutes for the existing jobs to finish and try again. The batch runner will also wait automatically during a full migration run.
-
----
-
-## Adding more source platforms
-
-The connector pattern makes it straightforward to add a new source (e.g. HubSpot, Azure DevOps, ServiceNow-to-ServiceNow):
-
-1. Create `src/connectors/yourplatform.js` — implement `connect()`, a method to list fields, and a pagination/fetch method
-2. Add credentials to `.env.example`
-3. Add `yourplatform` to the `platform` enum in the relevant tools in `src/mcp-server.js`
-4. Add a `discoverYourPlatformSchema()` branch in `src/migration/schema.js`
+The tool count grows with every use case. Current: **90 tools**.
