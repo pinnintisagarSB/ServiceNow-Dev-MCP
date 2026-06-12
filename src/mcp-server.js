@@ -5714,6 +5714,816 @@ Pass confirm=false (default) to preview what would be deleted first.`,
   }
 );
 
+// ═══════════════════════════════════════════════════════════════════════════
+// USER & GROUP MANAGEMENT — ServiceNow, Jira, Salesforce
+// ═══════════════════════════════════════════════════════════════════════════
+
+// ══════════════════════════════════════════════════════════════════════════
+// SERVICENOW USER & GROUP TOOLS
+// ══════════════════════════════════════════════════════════════════════════
+
+// ── TOOL: sn_create_user ──────────────────────────────────────────────────
+server.tool(
+  'sn_create_user',
+  `Create a ServiceNow user (sys_user) with all standard fields, optional roles, and optional group membership.
+
+Handles the fields that developers most commonly miss or set incorrectly:
+  - Generates a valid user_name if not provided
+  - Sets active=true by default
+  - Optionally assigns roles directly on the user record
+  - Optionally adds the user to one or more groups in one call
+
+Returns the new user's sys_id plus links to role and group records created.`,
+  {
+    first_name:   z.string().describe('First name'),
+    last_name:    z.string().describe('Last name'),
+    email:        z.string().describe('Email address (used for notifications)'),
+    user_name:    z.string().optional().describe('Login username — auto-generated from first.last if not provided'),
+    title:        z.string().optional().describe('Job title'),
+    department:   z.string().optional().describe('Department name or sys_id'),
+    manager:      z.string().optional().describe('Manager username, email, or sys_id'),
+    phone:        z.string().optional().describe('Business phone number'),
+    mobile_phone: z.string().optional().describe('Mobile phone number'),
+    location:     z.string().optional().describe('Location name or sys_id'),
+    time_zone:    z.string().optional().describe('e.g. "America/New_York"'),
+    date_format:  z.string().optional().describe('e.g. "MM/dd/yyyy"'),
+    language:     z.string().optional().default('en').describe('Language code (default: en)'),
+    password:     z.string().optional().describe('Initial password. If omitted, user must reset on first login.'),
+    active:       z.boolean().optional().default(true),
+    vip:          z.boolean().optional().default(false).describe('Mark as VIP (affects SLA)'),
+    roles:        z.array(z.string()).optional().describe('Role names to assign (e.g. ["itil","catalog"])'),
+    groups:       z.array(z.string()).optional().describe('Group names or sys_ids to add the user to'),
+    extra_fields: z.record(z.unknown()).optional().describe('Any additional sys_user fields'),
+  },
+  async ({ first_name, last_name, email, user_name, title, department, manager,
+           phone, mobile_phone, location, time_zone, date_format, language,
+           password, active, vip, roles, groups, extra_fields }) => {
+    try {
+      const sn = await getSn();
+
+      // ── Resolve manager sys_id if a name/email was given ─────────────────
+      let managerSysId = null;
+      if (manager) {
+        const mgrs = await sn.get('sys_user', {
+          sysparm_query:  `user_name=${manager}^ORemail=${manager}^ORsys_id=${manager}`,
+          sysparm_fields: 'sys_id,user_name',
+          sysparm_limit:  '1',
+        });
+        managerSysId = mgrs[0]?.sys_id ?? null;
+        if (!managerSysId) return fail(`Manager not found: ${manager}. Create the manager first or provide their sys_id.`);
+      }
+
+      // ── Build user payload ─────────────────────────────────────────────────
+      const generatedUserName = user_name ?? `${first_name.toLowerCase()}.${last_name.toLowerCase()}`.replace(/\s+/g, '');
+      const userPayload = {
+        first_name,
+        last_name,
+        email,
+        user_name:    generatedUserName,
+        active,
+        vip,
+        language:     language ?? 'en',
+        ...(title        && { title }),
+        ...(department   && { department }),
+        ...(managerSysId && { manager: managerSysId }),
+        ...(phone        && { phone }),
+        ...(mobile_phone && { mobile_phone }),
+        ...(location     && { location }),
+        ...(time_zone    && { time_zone }),
+        ...(date_format  && { date_format }),
+        ...(password     && { user_password: password, password_needs_reset: !password }),
+        ...(!password    && { password_needs_reset: true }),
+        ...(extra_fields ?? {}),
+      };
+
+      const createdUser = await sn.post('sys_user', userPayload);
+      const userSysId   = createdUser?.sys_id;
+      if (!userSysId) return fail('User creation failed — no sys_id returned.');
+
+      const results = { user: { sys_id: userSysId, user_name: generatedUserName, email }, roles_assigned: [], groups_added: [] };
+
+      // ── Assign roles ───────────────────────────────────────────────────────
+      for (const roleName of roles ?? []) {
+        // Look up the role sys_id
+        const roleRows = await sn.get('sys_user_role', {
+          sysparm_query:  `name=${roleName}`,
+          sysparm_fields: 'sys_id,name',
+          sysparm_limit:  '1',
+        });
+        if (!roleRows.length) {
+          results.roles_assigned.push({ role: roleName, status: 'NOT FOUND — skipped' });
+          continue;
+        }
+        await sn.post('sys_user_has_role', { user: userSysId, role: roleRows[0].sys_id, inherited: false });
+        results.roles_assigned.push({ role: roleName, status: 'assigned' });
+      }
+
+      // ── Add to groups ──────────────────────────────────────────────────────
+      for (const groupRef of groups ?? []) {
+        const groupRows = await sn.get('sys_user_group', {
+          sysparm_query:  `name=${groupRef}^ORsys_id=${groupRef}`,
+          sysparm_fields: 'sys_id,name',
+          sysparm_limit:  '1',
+        });
+        if (!groupRows.length) {
+          results.groups_added.push({ group: groupRef, status: 'NOT FOUND — skipped' });
+          continue;
+        }
+        await sn.post('sys_user_grmember', { user: userSysId, group: groupRows[0].sys_id });
+        results.groups_added.push({ group: groupRows[0].name, group_sys_id: groupRows[0].sys_id, status: 'added' });
+      }
+
+      results.note = password
+        ? `User created. Initial password set. User will be prompted to reset on first login.`
+        : `User created with no password — user must use "Forgot Password" or an admin must set one.`;
+
+      return ok(results);
+    } catch (e) { return fail(e.message); }
+  }
+);
+
+// ── TOOL: sn_create_group ─────────────────────────────────────────────────
+server.tool(
+  'sn_create_group',
+  `Create a ServiceNow group (sys_user_group) and optionally assign members, roles, and a manager.
+
+Groups in ServiceNow are used for:
+  - Assignment groups on incidents, changes, tasks
+  - Approval groups on workflows and catalog items
+  - Notification recipient groups
+  - ACL role-based access
+
+Returns the group sys_id plus member and role assignment results.`,
+  {
+    name:         z.string().describe('Group name — should be clear and unique (e.g. "Network Operations", "Change Approvers - EMEA")'),
+    description:  z.string().optional().describe('Group description / purpose'),
+    manager:      z.string().optional().describe('Manager username, email, or sys_id'),
+    email:        z.string().optional().describe('Group email address (for notifications sent to the group)'),
+    type:         z.string().optional().describe('Group type (itil, catalog, etc.) — leave blank for general purpose'),
+    active:       z.boolean().optional().default(true),
+    parent:       z.string().optional().describe('Parent group name or sys_id (for nested groups)'),
+    members:      z.array(z.string()).optional().describe('User usernames, emails, or sys_ids to add as members'),
+    roles:        z.array(z.string()).optional().describe('Role names to assign to the group (inherited by all members)'),
+    extra_fields: z.record(z.unknown()).optional(),
+  },
+  async ({ name, description, manager, email, type, active, parent, members, roles, extra_fields }) => {
+    try {
+      const sn = await getSn();
+
+      // ── Resolve manager ────────────────────────────────────────────────────
+      let managerSysId = null;
+      if (manager) {
+        const mgrs = await sn.get('sys_user', {
+          sysparm_query:  `user_name=${manager}^ORemail=${manager}^ORsys_id=${manager}`,
+          sysparm_fields: 'sys_id,user_name',
+          sysparm_limit:  '1',
+        });
+        if (!mgrs.length) return fail(`Manager not found: ${manager}`);
+        managerSysId = mgrs[0].sys_id;
+      }
+
+      // ── Resolve parent group ───────────────────────────────────────────────
+      let parentSysId = null;
+      if (parent) {
+        const parents = await sn.get('sys_user_group', {
+          sysparm_query:  `name=${parent}^ORsys_id=${parent}`,
+          sysparm_fields: 'sys_id,name',
+          sysparm_limit:  '1',
+        });
+        if (!parents.length) return fail(`Parent group not found: ${parent}`);
+        parentSysId = parents[0].sys_id;
+      }
+
+      // ── Check for duplicate group name ─────────────────────────────────────
+      const existing = await sn.get('sys_user_group', {
+        sysparm_query:  `name=${name}^active=true`,
+        sysparm_fields: 'sys_id,name',
+        sysparm_limit:  '1',
+      });
+      if (existing.length) {
+        return fail(`A group named "${name}" already exists (sys_id: ${existing[0].sys_id}). Use sn_update to modify it, or choose a different name.`);
+      }
+
+      // ── Create group ───────────────────────────────────────────────────────
+      const groupPayload = {
+        name, active,
+        ...(description  && { description }),
+        ...(managerSysId && { manager: managerSysId }),
+        ...(email        && { email }),
+        ...(type         && { type }),
+        ...(parentSysId  && { parent: parentSysId }),
+        ...(extra_fields ?? {}),
+      };
+
+      const createdGroup = await sn.post('sys_user_group', groupPayload);
+      const groupSysId   = createdGroup?.sys_id;
+      if (!groupSysId) return fail('Group creation failed — no sys_id returned.');
+
+      const results = {
+        group: { sys_id: groupSysId, name },
+        members_added:  [],
+        roles_assigned: [],
+      };
+
+      // ── Add members ────────────────────────────────────────────────────────
+      for (const memberRef of members ?? []) {
+        const userRows = await sn.get('sys_user', {
+          sysparm_query:  `user_name=${memberRef}^ORemail=${memberRef}^ORsys_id=${memberRef}^active=true`,
+          sysparm_fields: 'sys_id,user_name,name',
+          sysparm_limit:  '1',
+        });
+        if (!userRows.length) {
+          results.members_added.push({ user: memberRef, status: 'NOT FOUND — skipped' });
+          continue;
+        }
+        await sn.post('sys_user_grmember', { user: userRows[0].sys_id, group: groupSysId });
+        results.members_added.push({ user: userRows[0].user_name, name: userRows[0].name, status: 'added' });
+      }
+
+      // ── Assign roles to group (all members inherit) ────────────────────────
+      for (const roleName of roles ?? []) {
+        const roleRows = await sn.get('sys_user_role', {
+          sysparm_query:  `name=${roleName}`,
+          sysparm_fields: 'sys_id,name',
+          sysparm_limit:  '1',
+        });
+        if (!roleRows.length) {
+          results.roles_assigned.push({ role: roleName, status: 'NOT FOUND — skipped' });
+          continue;
+        }
+        await sn.post('sys_group_has_role', { group: groupSysId, role: roleRows[0].sys_id });
+        results.roles_assigned.push({ role: roleName, status: 'assigned — all members inherit this role' });
+      }
+
+      results.note = `Group "${name}" created with ${results.members_added.filter(m => m.status === 'added').length} member(s) and ${results.roles_assigned.filter(r => r.status?.startsWith('assigned')).length} role(s).`;
+      return ok(results);
+    } catch (e) { return fail(e.message); }
+  }
+);
+
+// ── TOOL: sn_manage_group_members ─────────────────────────────────────────
+server.tool(
+  'sn_manage_group_members',
+  `Add or remove members from a ServiceNow group, or list current members.
+
+action options:
+  add     — Add one or more users to a group
+  remove  — Remove one or more users from a group
+  list    — List all current members of a group`,
+  {
+    group:   z.string().describe('Group name or sys_id'),
+    action:  z.enum(['add','remove','list']),
+    members: z.array(z.string()).optional().describe('User usernames, emails, or sys_ids (required for add/remove)'),
+  },
+  async ({ group, action, members }) => {
+    try {
+      const sn = await getSn();
+
+      // Resolve group
+      const groupRows = await sn.get('sys_user_group', {
+        sysparm_query:  `name=${group}^ORsys_id=${group}`,
+        sysparm_fields: 'sys_id,name,manager,email',
+        sysparm_limit:  '1',
+      });
+      if (!groupRows.length) return fail(`Group not found: ${group}`);
+      const grp = groupRows[0];
+
+      if (action === 'list') {
+        const memberRows = await sn.get('sys_user_grmember', {
+          sysparm_query:  `group=${grp.sys_id}`,
+          sysparm_fields: 'user.user_name,user.name,user.email,user.active,user.title,sys_id',
+          sysparm_limit:  '200',
+        });
+        return ok({
+          group:        grp.name,
+          group_sys_id: grp.sys_id,
+          member_count: memberRows.length,
+          members:      memberRows.map(m => ({
+            membership_sys_id: m.sys_id,
+            user_name:  m['user.user_name'],
+            name:       m['user.name'],
+            email:      m['user.email'],
+            active:     m['user.active'],
+            title:      m['user.title'],
+          })),
+        });
+      }
+
+      const results = [];
+      for (const memberRef of members ?? []) {
+        const userRows = await sn.get('sys_user', {
+          sysparm_query:  `user_name=${memberRef}^ORemail=${memberRef}^ORsys_id=${memberRef}`,
+          sysparm_fields: 'sys_id,user_name,name',
+          sysparm_limit:  '1',
+        });
+        if (!userRows.length) {
+          results.push({ user: memberRef, status: 'NOT FOUND — skipped' });
+          continue;
+        }
+        const user = userRows[0];
+
+        if (action === 'add') {
+          // Check if already a member
+          const existing = await sn.get('sys_user_grmember', {
+            sysparm_query:  `user=${user.sys_id}^group=${grp.sys_id}`,
+            sysparm_fields: 'sys_id',
+            sysparm_limit:  '1',
+          });
+          if (existing.length) {
+            results.push({ user: user.user_name, name: user.name, status: 'already a member — skipped' });
+            continue;
+          }
+          await sn.post('sys_user_grmember', { user: user.sys_id, group: grp.sys_id });
+          results.push({ user: user.user_name, name: user.name, status: 'added' });
+        }
+
+        if (action === 'remove') {
+          const membership = await sn.get('sys_user_grmember', {
+            sysparm_query:  `user=${user.sys_id}^group=${grp.sys_id}`,
+            sysparm_fields: 'sys_id',
+            sysparm_limit:  '1',
+          });
+          if (!membership.length) {
+            results.push({ user: user.user_name, status: 'not a member — skipped' });
+            continue;
+          }
+          await sn.delete('sys_user_grmember', membership[0].sys_id);
+          results.push({ user: user.user_name, name: user.name, status: 'removed' });
+        }
+      }
+
+      return ok({ group: grp.name, group_sys_id: grp.sys_id, action, results });
+    } catch (e) { return fail(e.message); }
+  }
+);
+
+// ── TOOL: sn_assign_roles ─────────────────────────────────────────────────
+server.tool(
+  'sn_assign_roles',
+  `Assign or revoke roles on a ServiceNow user or group.
+
+target_type:
+  user  — Roles go on the individual user (sys_user_has_role)
+  group — Roles go on the group; all members inherit them (sys_group_has_role)
+
+action:
+  assign — Grant the role(s)
+  revoke — Remove the role(s)
+  list   — Show current roles
+
+Examples:
+  target_type="user"  target="john.doe"  action="assign" roles=["itil","catalog"]
+  target_type="group" target="Network Ops" action="assign" roles=["itil","sn_incident_write"]
+  target_type="user"  target="jane.smith" action="list"`,
+  {
+    target_type: z.enum(['user','group']),
+    target:      z.string().describe('Username/email/sys_id for user, or group name/sys_id for group'),
+    action:      z.enum(['assign','revoke','list']),
+    roles:       z.array(z.string()).optional().describe('Role names (required for assign/revoke)'),
+  },
+  async ({ target_type, target, action, roles }) => {
+    try {
+      const sn = await getSn();
+
+      // Resolve target
+      const targetTable = target_type === 'user' ? 'sys_user' : 'sys_user_group';
+      const targetQuery = target_type === 'user'
+        ? `user_name=${target}^ORemail=${target}^ORsys_id=${target}`
+        : `name=${target}^ORsys_id=${target}`;
+
+      const targetRows = await sn.get(targetTable, {
+        sysparm_query:  targetQuery,
+        sysparm_fields: 'sys_id,name,user_name',
+        sysparm_limit:  '1',
+      });
+      if (!targetRows.length) return fail(`${target_type === 'user' ? 'User' : 'Group'} not found: ${target}`);
+      const tgt = targetRows[0];
+
+      const roleTable        = target_type === 'user' ? 'sys_user_has_role' : 'sys_group_has_role';
+      const roleTargetField  = target_type === 'user' ? 'user' : 'group';
+
+      if (action === 'list') {
+        const currentRoles = await sn.get(roleTable, {
+          sysparm_query:  `${roleTargetField}=${tgt.sys_id}`,
+          sysparm_fields: 'role.name,role.sys_id,inherited,sys_id',
+          sysparm_limit:  '100',
+        });
+        return ok({
+          target_type,
+          target:    tgt.user_name ?? tgt.name,
+          sys_id:    tgt.sys_id,
+          role_count: currentRoles.length,
+          roles:     currentRoles.map(r => ({
+            role:        r['role.name'],
+            role_sys_id: r['role.sys_id'],
+            inherited:   r.inherited === 'true',
+            record_sys_id: r.sys_id,
+          })),
+        });
+      }
+
+      const results = [];
+      for (const roleName of roles ?? []) {
+        const roleRows = await sn.get('sys_user_role', {
+          sysparm_query:  `name=${roleName}`,
+          sysparm_fields: 'sys_id,name',
+          sysparm_limit:  '1',
+        });
+        if (!roleRows.length) {
+          results.push({ role: roleName, status: 'ROLE NOT FOUND in sys_user_role — check spelling' });
+          continue;
+        }
+        const role = roleRows[0];
+
+        if (action === 'assign') {
+          const existing = await sn.get(roleTable, {
+            sysparm_query:  `${roleTargetField}=${tgt.sys_id}^role=${role.sys_id}`,
+            sysparm_fields: 'sys_id',
+            sysparm_limit:  '1',
+          });
+          if (existing.length) {
+            results.push({ role: roleName, status: 'already assigned — skipped' });
+            continue;
+          }
+          await sn.post(roleTable, { [roleTargetField]: tgt.sys_id, role: role.sys_id, inherited: false });
+          results.push({ role: roleName, status: 'assigned' });
+        }
+
+        if (action === 'revoke') {
+          const existing = await sn.get(roleTable, {
+            sysparm_query:  `${roleTargetField}=${tgt.sys_id}^role=${role.sys_id}`,
+            sysparm_fields: 'sys_id',
+            sysparm_limit:  '1',
+          });
+          if (!existing.length) {
+            results.push({ role: roleName, status: 'not assigned — skipped' });
+            continue;
+          }
+          await sn.delete(roleTable, existing[0].sys_id);
+          results.push({ role: roleName, status: 'revoked' });
+        }
+      }
+
+      return ok({ target_type, target: tgt.user_name ?? tgt.name, sys_id: tgt.sys_id, action, results });
+    } catch (e) { return fail(e.message); }
+  }
+);
+
+// ── TOOL: sn_get_user ─────────────────────────────────────────────────────
+server.tool(
+  'sn_get_user',
+  `Look up a ServiceNow user and return their profile, roles, and group memberships.
+
+Accepts username, email address, name (first/last), or sys_id.`,
+  {
+    identifier: z.string().describe('Username, email, full name, or sys_id'),
+  },
+  async ({ identifier }) => {
+    try {
+      const sn   = await getSn();
+      const rows = await sn.get('sys_user', {
+        sysparm_query:  `user_name=${identifier}^ORemail=${identifier}^ORsys_id=${identifier}^ORname=${identifier}`,
+        sysparm_fields: 'sys_id,user_name,name,first_name,last_name,email,title,department,manager,phone,mobile_phone,active,vip,location,time_zone,language,last_login',
+        sysparm_limit:  '3',
+      });
+      if (!rows.length) return fail(`User not found: ${identifier}`);
+      const user = rows[0];
+
+      // Fetch roles and groups in parallel
+      const [roleRows, groupRows] = await Promise.all([
+        sn.get('sys_user_has_role', {
+          sysparm_query:  `user=${user.sys_id}`,
+          sysparm_fields: 'role.name,inherited',
+          sysparm_limit:  '50',
+        }),
+        sn.get('sys_user_grmember', {
+          sysparm_query:  `user=${user.sys_id}`,
+          sysparm_fields: 'group.name,group.sys_id,group.email,group.manager.name',
+          sysparm_limit:  '50',
+        }),
+      ]);
+
+      return ok({
+        user,
+        roles:  roleRows.map(r => ({ name: r['role.name'], inherited: r.inherited === 'true' })),
+        groups: groupRows.map(g => ({ name: g['group.name'], sys_id: g['group.sys_id'], email: g['group.email'], manager: g['group.manager.name'] })),
+        role_count:  roleRows.length,
+        group_count: groupRows.length,
+      });
+    } catch (e) { return fail(e.message); }
+  }
+);
+
+// ── TOOL: sn_get_group ────────────────────────────────────────────────────
+server.tool(
+  'sn_get_group',
+  `Look up a ServiceNow group with full details — members, roles, and manager.`,
+  {
+    identifier:      z.string().describe('Group name or sys_id'),
+    include_members: z.boolean().optional().default(true),
+    include_roles:   z.boolean().optional().default(true),
+  },
+  async ({ identifier, include_members, include_roles }) => {
+    try {
+      const sn   = await getSn();
+      const rows = await sn.get('sys_user_group', {
+        sysparm_query:  `name=${identifier}^ORsys_id=${identifier}`,
+        sysparm_fields: 'sys_id,name,description,manager,manager.name,email,type,active,parent,parent.name',
+        sysparm_limit:  '1',
+      });
+      if (!rows.length) return fail(`Group not found: ${identifier}`);
+      const grp = rows[0];
+
+      const [members, groupRoles] = await Promise.all([
+        include_members ? sn.get('sys_user_grmember', {
+          sysparm_query:  `group=${grp.sys_id}`,
+          sysparm_fields: 'user.user_name,user.name,user.email,user.active,user.title',
+          sysparm_limit:  '200',
+        }) : Promise.resolve([]),
+        include_roles ? sn.get('sys_group_has_role', {
+          sysparm_query:  `group=${grp.sys_id}`,
+          sysparm_fields: 'role.name,role.sys_id',
+          sysparm_limit:  '50',
+        }) : Promise.resolve([]),
+      ]);
+
+      return ok({
+        group: {
+          sys_id:      grp.sys_id,
+          name:        grp.name,
+          description: grp.description,
+          email:       grp.email,
+          type:        grp.type,
+          active:      grp.active,
+          manager:     grp['manager.name'],
+          parent:      grp['parent.name'] ?? null,
+        },
+        member_count: members.length,
+        members: members.map(m => ({
+          user_name: m['user.user_name'],
+          name:      m['user.name'],
+          email:     m['user.email'],
+          active:    m['user.active'],
+          title:     m['user.title'],
+        })),
+        roles: groupRoles.map(r => r['role.name']),
+      });
+    } catch (e) { return fail(e.message); }
+  }
+);
+
+// ── TOOL: sn_list_roles ───────────────────────────────────────────────────
+server.tool(
+  'sn_list_roles',
+  `List available ServiceNow roles, optionally filtered by keyword.
+Useful before calling sn_assign_roles to confirm the exact role name.`,
+  {
+    keyword: z.string().optional().describe('Filter roles by name (e.g. "itil", "catalog", "admin")'),
+    limit:   z.number().optional().default(30),
+  },
+  async ({ keyword, limit }) => {
+    try {
+      const sn    = await getSn();
+      const query = keyword ? `nameLIKE${keyword}` : 'active=true';
+      const rows  = await sn.get('sys_user_role', {
+        sysparm_query:  query,
+        sysparm_fields: 'name,description,elevated_privilege,sys_id',
+        sysparm_limit:  String(limit),
+        sysparm_order:  'name',
+      });
+      return ok({ count: rows.length, roles: rows.map(r => ({ name: r.name, description: r.description ?? '', elevated: r.elevated_privilege === 'true', sys_id: r.sys_id })) });
+    } catch (e) { return fail(e.message); }
+  }
+);
+
+// ══════════════════════════════════════════════════════════════════════════
+// JIRA USER & GROUP TOOLS
+// ══════════════════════════════════════════════════════════════════════════
+
+// ── TOOL: jira_create_group ───────────────────────────────────────────────
+server.tool(
+  'jira_create_group',
+  `Create a Jira group and optionally add members to it.
+
+Jira groups control project permissions, notification schemes, and filter sharing.
+Note: User creation in Jira Cloud is managed through Atlassian Admin (admin.atlassian.com)
+— the API can create groups and manage membership, but cannot create net-new users directly.`,
+  {
+    group_name: z.string().describe('Group name (e.g. "developers", "project-leads")'),
+    members:    z.array(z.string()).optional().describe('Account IDs of users to add'),
+  },
+  async ({ group_name, members }) => {
+    try {
+      const jira   = await getJira();
+      const created = await jira.post('/rest/api/3/group', { name: group_name });
+      const results = { created: true, group_name, group_id: created.groupId ?? created.name, members_added: [] };
+
+      for (const accountId of members ?? []) {
+        try {
+          await jira.post(`/rest/api/3/group/user?groupname=${encodeURIComponent(group_name)}`, { accountId });
+          results.members_added.push({ accountId, status: 'added' });
+        } catch (e) {
+          results.members_added.push({ accountId, status: `error: ${e.message}` });
+        }
+      }
+      return ok(results);
+    } catch (e) { return fail(e.message); }
+  }
+);
+
+// ── TOOL: jira_manage_group_members ──────────────────────────────────────
+server.tool(
+  'jira_manage_group_members',
+  `Add or remove users from a Jira group, or list current members.
+
+action: add | remove | list`,
+  {
+    group_name: z.string().describe('Jira group name'),
+    action:     z.enum(['add','remove','list']),
+    account_ids: z.array(z.string()).optional().describe('Atlassian account IDs (required for add/remove)'),
+  },
+  async ({ group_name, action, account_ids }) => {
+    try {
+      const jira = await getJira();
+
+      if (action === 'list') {
+        const result = await jira.get('/rest/api/3/group/member', {
+          groupname:  group_name,
+          maxResults: 100,
+        });
+        return ok({ group_name, count: result.total ?? result.values?.length ?? 0, members: result.values ?? [] });
+      }
+
+      const results = [];
+      for (const accountId of account_ids ?? []) {
+        try {
+          if (action === 'add') {
+            await jira.post(`/rest/api/3/group/user?groupname=${encodeURIComponent(group_name)}`, { accountId });
+            results.push({ accountId, status: 'added' });
+          } else {
+            await jira.delete(`/rest/api/3/group/user?groupname=${encodeURIComponent(group_name)}&accountId=${accountId}`);
+            results.push({ accountId, status: 'removed' });
+          }
+        } catch (e) {
+          results.push({ accountId, status: `error: ${e.message}` });
+        }
+      }
+      return ok({ group_name, action, results });
+    } catch (e) { return fail(e.message); }
+  }
+);
+
+// ══════════════════════════════════════════════════════════════════════════
+// SALESFORCE USER & GROUP TOOLS
+// ══════════════════════════════════════════════════════════════════════════
+
+// ── TOOL: sf_create_user ──────────────────────────────────────────────────
+server.tool(
+  'sf_create_user',
+  `Create a Salesforce user.
+
+Required fields: Username (must be unique and email-format), LastName, Email, Alias, ProfileId, TimeZoneSidKey, LocaleSidKey, EmailEncodingKey, LanguageLocaleKey.
+
+Get ProfileId first:
+  sf_read read_type="query" soql="SELECT Id, Name FROM Profile WHERE Name='Standard User' LIMIT 5"`,
+  {
+    username:           z.string().describe('Must be unique globally across Salesforce — typically user@company.sandbox or user@company.com'),
+    first_name:         z.string().optional(),
+    last_name:          z.string(),
+    email:              z.string().describe('Notification email (can differ from username)'),
+    alias:              z.string().describe('Short alias (max 8 chars, e.g. "jsmith")'),
+    profile_id:         z.string().describe('Profile sys_id — use sf_read to find it'),
+    title:              z.string().optional(),
+    department:         z.string().optional(),
+    phone:              z.string().optional(),
+    is_active:          z.boolean().optional().default(true),
+    time_zone:          z.string().optional().default('America/New_York'),
+    locale:             z.string().optional().default('en_US'),
+    email_encoding:     z.string().optional().default('UTF-8'),
+    language:           z.string().optional().default('en_US'),
+    extra_fields:       z.record(z.unknown()).optional(),
+  },
+  async ({ username, first_name, last_name, email, alias, profile_id, title, department, phone, is_active, time_zone, locale, email_encoding, language, extra_fields }) => {
+    try {
+      const sf = await getSf();
+      const payload = {
+        Username:           username,
+        LastName:           last_name,
+        Email:              email,
+        Alias:              alias.substring(0, 8),
+        ProfileId:          profile_id,
+        IsActive:           is_active ?? true,
+        TimeZoneSidKey:     time_zone  ?? 'America/New_York',
+        LocaleSidKey:       locale     ?? 'en_US',
+        EmailEncodingKey:   email_encoding ?? 'UTF-8',
+        LanguageLocaleKey:  language   ?? 'en_US',
+        ...(first_name  && { FirstName:  first_name }),
+        ...(title       && { Title:      title }),
+        ...(department  && { Department: department }),
+        ...(phone       && { Phone:      phone }),
+        ...(extra_fields ?? {}),
+      };
+      const result = await sf.post(`/services/data/${sf.apiVersion}/sobjects/User`, payload);
+      return ok({
+        created:  result.success,
+        id:       result.id,
+        username,
+        note:     'User created. They will receive an email to set their password. Assign Permission Sets separately if needed.',
+        errors:   result.errors ?? [],
+      });
+    } catch (e) { return fail(e.message); }
+  }
+);
+
+// ── TOOL: sf_manage_group ─────────────────────────────────────────────────
+server.tool(
+  'sf_manage_group',
+  `Create a Salesforce Public Group or Queue, and manage its members.
+
+Salesforce groups/queues are used for:
+  - Record ownership (Queues own cases, leads, etc.)
+  - Sharing rules (share records with a group)
+  - List view visibility
+
+action:
+  create     — Create a new Public Group
+  create_queue — Create a Queue (assign supported objects)
+  add_members  — Add users or groups to an existing group
+  list_members — List members of a group
+  list_groups  — Find groups by name`,
+  {
+    action:        z.enum(['create','create_queue','add_members','list_members','list_groups']),
+    name:          z.string().optional().describe('Group/queue name'),
+    developer_name: z.string().optional().describe('API name (no spaces, used for DeveloperName field)'),
+    group_id:      z.string().optional().describe('Group/Queue Id for add_members/list_members'),
+    members: z.array(z.object({
+      type:  z.enum(['User','Group','Role','RoleAndSubordinates']),
+      id:    z.string().describe('User Id, Group Id, or Role Id'),
+    })).optional().describe('Members to add'),
+    supported_objects: z.array(z.string()).optional().describe('For queues: object API names (e.g. ["Case","Lead"])'),
+    keyword: z.string().optional().describe('For list_groups: filter by name'),
+  },
+  async ({ action, name, developer_name, group_id, members, supported_objects, keyword }) => {
+    try {
+      const sf = await getSf();
+
+      if (action === 'create') {
+        const result = await sf.post(`/services/data/${sf.apiVersion}/sobjects/Group`, {
+          Name:          name,
+          DeveloperName: (developer_name ?? name ?? '').replace(/\s+/g, '_'),
+          Type:          'Regular',
+        });
+        return ok({ created: true, id: result.id, name, type: 'Public Group' });
+      }
+
+      if (action === 'create_queue') {
+        const result = await sf.post(`/services/data/${sf.apiVersion}/sobjects/Group`, {
+          Name:          name,
+          DeveloperName: (developer_name ?? name ?? '').replace(/\s+/g, '_'),
+          Type:          'Queue',
+        });
+        const queueId = result.id;
+        // Assign supported objects to the queue
+        for (const obj of supported_objects ?? []) {
+          await sf.post(`/services/data/${sf.apiVersion}/sobjects/QueueSobject`, {
+            QueueId:    queueId,
+            SobjectType: obj,
+          }).catch(e => null); // ignore if already assigned
+        }
+        return ok({ created: true, id: queueId, name, type: 'Queue', supported_objects: supported_objects ?? [] });
+      }
+
+      if (action === 'add_members') {
+        const results = [];
+        for (const m of members ?? []) {
+          try {
+            await sf.post(`/services/data/${sf.apiVersion}/sobjects/GroupMember`, {
+              GroupId:       group_id,
+              UserOrGroupId: m.id,
+            });
+            results.push({ ...m, status: 'added' });
+          } catch (e) {
+            results.push({ ...m, status: `error: ${e.message}` });
+          }
+        }
+        return ok({ group_id, action, results });
+      }
+
+      if (action === 'list_members') {
+        const result = await sf.query(`SELECT Id, UserOrGroupId, UserOrGroup.Name, UserOrGroup.Type FROM GroupMember WHERE GroupId = '${group_id}'`);
+        return ok({ group_id, count: result.totalSize, members: result.records ?? [] });
+      }
+
+      if (action === 'list_groups') {
+        const result = await sf.query(`SELECT Id, Name, DeveloperName, Type FROM Group WHERE Name LIKE '%${keyword ?? ''}%' LIMIT 30`);
+        return ok({ count: result.totalSize, groups: result.records ?? [] });
+      }
+
+      return fail(`Unknown action: ${action}`);
+    } catch (e) { return fail(e.message); }
+  }
+);
+
 // ── Start: stdio (CLI) or HTTP/SSE (web Claude Code / remote) ────────────
 // Set MCP_MODE=http (and optionally MCP_PORT) to run as an HTTP server.
 // Default is stdio for local Claude Code CLI use.
