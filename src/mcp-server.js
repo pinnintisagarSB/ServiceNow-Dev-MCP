@@ -30,6 +30,7 @@ import { PreMigrationChecker }  from './migration/pre-migration-checks.js';
 import { TransformEngine }      from './migration/transform-engine.js';
 import { AuditTrail }           from './migration/audit.js';
 import { toSnHtml }             from './utils/rich-text.js';
+import { MigrationReconciler }  from './migration/reconciler.js';
 import { IntegrationDesigner }  from './integration/designer.js';
 import { SNArtifactBuilder }    from './integration/sn-artifacts.js';
 import { JiraArtifactBuilder }  from './integration/jira-artifacts.js';
@@ -2416,6 +2417,413 @@ server.tool(
   async () => {
     if (!_audit) return fail('No active audit session. Call start_audit_session first.');
     return ok(_audit.stats());
+  }
+);
+
+// ══════════════════════════════════════════════════════════════════════════
+// MIGRATION TESTING & RECONCILIATION TOOLS
+// ══════════════════════════════════════════════════════════════════════════
+
+// ── TOOL: reconcile_migration ──────────────────────────────────────────────
+server.tool(
+  'reconcile_migration',
+  `Deep comparison between source records and ServiceNow target records to verify
+   the migration was successful. Goes far beyond fill-rate checks:
+
+   1. COUNT CHECK       — source count vs SN count (detects missing or duplicate records)
+   2. RECORD MATCHING   — correlates each source record to its SN counterpart using
+                          a correlation field (e.g. u_jira_key, u_sf_id)
+   3. FIELD-LEVEL DIFF  — for every matched pair, compares each mapped field value
+                          Expected vs Actual, with transform-awareness (so a Jira
+                          "In Progress" → SN state "2" is not flagged as a mismatch)
+   4. VERDICT           — PASS / PARTIAL / FAIL with specific reasons
+
+   Returns: verdict, per-record diffs, per-field accuracy %, missing/extra records.
+   Use after a test migration or a full migration to confirm data integrity.`,
+  {
+    source_records: z.array(z.record(z.unknown())).describe(
+      'Array of source records (Jira issues, SF records, etc.) to compare against SN'
+    ),
+    sn_table: z.string().describe('Target ServiceNow table (e.g. incident, u_my_custom_table)'),
+    field_mappings: z.record(z.string()).describe(
+      '{ sourceField: snField } — the same mapping used during migration'
+    ),
+    correlation_field: z.string().describe(
+      'Field in the SN table that stores the source record ID (e.g. u_jira_key, u_sf_id, correlation_display)'
+    ),
+    source_id_field: z.string().describe(
+      'Field in source records that holds the unique ID (e.g. "key" for Jira, "Id" for Salesforce)'
+    ),
+    transform_rules: z.array(z.object({
+      sn_field:     z.string(),
+      value_map:    z.record(z.string()).describe('{ sourceValue: expectedSnValue }'),
+    })).optional().describe(
+      'Transform mappings to apply when comparing — prevents false mismatches for status/priority fields'
+    ),
+    date_fields: z.array(z.string()).optional().describe(
+      'SN field names that are dates — compared as YYYY-MM-DD only, ignoring time'
+    ),
+    ignored_fields: z.array(z.string()).optional().describe(
+      'SN field names to skip in value comparison (e.g. sys_created_on, sys_updated_by)'
+    ),
+    limit: z.number().optional().default(200).describe('Max source records to compare (default 200)'),
+    full_scan: z.boolean().optional().default(false).describe(
+      'Also check for records in SN that are not in the source sample (detects extras/duplicates)'
+    ),
+  },
+  async ({
+    source_records, sn_table, field_mappings,
+    correlation_field, source_id_field,
+    transform_rules, date_fields, ignored_fields, limit, full_scan,
+  }) => {
+    try {
+      const sn = await getSn();
+
+      // Build transform map from rules
+      const transformMap = new Map();
+      for (const rule of (transform_rules ?? [])) {
+        transformMap.set(rule.sn_field, new Map(Object.entries(rule.value_map)));
+      }
+
+      const reconciler = new MigrationReconciler(sn, {
+        transformMap,
+        dateFields:    new Set(date_fields ?? []),
+        ignoredFields: new Set([
+          'sys_created_on','sys_updated_on','sys_created_by','sys_updated_by','sys_mod_count',
+          ...(ignored_fields ?? []),
+        ]),
+      });
+
+      const report = await reconciler.reconcile(
+        source_records,
+        sn_table,
+        field_mappings,
+        correlation_field,
+        source_id_field,
+        { limit: limit ?? 200, fullScan: full_scan ?? false },
+      );
+
+      return ok({
+        instructions_for_claude: [
+          `Reconciliation verdict: ${report.verdict.result}`,
+          report.verdict.reason,
+          report.summary.missing_from_sn > 0
+            ? `ACTION NEEDED: ${report.summary.missing_from_sn} records were not found in ServiceNow. Check that the correlation field "${correlation_field}" is populated and that the transform map ran.`
+            : null,
+          report.summary.records_with_errors > 0
+            ? `ACTION NEEDED: ${report.summary.records_with_errors} records have field-level mismatches. Review the mismatched_records array and fix the transform map or field mapping.`
+            : null,
+          report.verdict.result === 'PASS'
+            ? 'Migration verified. Safe to proceed to full production run.'
+            : null,
+        ].filter(Boolean),
+        ...report,
+      });
+    } catch (e) { return fail(e.message); }
+  }
+);
+
+// ── TOOL: reconcile_staging ────────────────────────────────────────────────
+server.tool(
+  'reconcile_staging',
+  `Compare the ServiceNow STAGING table against the TARGET table to verify that
+   the transform map correctly moved all records from staging into the real table.
+
+   This is the staging → target leg of the three-layer quality check:
+     Source → [staging] → Target
+
+   Fetches the most recent N staging records, looks up their corresponding target
+   records via sys_target_sys_id, then compares every mapped field value.
+
+   Returns: per-record diffs, per-field accuracy, missing target records.`,
+  {
+    staging_table:    z.string().describe('ServiceNow import set staging table (e.g. u_jira_import)'),
+    target_table:     z.string().describe('ServiceNow target table (e.g. incident)'),
+    field_mappings:   z.record(z.string()).describe('{ stagingField: targetField }'),
+    sample_size:      z.number().optional().default(50).describe('How many staging records to check'),
+    transform_rules:  z.array(z.object({
+      target_field: z.string(),
+      value_map:    z.record(z.string()),
+    })).optional(),
+    date_fields:      z.array(z.string()).optional(),
+  },
+  async ({ staging_table, target_table, field_mappings, sample_size, transform_rules, date_fields }) => {
+    try {
+      const sn = await getSn();
+
+      // Fetch recent staging records
+      const stagingRecords = await sn.get(staging_table, {
+        sysparm_limit:         String(sample_size ?? 50),
+        sysparm_query:         'ORDERBYDESCsys_created_on',
+        sysparm_display_value: 'true',
+      });
+
+      if (!stagingRecords.length) return fail(`No records found in staging table ${staging_table}`);
+
+      // For each staging record, fetch the target record via sys_target_sys_id
+      const pairs = [];
+      const noTarget = [];
+
+      for (const row of stagingRecords) {
+        const targetSysId = row.sys_target_sys_id?.value
+          ?? row.sys_target_sys_id?.link?.split('/').pop()
+          ?? row.sys_target_sys_id
+          ?? null;
+
+        if (!targetSysId || targetSysId === 'null' || targetSysId === '') {
+          noTarget.push({ staging_id: row.sys_id, state: row.sys_import_state?.value ?? row.sys_import_state });
+          continue;
+        }
+
+        const target = await sn.getById(target_table, targetSysId, { sysparm_display_value: 'true' }).catch(() => null);
+        if (target) pairs.push({ staging: row, target });
+        else         noTarget.push({ staging_id: row.sys_id, target_sys_id: targetSysId, reason: 'not_found_in_target' });
+      }
+
+      // Build transform map
+      const transformMap = new Map();
+      for (const rule of (transform_rules ?? [])) {
+        transformMap.set(rule.target_field, new Map(Object.entries(rule.value_map)));
+      }
+      const dateSet = new Set(date_fields ?? []);
+
+      // Compare field values
+      const fieldStats    = {};
+      const mismatchedPairs = [];
+
+      for (const { staging, target } of pairs) {
+        const diffs = [];
+        for (const [stagingField, targetField] of Object.entries(field_mappings)) {
+          const rawStaging = staging[stagingField];
+          const rawTarget  = target[targetField];
+
+          // Normalise
+          const normVal = v => {
+            if (v === null || v === undefined) return '';
+            if (typeof v === 'object' && 'value' in v) return String(v.value ?? '').trim();
+            return String(v).trim();
+          };
+
+          let expected = normVal(rawStaging);
+          const actual = normVal(rawTarget);
+
+          // Apply transform
+          const fieldMap = transformMap.get(targetField);
+          if (fieldMap && fieldMap.has(expected)) expected = fieldMap.get(expected);
+
+          // Date normalise
+          const normDate = v => { try { return new Date(v).toISOString().slice(0,10); } catch { return v; } };
+          const e = dateSet.has(targetField) ? normDate(expected) : expected;
+          const a = dateSet.has(targetField) ? normDate(actual)   : actual;
+
+          const match = e === a || e.toLowerCase() === a.toLowerCase() || (!e && !a);
+
+          if (!fieldStats[targetField]) fieldStats[targetField] = { passed: 0, failed: 0, total: 0, samples: [] };
+          fieldStats[targetField].total++;
+          match ? fieldStats[targetField].passed++ : fieldStats[targetField].failed++;
+          if (!match && fieldStats[targetField].samples.length < 3) {
+            fieldStats[targetField].samples.push({ expected: e, actual: a });
+          }
+
+          diffs.push({ stagingField, targetField, expected: e, actual: a, match });
+        }
+
+        const failures = diffs.filter(d => !d.match);
+        if (failures.length) {
+          mismatchedPairs.push({
+            staging_sys_id: staging.sys_id,
+            target_sys_id:  target.sys_id,
+            failed: failures.length,
+            passed: diffs.length - failures.length,
+            accuracy_pct: Math.round(((diffs.length - failures.length) / diffs.length) * 100),
+            diffs: failures,
+          });
+        }
+      }
+
+      const totalRecords    = stagingRecords.length;
+      const matched         = pairs.length;
+      const withMismatches  = mismatchedPairs.length;
+      const fullyCorrect    = matched - withMismatches;
+
+      const fieldSummary = Object.entries(fieldStats).map(([field, s]) => ({
+        target_field:  field,
+        total:         s.total,
+        passed:        s.passed,
+        failed:        s.failed,
+        accuracy_pct:  Math.round((s.passed / s.total) * 100),
+        verdict:       s.failed === 0 ? 'PASS' : s.passed === 0 ? 'FAIL' : 'PARTIAL',
+        sample_mismatches: s.samples,
+      })).sort((a,b) => a.accuracy_pct - b.accuracy_pct);
+
+      const overallVerdict = noTarget.length === totalRecords ? 'FAIL'
+        : withMismatches === 0 && noTarget.length === 0 ? 'PASS'
+        : 'PARTIAL';
+
+      return ok({
+        instructions_for_claude: [
+          `Staging→Target reconciliation: ${overallVerdict}`,
+          noTarget.length > 0
+            ? `${noTarget.length}/${totalRecords} staging records have no target record — transform map may not have run, or records were in error state.`
+            : null,
+          withMismatches > 0
+            ? `${withMismatches} record pairs have field-level mismatches — review field_stats for details.`
+            : null,
+          overallVerdict === 'PASS'
+            ? 'All staging records successfully transformed into target table with correct values.'
+            : null,
+        ].filter(Boolean),
+        verdict:             overallVerdict,
+        summary: {
+          staging_records:       totalRecords,
+          matched_to_target:     matched,
+          no_target_record:      noTarget.length,
+          records_with_errors:   withMismatches,
+          records_fully_correct: fullyCorrect,
+          record_accuracy_pct:   matched ? Math.round((fullyCorrect / matched) * 100) : 0,
+        },
+        field_stats:           fieldSummary,
+        mismatched_pairs:      mismatchedPairs.slice(0, 30),
+        no_target_records:     noTarget.slice(0, 20),
+      });
+    } catch (e) { return fail(e.message); }
+  }
+);
+
+// ── TOOL: migration_test_report ────────────────────────────────────────────
+server.tool(
+  'migration_test_report',
+  `Generate a complete end-to-end migration test report covering all three layers:
+
+     Source (Jira/SF) → Staging Table → Target Table (ServiceNow)
+
+   Combines the existing validate tool (fill-rate check) with deep reconciliation
+   to produce a single pass/fail report with actionable fix guidance.
+
+   Use this after a test migration of 5–50 records before running the full migration.
+   Returns a human-readable verdict + specific fields/records that need fixing.`,
+  {
+    platform:         z.enum(['jira','salesforce']).describe('Source platform'),
+    source_records:   z.array(z.record(z.unknown())).describe('The source records that were migrated'),
+    staging_table:    z.string().describe('SN staging/import table name'),
+    target_table:     z.string().describe('SN target table name (e.g. incident)'),
+    field_mappings:   z.array(z.object({
+      source_field:  z.string(),
+      staging_field: z.string(),
+      sn_field:      z.string(),
+    })).describe('Three-layer field mapping: source → staging → SN target'),
+    correlation_field: z.string().describe('SN target field holding the source ID (e.g. u_jira_key)'),
+    source_id_field:   z.string().describe('Field in source records that is the unique ID (e.g. key, Id)'),
+    transform_rules:   z.array(z.object({
+      sn_field: z.string(),
+      value_map: z.record(z.string()),
+    })).optional(),
+    date_fields:       z.array(z.string()).optional(),
+  },
+  async ({ platform, source_records, staging_table, target_table, field_mappings,
+           correlation_field, source_id_field, transform_rules, date_fields }) => {
+    try {
+      const sn = await getSn();
+
+      // ── Layer 1: staging fill-rate (existing MigrationValidator) ──────────
+      const { MigrationValidator } = await import('./migration/validator.js');
+      const validator  = new MigrationValidator(sn);
+      const mappingsForValidator = field_mappings.map(m => ({
+        staging_field: m.staging_field,
+        sn_target:     m.sn_field,
+      }));
+      const fillReport = await validator.validate({
+        platform,
+        source:        null,
+        stagingTable:  staging_table,
+        targetTable:   target_table,
+        mappings:      mappingsForValidator,
+        sampleSize:    Math.min(source_records.length, 50),
+      }).catch(e => ({ error: e.message }));
+
+      // ── Layer 2: deep source↔target reconciliation ────────────────────────
+      const transformMap = new Map();
+      for (const rule of (transform_rules ?? [])) {
+        transformMap.set(rule.sn_field, new Map(Object.entries(rule.value_map)));
+      }
+      const sourceToSn = Object.fromEntries(field_mappings.map(m => [m.source_field, m.sn_field]));
+
+      const reconciler = new MigrationReconciler(sn, {
+        transformMap,
+        dateFields:    new Set(date_fields ?? []),
+      });
+      const reconReport = await reconciler.reconcile(
+        source_records, target_table, sourceToSn,
+        correlation_field, source_id_field,
+        { limit: source_records.length }
+      );
+
+      // ── Combine into unified verdict ───────────────────────────────────────
+      const stagingPass = !fillReport.error && fillReport.overall_health === 'PASS';
+      const reconPass   = reconReport.verdict.result === 'PASS';
+      const overallVerdict = stagingPass && reconPass ? 'PASS'
+        : !stagingPass && !reconPass ? 'FAIL'
+        : 'PARTIAL';
+
+      // Build actionable fix list
+      const fixes = [];
+      if (fillReport.staging_issues?.length) {
+        fixes.push(...fillReport.staging_issues.map(f => ({
+          layer: 'source→staging',
+          field: f.staging_field,
+          issue: 'Field is empty in staging table — data was not fetched from source',
+          action: `Check the source connector is mapping "${f.staging_field}" and re-run the staging push`,
+        })));
+      }
+      if (fillReport.target_issues?.length) {
+        fixes.push(...fillReport.target_issues.map(f => ({
+          layer: 'staging→target',
+          field: f.target_field,
+          issue: 'Field is empty in target table — transform map is not mapping this field',
+          action: `Check the transform map has a field mapping for staging.${f.staging_field} → target.${f.target_field}`,
+        })));
+      }
+      if (reconReport.missing_records?.length) {
+        fixes.push({
+          layer:  'source→target',
+          field:  correlation_field,
+          issue:  `${reconReport.missing_records.length} source records not found in ServiceNow`,
+          action: `Verify the correlation field "${correlation_field}" is being populated and the migration ran for all records`,
+        });
+      }
+      for (const f of reconReport.field_stats.filter(f => f.verdict === 'FAIL' || f.verdict === 'PARTIAL')) {
+        fixes.push({
+          layer:  'value mismatch',
+          field:  f.sn_field,
+          issue:  `${f.failed}/${f.total} values don't match (${f.accuracy_pct}% accuracy)`,
+          action: `Review transform rules for "${f.sn_field}". Sample: expected "${f.sample_mismatches[0]?.expected}" got "${f.sample_mismatches[0]?.actual}"`,
+        });
+      }
+
+      return ok({
+        instructions_for_claude: [
+          `Migration test report: ${overallVerdict}`,
+          overallVerdict === 'PASS'
+            ? 'All three layers verified. Safe to proceed with full production migration.'
+            : `${fixes.length} issue(s) found. Walk the user through each fix in the fixes array before re-running.`,
+          overallVerdict !== 'PASS'
+            ? 'Do NOT proceed with full migration until all FAIL items are resolved.'
+            : null,
+        ].filter(Boolean),
+        overall_verdict:   overallVerdict,
+        layer_verdicts: {
+          fill_rate:     stagingPass ? 'PASS' : 'FAIL',
+          reconciliation: reconReport.verdict.result,
+        },
+        fixes,
+        fill_rate_report: fillReport,
+        reconciliation_report: {
+          verdict:  reconReport.verdict,
+          summary:  reconReport.summary,
+          field_stats: reconReport.field_stats,
+        },
+      });
+    } catch (e) { return fail(e.message); }
   }
 );
 
