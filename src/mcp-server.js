@@ -38,13 +38,66 @@ import { SFArtifactBuilder }    from './integration/sf-artifacts.js';
 import { logger }               from './utils/logger.js';
 
 // ── Connector cache (reuse within a session) ───────────────────────────────
+// In HTTP mode each request is stateless, so connectors are reset per-session
+// via configure_credentials. In stdio mode they are process-scoped singletons.
 let _sn   = null;
 let _sf   = null;
 let _jira = null;
 
-async function getSn()   { return (_sn   ??= await new ServiceNowConnector().init()); }
-async function getSf()   { return (_sf   ??= await new SalesforceConnector().connect()); }
-async function getJira() { return (_jira ??= await new JiraConnector().connect()); }
+// Session-level credential overrides (set via configure_credentials tool).
+// These override whatever is in .env, so each web session can use its own instance.
+const _sessionCreds = {
+  servicenow:  null,   // { instanceUrl, username, password }
+  jira:        null,   // { baseUrl, email, apiToken }
+  salesforce:  null,   // { loginUrl, clientId, clientSecret, username, password, securityToken }
+};
+
+async function getSn() {
+  if (!_sn) {
+    if (_sessionCreds.servicenow) {
+      // Override env with session credentials
+      const c = _sessionCreds.servicenow;
+      process.env.SN_INSTANCE_URL = c.instanceUrl;
+      process.env.SN_USERNAME     = c.username;
+      process.env.SN_PASSWORD     = c.password;
+    }
+    _sn = await new ServiceNowConnector().init();
+  }
+  return _sn;
+}
+
+async function getSf() {
+  if (!_sf) {
+    if (_sessionCreds.salesforce) {
+      const c = _sessionCreds.salesforce;
+      process.env.SF_LOGIN_URL      = c.loginUrl     ?? 'https://login.salesforce.com';
+      process.env.SF_CLIENT_ID      = c.clientId;
+      process.env.SF_CLIENT_SECRET  = c.clientSecret;
+      process.env.SF_USERNAME       = c.username;
+      process.env.SF_PASSWORD       = c.password;
+      process.env.SF_SECURITY_TOKEN = c.securityToken ?? '';
+    }
+    _sf = await new SalesforceConnector().connect();
+  }
+  return _sf;
+}
+
+async function getJira() {
+  if (!_jira) {
+    if (_sessionCreds.jira) {
+      const c = _sessionCreds.jira;
+      process.env.JIRA_BASE_URL  = c.baseUrl;
+      process.env.JIRA_EMAIL     = c.email;
+      process.env.JIRA_API_TOKEN = c.apiToken;
+    }
+    _jira = await new JiraConnector().connect();
+  }
+  return _jira;
+}
+
+function resetConnectors() {
+  _sn = null; _sf = null; _jira = null;
+}
 
 // ── Response helpers ───────────────────────────────────────────────────────
 const ok  = (data) => ({ content: [{ type: 'text', text: JSON.stringify(data, null, 2) }] });
@@ -58,29 +111,45 @@ const server = new McpServer({ name: 'sn-data-migration', version: '1.0.0' });
 // ══════════════════════════════════════════════════════════════════════════
 server.tool(
   'get_config',
-  `Returns the current configuration from the .env file — which platforms are set up and ready to use.
-   Call this at the very start of every session BEFORE asking the user for any information.
-   Never ask the user for credentials, URLs, or tokens — they are already in the .env file.
-   Use this to confirm what's configured, then call connect() to verify the connections are live.`,
+  `Returns which platforms are configured and ready to use.
+   Call this at the very start of every session BEFORE asking the user for anything.
+
+   Credentials come from one of two places (checked in this order):
+     1. Session memory — set via configure_credentials (used in web Claude Code)
+     2. .env file on the server (used in CLI / personal deployment)
+
+   If a platform shows configured=false AND the server has no .env:
+     → Call configure_credentials first, then re-call get_config.
+   If a platform shows configured=false AND a .env exists:
+     → The .env is missing that platform's values. Tell the user which vars are needed.
+
+   Never ask the user for credentials unless get_config reports a platform is not configured.`,
   {},
   async () => {
+    const snCreds  = _sessionCreds.servicenow;
+    const jiraCreds = _sessionCreds.jira;
+    const sfCreds   = _sessionCreds.salesforce;
+
     const cfg = {
       servicenow: {
-        configured: !!(process.env.SN_INSTANCE_URL && (process.env.SN_USERNAME || process.env.SN_USE_SDK_AUTH === 'true')),
-        instance:   process.env.SN_INSTANCE_URL ?? null,
-        auth_type:  process.env.SN_USE_SDK_AUTH === 'true' ? 'oauth_sdk' : 'basic',
+        configured:   !!(snCreds?.instanceUrl || (process.env.SN_INSTANCE_URL && (process.env.SN_USERNAME || process.env.SN_USE_SDK_AUTH === 'true'))),
+        instance:     snCreds?.instanceUrl ?? process.env.SN_INSTANCE_URL ?? null,
+        auth_type:    process.env.SN_USE_SDK_AUTH === 'true' ? 'oauth_sdk' : 'basic',
         scope_prefix: process.env.SN_SCOPE_PREFIX ?? 'u',
+        source:       snCreds ? 'session' : 'env',
       },
       jira: {
-        configured: !!(process.env.JIRA_BASE_URL && process.env.JIRA_EMAIL && process.env.JIRA_API_TOKEN),
-        base_url:   process.env.JIRA_BASE_URL ?? null,
-        email:      process.env.JIRA_EMAIL ?? null,
+        configured: !!(jiraCreds?.baseUrl || (process.env.JIRA_BASE_URL && process.env.JIRA_EMAIL && process.env.JIRA_API_TOKEN)),
+        base_url:   jiraCreds?.baseUrl ?? process.env.JIRA_BASE_URL ?? null,
+        email:      jiraCreds?.email   ?? process.env.JIRA_EMAIL ?? null,
+        source:     jiraCreds ? 'session' : 'env',
       },
       salesforce: {
-        configured: !!(process.env.SF_CLIENT_ID && process.env.SF_USERNAME),
-        login_url:  process.env.SF_LOGIN_URL ?? null,
-        username:   process.env.SF_USERNAME ?? null,
+        configured:  !!(sfCreds?.clientId || (process.env.SF_CLIENT_ID && process.env.SF_USERNAME)),
+        login_url:   sfCreds?.loginUrl  ?? process.env.SF_LOGIN_URL ?? null,
+        username:    sfCreds?.username  ?? process.env.SF_USERNAME ?? null,
         api_version: process.env.SF_API_VERSION ?? null,
+        source:      sfCreds ? 'session' : 'env',
       },
       migration_settings: {
         test_limit:  parseInt(process.env.MIGRATION_TEST_LIMIT ?? '5', 10),
@@ -96,16 +165,109 @@ server.tool(
 
     return ok({
       instructions_for_claude: [
-        'Do NOT ask the user for any credentials or configuration — everything is already set up in the .env file.',
-        `The following platforms are configured and ready: ${ready.join(', ')}.`,
+        `The following platforms are configured and ready: ${ready.length ? ready.join(', ') : 'none'}.`,
         notConfigured.length
-          ? `These platforms are NOT configured (missing .env values): ${notConfigured.join(', ')}. Only mention this if the user asks to use one of them.`
+          ? `These platforms are NOT configured: ${notConfigured.join(', ')}. If the user needs one of them, call configure_credentials to collect their credentials for this session.`
           : 'All three platforms are configured.',
-        'Call connect() next to verify the live connections, then proceed with the user\'s request.',
+        ready.length === 0
+          ? 'No platforms are configured. Call configure_credentials first — ask the user which platform(s) they need and collect the credentials.'
+          : 'Call connect() next to verify the live connections, then proceed with the user\'s request.',
       ],
       configured_platforms: ready,
       not_configured:       notConfigured,
       config:               cfg,
+    });
+  }
+);
+
+// ══════════════════════════════════════════════════════════════════════════
+// TOOL: configure_credentials
+// ══════════════════════════════════════════════════════════════════════════
+server.tool(
+  'configure_credentials',
+  `Set credentials for this session when running in web Claude Code or any context
+   where a .env file is not present on the server.
+
+   WHEN TO CALL THIS:
+   - Web Claude Code (claude.ai/code): the server is deployed remotely and has no
+     access to the user's .env. Call this once at the start of the session.
+   - CLI: only needed if the user wants to override their .env for this session.
+
+   SECURITY: credentials are held in memory for this session only and are never
+   logged, stored to disk, or returned in any tool response. They are cleared
+   when the session ends.
+
+   Only provide credentials for the platforms you actually need.
+   After calling this, call get_config to confirm the platforms are now configured,
+   then call connect to verify the live connections.`,
+  {
+    servicenow: z.object({
+      instance_url: z.string().describe('e.g. https://yourinstance.service-now.com'),
+      username:     z.string().describe('ServiceNow username'),
+      password:     z.string().describe('ServiceNow password'),
+    }).optional().describe('ServiceNow credentials'),
+
+    jira: z.object({
+      base_url:  z.string().describe('e.g. https://yourcompany.atlassian.net'),
+      email:     z.string().describe('Atlassian account email'),
+      api_token: z.string().describe('Jira API token from id.atlassian.com/manage-profile/security'),
+    }).optional().describe('Jira credentials'),
+
+    salesforce: z.object({
+      login_url:      z.string().optional().default('https://login.salesforce.com').describe('Use https://test.salesforce.com for sandboxes'),
+      client_id:      z.string().describe('Connected App consumer key'),
+      client_secret:  z.string().describe('Connected App consumer secret'),
+      username:       z.string().describe('Salesforce username'),
+      password:       z.string().describe('Salesforce password'),
+      security_token: z.string().optional().default('').describe('Salesforce security token (if IP not allowlisted)'),
+    }).optional().describe('Salesforce credentials'),
+  },
+  async ({ servicenow, jira, salesforce }) => {
+    const configured = [];
+    const skipped    = [];
+
+    if (servicenow) {
+      _sessionCreds.servicenow = {
+        instanceUrl: servicenow.instance_url,
+        username:    servicenow.username,
+        password:    servicenow.password,
+      };
+      configured.push('servicenow');
+    } else skipped.push('servicenow');
+
+    if (jira) {
+      _sessionCreds.jira = {
+        baseUrl:  jira.base_url,
+        email:    jira.email,
+        apiToken: jira.api_token,
+      };
+      configured.push('jira');
+    } else skipped.push('jira');
+
+    if (salesforce) {
+      _sessionCreds.salesforce = {
+        loginUrl:      salesforce.login_url ?? 'https://login.salesforce.com',
+        clientId:      salesforce.client_id,
+        clientSecret:  salesforce.client_secret,
+        username:      salesforce.username,
+        password:      salesforce.password,
+        securityToken: salesforce.security_token ?? '',
+      };
+      configured.push('salesforce');
+    } else skipped.push('salesforce');
+
+    // Reset cached connectors so they re-initialise with the new credentials
+    resetConnectors();
+
+    return ok({
+      instructions_for_claude: [
+        `Credentials stored in session memory for: ${configured.join(', ')}.`,
+        'Credentials are NOT logged or persisted — they exist only for this session.',
+        'Call get_config to confirm, then call connect to verify the live connections.',
+      ],
+      configured,
+      skipped,
+      note: 'Credentials held in memory only. Call configure_credentials again to update.',
     });
   }
 );
