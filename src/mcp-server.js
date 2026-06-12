@@ -41,13 +41,20 @@ import { TableExplorer }        from './developer/table-explorer.js';
 import { TestGenerator }        from './developer/test-generator.js';
 import { PerfAnalyzer }         from './developer/perf-analyzer.js';
 import { DocGenerator }         from './developer/doc-generator.js';
+import { PortalBuilder }        from './developer/portal-builder.js';
+import { CatalogBuilder }       from './developer/catalog-builder.js';
+import { NotificationBuilder }  from './developer/notification-builder.js';
+import { TechDocWriter }        from './developer/tech-doc-writer.js';
+import { IssueGuide }           from './developer/issue-guide.js';
 import { logger }               from './utils/logger.js';
 
 // ── Developer tools singletons (stateless, no credentials needed) ──────────
-const _scriptBuilder = new ScriptBuilder();
-const _codeReviewer  = new CodeReviewer();
-const _testGen       = new TestGenerator();
-const _docGen        = new DocGenerator();
+const _scriptBuilder   = new ScriptBuilder();
+const _codeReviewer    = new CodeReviewer();
+const _testGen         = new TestGenerator();
+const _docGen          = new DocGenerator();
+const _notifBuilder    = new NotificationBuilder();
+const _issueGuide      = new IssueGuide();
 
 // ── Connector cache (reuse within a session) ───────────────────────────────
 // In HTTP mode each request is stateless, so connectors are reset per-session
@@ -4198,6 +4205,634 @@ const BEST_PRACTICES_SUMMARY = {
     'Set setWorkflow(false) in bulk updates',
   ],
 };
+
+// ═══════════════════════════════════════════════════════════════════════════
+// PORTAL TOOLS — analyze, find, clone, create, update widgets and portals
+// ═══════════════════════════════════════════════════════════════════════════
+
+// ── TOOL: analyze_portal ──────────────────────────────────────────────────
+server.tool(
+  'analyze_portal',
+  `Analyze a complete Service Portal — pages, widgets, theme, widget usage counts.
+
+Provide the portal's URL suffix (e.g. "sp" for the default portal) or its sys_id.
+
+Returns:
+  - Portal metadata (title, theme, homepage)
+  - All pages (title, ID, public/private, roles)
+  - Widgets available on the instance
+  - Widget usage counts across pages
+  - Theme details (CSS variables)
+  - Summary statistics
+
+Use this before starting portal development to understand what already exists.`,
+  {
+    portal_id: z.string().describe('Portal URL suffix (e.g. "sp") or sys_id'),
+  },
+  async ({ portal_id }) => {
+    try {
+      const sn     = await getSn();
+      const portal = new PortalBuilder(sn);
+      return ok(await portal.analyzePortal(portal_id));
+    } catch (e) { return fail(e.message); }
+  }
+);
+
+// ── TOOL: find_widget ─────────────────────────────────────────────────────
+server.tool(
+  'find_widget',
+  'Search for Service Portal widgets by name, ID, or keyword. Returns up to 20 matches with sys_ids.',
+  {
+    keyword: z.string().describe('Keyword to search in widget name, ID, or description'),
+    limit:   z.number().optional().default(20),
+  },
+  async ({ keyword, limit }) => {
+    try {
+      const sn     = await getSn();
+      const portal = new PortalBuilder(sn);
+      return ok({ keyword, results: await portal.findWidgets(keyword, limit) });
+    } catch (e) { return fail(e.message); }
+  }
+);
+
+// ── TOOL: clone_widget ────────────────────────────────────────────────────
+server.tool(
+  'clone_widget',
+  `Clone an existing Service Portal widget with a new name and optional modifications.
+
+Fetches all 4 widget sections (template, CSS, client script, server script) plus
+option schema from the source widget, then produces a ready-to-deploy payload for
+the cloned version with your modifications applied.
+
+Modifications you can apply at clone time:
+  template, css, client_script, server_script, option_schema, demo_data, description
+
+Returns: POST-ready payload for sp_widget table + provenance comment in each section.`,
+  {
+    source_id:    z.string().describe('Source widget ID (e.g. "sc-cat-item") or sys_id'),
+    new_name:     z.string().describe('Display name for the cloned widget'),
+    new_id:       z.string().optional().describe('Widget ID for cloned widget (defaults to kebab-case of new_name)'),
+    modifications: z.object({
+      template:      z.string().optional(),
+      css:           z.string().optional(),
+      client_script: z.string().optional(),
+      server_script: z.string().optional(),
+      option_schema: z.string().optional(),
+      description:   z.string().optional(),
+    }).optional(),
+  },
+  async ({ source_id, new_name, new_id, modifications }) => {
+    try {
+      const sn     = await getSn();
+      const portal = new PortalBuilder(sn);
+      return ok(await portal.cloneWidget({ sourceIdOrSysId: source_id, newName: new_name, newId: new_id, modifications: modifications ?? {} }));
+    } catch (e) { return fail(e.message); }
+  }
+);
+
+// ── TOOL: create_widget ───────────────────────────────────────────────────
+server.tool(
+  'create_widget',
+  `Generate a complete, production-ready Service Portal widget from a requirement description.
+
+Generates all 4 sections with best practices baked in:
+  - HTML template: panel layout, loading/error states, AngularJS binding
+  - CSS: theme-variable-based styling (no hardcoded colors)
+  - Client script: c.data pattern, c.server.update(), spUtil feedback
+  - Server script: try/catch, input dispatcher, GlideRecord with limit
+  - Option schema: title + limit + any custom options
+
+Returns deploy-ready payload + best practices + deploy instructions.`,
+  {
+    name:        z.string().describe('Widget display name'),
+    id:          z.string().optional().describe('Widget ID (kebab-case, used in URL and as CSS class)'),
+    description: z.string().optional(),
+    data_source: z.string().optional().describe('Table to load data from (e.g. "incident")'),
+    fields: z.array(z.object({
+      key:   z.string().describe('Variable name in data object'),
+      label: z.string().describe('Display label'),
+      field: z.string().optional().describe('SN table field name if different from key'),
+    })).optional(),
+    actions: z.array(z.object({
+      fn:          z.string().describe('Function name called from template ng-click'),
+      label:       z.string().describe('Button label'),
+      style:       z.enum(['default','primary','success','warning','danger','info']).optional(),
+      description: z.string().optional(),
+      condition:   z.string().optional().describe('AngularJS ng-if expression'),
+    })).optional(),
+    options: z.array(z.object({
+      name:    z.string(),
+      label:   z.string(),
+      type:    z.string().optional(),
+      default: z.string().optional(),
+      hint:    z.string().optional(),
+    })).optional(),
+  },
+  ({ name, id, description, data_source, fields, actions, options }) => {
+    try {
+      const portal = new PortalBuilder(null);
+      return ok(portal.buildWidget({ name, id, description, dataSource: data_source, fields: fields ?? [], actions: actions ?? [], options: options ?? [] }));
+    } catch (e) { return fail(e.message); }
+  }
+);
+
+// ── TOOL: update_widget ───────────────────────────────────────────────────
+server.tool(
+  'update_widget',
+  `Build a PATCH payload to update specific sections of an existing widget.
+
+Provide the widget sys_id and only the sections you want to change.
+Returns a PATCH payload ready to send to /api/now/table/sp_widget/{sys_id}.
+
+Updatable sections: template, css, client_script, server_script, option_schema, demo_data`,
+  {
+    widget_sys_id: z.string().describe('sys_id of the widget to update'),
+    sections: z.object({
+      template:      z.string().optional(),
+      css:           z.string().optional(),
+      client_script: z.string().optional(),
+      server_script: z.string().optional(),
+      option_schema: z.string().optional(),
+      demo_data:     z.string().optional(),
+    }).describe('Only include the sections you want to change'),
+  },
+  ({ widget_sys_id, sections }) => {
+    try {
+      const portal = new PortalBuilder(null);
+      return ok(portal.buildWidgetUpdate({ widgetSysId: widget_sys_id, sections }));
+    } catch (e) { return fail(e.message); }
+  }
+);
+
+// ── TOOL: create_portal ───────────────────────────────────────────────────
+server.tool(
+  'create_portal',
+  `Scaffold a new Service Portal with theme, default pages, and best-practice CSS variables.
+
+Generates:
+  - Portal record (url_suffix, title)
+  - Theme with full CSS variable set (brand colors, typography, spacing, borders)
+  - Default pages: Home, Login, Profile, Catalog + any custom pages
+  - Deploy order and instructions
+
+Returns all payloads in correct deployment order.`,
+  {
+    name:       z.string().describe('Portal display name'),
+    url_suffix: z.string().optional().describe('URL suffix (e.g. "myportal" → /myportal)'),
+    description: z.string().optional(),
+    pages: z.array(z.object({
+      title:       z.string(),
+      id:          z.string().describe('Page ID used in URL'),
+      public:      z.boolean().optional().default(false),
+      description: z.string().optional(),
+    })).optional(),
+  },
+  ({ name, url_suffix, description, pages }) => {
+    try {
+      const portal = new PortalBuilder(null);
+      return ok(portal.buildPortal({ name, urlSuffix: url_suffix, description, pages: pages ?? [] }));
+    } catch (e) { return fail(e.message); }
+  }
+);
+
+// ═══════════════════════════════════════════════════════════════════════════
+// CATALOG TOOLS — items, variables, categories, record producers, order guides
+// ═══════════════════════════════════════════════════════════════════════════
+
+// ── TOOL: create_catalog_item ─────────────────────────────────────────────
+server.tool(
+  'create_catalog_item',
+  `Generate a complete Service Catalog item definition with variables, client scripts, and UI policies.
+
+Variable types supported:
+  single_line, multi_line, multiple_choice, yes_no, reference, date, date_time,
+  checkbox, select_box, numeric, email, url, phone, masked, file_attachment,
+  container_start, container_end, label
+
+Returns:
+  - Catalog item payload (deploy to sc_cat_item)
+  - Variable payloads (deploy to item_option_new)
+  - Client script payloads (deploy to catalog_script_client)
+  - UI policy payloads (deploy to catalog_ui_policy)
+  - Deployment order and best-practice checklist`,
+  {
+    name:               z.string(),
+    short_description:  z.string(),
+    description:        z.string().optional(),
+    category:           z.string().optional().describe('sys_id of sc_category'),
+    fulfillment_group:  z.string().optional().describe('sys_id of assignment group'),
+    price:              z.string().optional().default('0'),
+    delivery_time:      z.string().optional().describe('e.g. "3 days"'),
+    portal_visibility:  z.boolean().optional().default(true),
+    variables: z.array(z.object({
+      name:      z.string().describe('Internal variable name (no spaces)'),
+      label:     z.string().describe('Display label'),
+      type:      z.string().optional().default('single_line'),
+      mandatory: z.boolean().optional().default(false),
+      default:   z.string().optional(),
+      reference: z.string().optional().describe('Table name for reference type'),
+      help:      z.string().optional(),
+    })).optional(),
+    client_scripts: z.array(z.object({
+      name:  z.string(),
+      type:  z.enum(['onLoad','onChange','onSubmit']).optional(),
+      field: z.string().optional(),
+      logic: z.string().optional(),
+    })).optional(),
+  },
+  ({ name, short_description, description, category, fulfillment_group, price, delivery_time, portal_visibility, variables, client_scripts }) => {
+    try {
+      const catalog = new CatalogBuilder(null);
+      return ok(catalog.buildCatalogItem({ name, short_description, description, category, fulfillment_group, price, delivery_time, portal_visibility, variables: variables ?? [], client_scripts: client_scripts ?? [] }));
+    } catch (e) { return fail(e.message); }
+  }
+);
+
+// ── TOOL: clone_catalog_item ──────────────────────────────────────────────
+server.tool(
+  'clone_catalog_item',
+  `Clone an existing Service Catalog item — fetches live data from ServiceNow and returns a deploy-ready copy.
+
+Copies:
+  - Catalog item fields (name, description, category, price, workflow, etc.)
+  - All variables (name, type, mandatory, default, order)
+
+You can override any field via modifications.`,
+  {
+    source:        z.string().describe('Source catalog item name or sys_id'),
+    new_name:      z.string().describe('Name for the cloned item'),
+    modifications: z.record(z.unknown()).optional().describe('Fields to override in the clone'),
+  },
+  async ({ source, new_name, modifications }) => {
+    try {
+      const sn      = await getSn();
+      const catalog = new CatalogBuilder(sn);
+      return ok(await catalog.cloneCatalogItem({ sourceNameOrSysId: source, newName: new_name, modifications: modifications ?? {} }));
+    } catch (e) { return fail(e.message); }
+  }
+);
+
+// ── TOOL: create_catalog_category ────────────────────────────────────────
+server.tool(
+  'create_catalog_category',
+  'Create a Service Catalog category (sc_category). Returns deploy-ready payload.',
+  {
+    title:       z.string(),
+    description: z.string().optional(),
+    parent:      z.string().optional().describe('sys_id of parent category (leave blank for top-level)'),
+    roles:       z.string().optional().describe('Comma-separated role names to restrict visibility'),
+  },
+  ({ title, description, parent, roles }) => {
+    try {
+      const catalog = new CatalogBuilder(null);
+      return ok(catalog.buildCategory({ title, description, parent, roles }));
+    } catch (e) { return fail(e.message); }
+  }
+);
+
+// ── TOOL: get_catalog_item ────────────────────────────────────────────────
+server.tool(
+  'get_catalog_item',
+  'Fetch a catalog item and its variables from ServiceNow for inspection or cloning.',
+  {
+    name_or_sys_id: z.string().describe('Catalog item name or sys_id'),
+  },
+  async ({ name_or_sys_id }) => {
+    try {
+      const sn      = await getSn();
+      const catalog = new CatalogBuilder(sn);
+      return ok(await catalog.getCatalogItem(name_or_sys_id));
+    } catch (e) { return fail(e.message); }
+  }
+);
+
+// ═══════════════════════════════════════════════════════════════════════════
+// NOTIFICATION TOOLS — email, push, email scripts, analysis
+// ═══════════════════════════════════════════════════════════════════════════
+
+// ── TOOL: create_notification ─────────────────────────────────────────────
+server.tool(
+  'create_notification',
+  `Create a ServiceNow email notification with an HTML template, recipients, and conditions.
+
+Recipients can be specified as:
+  - field:    a field on the record (e.g. "caller_id.email")
+  - group:    an assignment group sys_id
+  - role:     a role name (all users with that role)
+  - user:     a specific user sys_id
+
+The tool generates:
+  - Notification record payload (sysevent_email_action)
+  - Responsive HTML email template with ServiceNow field tokens
+  - Plain text fallback
+  - Best practice checklist`,
+  {
+    name:          z.string(),
+    table:         z.string().describe('Table that triggers this notification (e.g. "incident")'),
+    event:         z.string().optional().describe('Event name (e.g. "incident.inserted"). Leave blank to use condition.'),
+    condition:     z.string().optional().describe('Encoded query condition (used if no event)'),
+    subject:       z.string().describe('Email subject line — can include ${table.field} tokens'),
+    recipients: z.array(z.object({
+      type:  z.enum(['field','group','role','user']),
+      value: z.string().describe('Field name, group sys_id, role name, or user sys_id'),
+    })).optional(),
+    body_html:     z.string().optional().describe('Custom HTML email body. Leave blank for auto-generated template.'),
+    include_work_notes: z.boolean().optional().default(false),
+    weight:        z.number().optional().default(10),
+    category:      z.string().optional(),
+    reply_to:      z.string().optional(),
+    email_script:  z.string().optional().describe('Name of an Email Script for dynamic logic'),
+  },
+  ({ name, table, event, condition, subject, recipients, body_html, include_work_notes, weight, category, reply_to, email_script }) => {
+    try {
+      return ok(_notifBuilder.buildEmailNotification({
+        name, table, event, condition, recipients: recipients ?? [], subject,
+        bodyHtml: body_html, includeWorkNotes: include_work_notes,
+        weight, category, replyTo: reply_to, emailScript: email_script,
+      }));
+    } catch (e) { return fail(e.message); }
+  }
+);
+
+// ── TOOL: analyze_notifications ───────────────────────────────────────────
+server.tool(
+  'analyze_notifications',
+  `Analyze all active email notifications for a ServiceNow table.
+
+Checks for:
+  - Notifications with no condition or event (fires on every record)
+  - Notifications with no recipients (goes nowhere)
+  - Notifications with weight = 0 (potential conflicts)
+  - Missing subjects
+
+Returns a notification inventory plus issues and recommendations.`,
+  {
+    table: z.string().describe('Table name to analyze (e.g. "incident")'),
+  },
+  async ({ table }) => {
+    try {
+      const sn = await getSn();
+      const nb = new NotificationBuilder(sn);
+      return ok(await nb.analyzeNotifications(table));
+    } catch (e) { return fail(e.message); }
+  }
+);
+
+// ── TOOL: create_push_notification ────────────────────────────────────────
+server.tool(
+  'create_push_notification',
+  `Create a ServiceNow push notification for the Now Mobile app.
+
+Returns deploy-ready payload for sys_push_message table.
+Supports ${field} tokens in title and body — same as email notifications.`,
+  {
+    name:        z.string(),
+    table:       z.string().describe('Table that triggers this push notification'),
+    condition:   z.string().optional().describe('Encoded query condition for when to send'),
+    title:       z.string().describe('Push notification title (keep under 50 chars)'),
+    body:        z.string().describe('Push notification body (keep under 100 chars, use ${table.field} tokens)'),
+    route_to:    z.string().optional().describe('Deep-link route for Now Mobile (e.g. "record/incident/{sys_id}")'),
+  },
+  ({ name, table, condition, title, body, route_to }) => {
+    try {
+      return ok(_notifBuilder.buildPushNotification({ name, table, condition, title, body, route_to }));
+    } catch (e) { return fail(e.message); }
+  }
+);
+
+// ── TOOL: create_email_script ─────────────────────────────────────────────
+server.tool(
+  'create_email_script',
+  `Generate a ServiceNow Email Script (sys_script_email) for dynamic notification logic.
+
+Email Scripts are used when a notification needs:
+  - Dynamic recipients (e.g. add manager as CC)
+  - Conditional subject lines
+  - Dynamic body content based on record state
+  - Loop-prevention logic
+
+Returns deploy-ready payload with best-practice template.`,
+  {
+    name:        z.string().describe('Email Script name'),
+    description: z.string().optional(),
+    logic:       z.string().optional().describe('Core logic to embed (pseudo-code is fine)'),
+  },
+  ({ name, description, logic }) => {
+    try {
+      return ok(_notifBuilder.buildEmailScript({ name, description, logic }));
+    } catch (e) { return fail(e.message); }
+  }
+);
+
+// ═══════════════════════════════════════════════════════════════════════════
+// TECHNICAL DOCUMENTATION TOOLS
+// ═══════════════════════════════════════════════════════════════════════════
+
+// ── TOOL: generate_project_doc ────────────────────────────────────────────
+server.tool(
+  'generate_project_doc',
+  `Generate comprehensive technical documentation for a ServiceNow application by pulling live data from the instance.
+
+Produces a full Markdown document with:
+  - Executive overview and architecture diagram
+  - Data model (fields, mandatory markers, reference links)
+  - Business logic (BRs, Script Includes with method listing)
+  - UI layer (Client Scripts, UI Actions by table)
+  - Integration points (Scripted REST APIs)
+  - Automation (Scheduled Jobs, Notifications)
+  - Security (ACLs per table, scope isolation)
+  - Operations guide (monitoring, maintenance, common issue matrix)
+  - Change log template
+
+The document is ready to paste into Confluence, GitHub Wiki, or any Markdown renderer.`,
+  {
+    app_name: z.string().describe('Application name for the document title'),
+    tables:   z.array(z.string()).describe('Tables that belong to this application (e.g. ["incident","problem"])'),
+    scope:    z.string().optional().describe('Application scope prefix (e.g. "x_mycompany_myapp")'),
+    author:   z.string().optional(),
+    version:  z.string().optional().default('1.0'),
+  },
+  async ({ app_name, tables, scope, author, version }) => {
+    try {
+      const sn     = await getSn();
+      const writer = new TechDocWriter(sn);
+      return ok(await writer.generateProjectDoc({ appName: app_name, scope, tables, author, version }));
+    } catch (e) { return fail(e.message); }
+  }
+);
+
+// ── TOOL: generate_feature_doc ────────────────────────────────────────────
+server.tool(
+  'generate_feature_doc',
+  `Generate a quick one-page technical spec for a specific feature or change.
+
+Covers affected tables, Business Rules, Script Includes, notifications, and test plan.
+Use this for sprint documentation, change requests, or PR descriptions.`,
+  {
+    feature_name:    z.string(),
+    description:     z.string().optional(),
+    tables:          z.array(z.string()).optional(),
+    business_rules: z.array(z.object({
+      name:   z.string(),
+      table:  z.string(),
+      when:   z.string().optional(),
+      events: z.array(z.string()).optional(),
+    })).optional(),
+    script_includes: z.array(z.object({ name: z.string(), description: z.string().optional() })).optional(),
+    notifications:   z.array(z.object({ name: z.string(), table: z.string(), event: z.string().optional() })).optional(),
+    test_plan:       z.string().optional(),
+  },
+  ({ feature_name, description, tables, business_rules, script_includes, notifications, test_plan }) => {
+    try {
+      const writer = new TechDocWriter(null);
+      return ok({
+        doc_type: 'feature',
+        name:     feature_name,
+        markdown: writer.generateFeatureDoc({ featureName: feature_name, description, tables, businessRules: business_rules, scriptIncludes: script_includes, notifications, testPlan: test_plan }),
+      });
+    } catch (e) { return fail(e.message); }
+  }
+);
+
+// ═══════════════════════════════════════════════════════════════════════════
+// ISSUE DIAGNOSIS TOOLS
+// ═══════════════════════════════════════════════════════════════════════════
+
+// ── TOOL: diagnose_issue ──────────────────────────────────────────────────
+server.tool(
+  'diagnose_issue',
+  `Diagnose a ServiceNow issue from a symptom description and get a guided step-by-step fix.
+
+Covers 60+ known issues across:
+  business_rule, client_script, scripted_rest, portal_widget, catalog,
+  notification, performance, security, atf, deployment, general
+
+Examples:
+  "Business Rule not firing on update"
+  "Widget shows blank white box"
+  "Email notification not being received"
+  "Catalog item not visible in portal"
+  "Infinite loop in BR"
+  "GlideAjax callback not called"
+
+Returns: root causes, diagnosis steps, copy-paste fix code, prevention tips, and suggested MCP tools to use.`,
+  {
+    symptom:  z.string().describe('Describe what is happening (e.g. "Business Rule not firing")'),
+    category: z.enum(['business_rule','client_script','scripted_rest','workflow_flow','portal_widget','catalog','notification','performance','security','integration','atf','deployment','upgrade','general']).optional(),
+  },
+  ({ symptom, category }) => {
+    try {
+      return ok(_issueGuide.diagnose(symptom, category));
+    } catch (e) { return fail(e.message); }
+  }
+);
+
+// ── TOOL: get_issue_guide ─────────────────────────────────────────────────
+server.tool(
+  'get_issue_guide',
+  `Get the full guided fix for a specific known issue by its ID (e.g. "BR001", "CS002", "SP001").
+
+Use list_common_issues first to find the ID of the issue you want.`,
+  {
+    issue_id: z.string().describe('Issue ID from the catalogue (e.g. "BR001", "SP002", "CAT001")'),
+  },
+  ({ issue_id }) => {
+    try {
+      const guide = _issueGuide.getGuidedFix(issue_id.toUpperCase());
+      if (!guide || guide.error) return fail(guide?.error ?? 'Issue not found');
+      return ok(guide);
+    } catch (e) { return fail(e.message); }
+  }
+);
+
+// ── TOOL: list_common_issues ──────────────────────────────────────────────
+server.tool(
+  'list_common_issues',
+  `List all known ServiceNow issues in the guide, optionally filtered by category.
+
+Categories: business_rule, client_script, scripted_rest, portal_widget, catalog,
+  notification, performance, security, atf, deployment, general
+
+Returns grouped issue IDs and titles. Use get_issue_guide(id) to get the full fix.`,
+  {
+    category: z.enum(['business_rule','client_script','scripted_rest','portal_widget','catalog','notification','performance','security','atf','deployment','general']).optional(),
+  },
+  ({ category }) => {
+    try {
+      return ok(_issueGuide.listIssues(category));
+    } catch (e) { return fail(e.message); }
+  }
+);
+
+// ── TOOL: get_field_choices ───────────────────────────────────────────────
+server.tool(
+  'get_field_choices',
+  'Get all choice list values for a field on a ServiceNow table (e.g. state, priority, category).',
+  {
+    table: z.string().describe('Table name'),
+    field: z.string().describe('Field name'),
+  },
+  async ({ table, field }) => {
+    try {
+      const sn   = await getSn();
+      const rows = await sn.query('sys_choice', {
+        sysparm_query:  `name=${table}^element=${field}^language=en^inactive=false`,
+        sysparm_fields: 'value,label,sequence,color,dependent_value',
+        sysparm_limit:  100,
+        sysparm_order:  'sequence',
+      });
+      return ok({
+        table, field,
+        count:   rows.length,
+        choices: rows.map(c => ({ value: c.value, label: c.label, sequence: c.sequence, color: c.color ?? '', dependent: c.dependent_value ?? '' })),
+      });
+    } catch (e) { return fail(e.message); }
+  }
+);
+
+// ── TOOL: create_choice ───────────────────────────────────────────────────
+server.tool(
+  'create_choice',
+  `Add a new choice value to a field's choice list in ServiceNow.
+
+Returns deploy-ready payload for the sys_choice table.
+Common use: adding custom states, priorities, categories, or types.`,
+  {
+    table:    z.string().describe('Table name (e.g. "incident")'),
+    field:    z.string().describe('Field name (e.g. "state")'),
+    value:    z.string().describe('Internal value stored in DB (e.g. "6")'),
+    label:    z.string().describe('Display label shown to users (e.g. "Pending Vendor")'),
+    sequence: z.number().optional().describe('Sort order (lower = first)'),
+    color:    z.string().optional().describe('Bootstrap color class: success, warning, danger, info, default'),
+    dependent_value: z.string().optional().describe('Dependent field value (for dependent choice lists)'),
+  },
+  ({ table, field, value, label, sequence, color, dependent_value }) => {
+    try {
+      return ok({
+        deploy_table: 'sys_choice',
+        payload: {
+          name:            table,
+          element:         field,
+          value,
+          label,
+          language:        'en',
+          sequence:        sequence ?? 100,
+          color:           color ?? '',
+          dependent_value: dependent_value ?? '',
+          inactive:        false,
+        },
+        note:          `POST to /api/now/table/sys_choice to add this choice. The choice will appear immediately after clearing the instance cache.`,
+        cache_note:    'After creating the choice, navigate to Cache.do to clear the instance cache if the value doesn\'t appear.',
+        best_practices: [
+          'Choose a value that won\'t conflict with existing choices',
+          'Set sequence carefully — changing order later can confuse users',
+          'Add choices to ALL relevant tables if the field is inherited',
+          'Document the new choice in your project tech doc',
+        ],
+      });
+    } catch (e) { return fail(e.message); }
+  }
+);
 
 // ── Start: stdio (CLI) or HTTP/SSE (web Claude Code / remote) ────────────
 // Set MCP_MODE=http (and optionally MCP_PORT) to run as an HTTP server.
