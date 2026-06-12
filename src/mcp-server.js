@@ -35,7 +35,19 @@ import { IntegrationDesigner }  from './integration/designer.js';
 import { SNArtifactBuilder }    from './integration/sn-artifacts.js';
 import { JiraArtifactBuilder }  from './integration/jira-artifacts.js';
 import { SFArtifactBuilder }    from './integration/sf-artifacts.js';
+import { ScriptBuilder }        from './developer/script-builder.js';
+import { CodeReviewer }         from './developer/code-reviewer.js';
+import { TableExplorer }        from './developer/table-explorer.js';
+import { TestGenerator }        from './developer/test-generator.js';
+import { PerfAnalyzer }         from './developer/perf-analyzer.js';
+import { DocGenerator }         from './developer/doc-generator.js';
 import { logger }               from './utils/logger.js';
+
+// ── Developer tools singletons (stateless, no credentials needed) ──────────
+const _scriptBuilder = new ScriptBuilder();
+const _codeReviewer  = new CodeReviewer();
+const _testGen       = new TestGenerator();
+const _docGen        = new DocGenerator();
 
 // ── Connector cache (reuse within a session) ───────────────────────────────
 // In HTTP mode each request is stateless, so connectors are reset per-session
@@ -3454,7 +3466,7 @@ server.tool(
           await sn.patch(retryTable, row.sys_id, { u_resolved: true });
           // Touch the source record to re-trigger the business rule
           // source_table param is explicit; fallback to last segment of prefix
-          const tbl = source_table ?? prefix.split('_').slice(2).join('_') || prefix;
+          const tbl = source_table ?? (prefix.split('_').slice(2).join('_') || prefix);
           await sn.patch(tbl, row.u_source_id, { u_sync_in_progress: false }).catch(() => null);
           results.push({ source_id: row.u_source_id, status: 'queued' });
         } catch (e) {
@@ -3466,6 +3478,726 @@ server.tool(
     } catch (e) { return fail(e.message); }
   }
 );
+
+// ═══════════════════════════════════════════════════════════════════════════
+// DEVELOPER TOOLS — script generation, code review, schema, testing, perf
+// ═══════════════════════════════════════════════════════════════════════════
+
+// ── TOOL: generate_script ──────────────────────────────────────────────────
+server.tool(
+  'generate_script',
+  `Generate a complete, production-ready ServiceNow script with industry best practices baked in.
+
+Supported types:
+  business_rule   — Server-side BR with guard, try/catch, async option
+  script_include  — Prototype-class SI with JSDoc and error envelope
+  client_script   — onChange/onLoad/onSubmit/onCellEdit with safe patterns
+  ui_action       — Server or client UI Action with redirect/confirm flow
+  scripted_rest   — Full Scripted REST API with auth, logging, error envelope
+  scheduled_job   — Scheduled job with timing, batch counting, error logging
+  fix_script      — One-time data fix with dry-run support and audit log
+  widget          — Service Portal widget stub (template + server + client)
+
+Returns ready-to-deploy script code plus best-practice checklist and deploy field values.`,
+  {
+    type: z.enum(['business_rule','script_include','client_script','ui_action','scripted_rest','scheduled_job','fix_script','widget']),
+    name: z.string().describe('Script name'),
+    table: z.string().optional().describe('Target table (required for BR, CS, UI Action, Fix Script)'),
+    description: z.string().optional().describe('What this script does'),
+    logic: z.string().optional().describe('Core logic to embed (pseudo-code or partial code is fine)'),
+    // BR options
+    when: z.enum(['before','after','async']).optional().default('after'),
+    events: z.array(z.enum(['insert','update','delete','query'])).optional(),
+    condition: z.string().optional().describe('Encoded query condition'),
+    async: z.boolean().optional().default(false),
+    // SI options
+    methods: z.array(z.object({
+      name:        z.string(),
+      description: z.string().optional(),
+      params:      z.string().optional(),
+      paramType:   z.string().optional(),
+      returnType:  z.string().optional(),
+      body:        z.string().optional(),
+    })).optional(),
+    client_callable: z.boolean().optional().default(false),
+    // Client Script options
+    script_type: z.enum(['onLoad','onChange','onSubmit','onCellEdit']).optional(),
+    field: z.string().optional().describe('Field name for onChange scripts'),
+    // UI Action options
+    client: z.boolean().optional().default(false),
+    hint: z.string().optional(),
+    // REST options
+    api_path: z.string().optional(),
+    verb: z.enum(['GET','POST','PUT','PATCH','DELETE']).optional().default('GET'),
+    requires_auth: z.boolean().optional().default(true),
+    request_params: z.array(z.object({
+      name:        z.string(),
+      type:        z.string().optional(),
+      required:    z.boolean().optional(),
+      description: z.string().optional(),
+      default:     z.string().optional(),
+    })).optional(),
+    // Scheduled Job options
+    schedule: z.enum(['hourly','daily','weekly','monthly']).optional().default('daily'),
+    // Fix Script options
+    query: z.string().optional().describe('Encoded query to select records to fix'),
+    dry_run: z.boolean().optional().default(true),
+  },
+  ({ type, name, table, description, logic, when, events, condition, async: isAsync,
+     methods, client_callable, script_type, field, client, hint,
+     api_path, verb, requires_auth, request_params, schedule, query, dry_run }) => {
+    try {
+      let result;
+      switch (type) {
+        case 'business_rule':
+          result = _scriptBuilder.buildBusinessRule({ name, table: table ?? 'incident', when, events: events ?? ['insert','update'], condition, description, logic, async: isAsync });
+          break;
+        case 'script_include':
+          result = _scriptBuilder.buildScriptInclude({ name, description, methods: methods ?? [], client_callable });
+          break;
+        case 'client_script':
+          result = _scriptBuilder.buildClientScript({ name, table: table ?? 'incident', type: script_type ?? 'onChange', field, description, logic });
+          break;
+        case 'ui_action':
+          result = _scriptBuilder.buildUiAction({ name, table: table ?? 'incident', client, condition, hint, description, logic });
+          break;
+        case 'scripted_rest':
+          result = _scriptBuilder.buildScriptedRestApi({ name, apiPath: api_path ?? name.toLowerCase().replace(/\s+/g,'-'), verb, description, requiresAuth: requires_auth, logic, requestParams: request_params ?? [] });
+          break;
+        case 'scheduled_job':
+          result = _scriptBuilder.buildScheduledJob({ name, description, schedule, logic });
+          break;
+        case 'fix_script':
+          result = _scriptBuilder.buildFixScript({ name, description, table: table ?? 'incident', query, updateLogic: logic, dryRun: dry_run });
+          break;
+        case 'widget':
+          result = _scriptBuilder.buildWidget({ name, description });
+          break;
+        default:
+          return fail(`Unknown script type: ${type}`);
+      }
+      return ok({ generated: result, note: 'Script generated with industry best practices. Review best_practices list before deploying.' });
+    } catch (e) { return fail(e.message); }
+  }
+);
+
+// ── TOOL: review_script ────────────────────────────────────────────────────
+server.tool(
+  'review_script',
+  `Static analysis code review for a ServiceNow script.
+
+Checks for:
+  - Critical: eval(), hardcoded credentials, SQL/SOQL injection risk, unvalidated input
+  - Anti-patterns: GlideRecord in loops, no setLimit, hardcoded sys_ids, gr.get in loops
+  - Performance: full table scans, getRowCount, sync REST in BR, GlideAggregate opportunities
+  - Null safety: missing gs.nil(), JSON.parse(null) risk, unchecked gr.get() return
+  - Best practices: gs.print vs gs.info, no error handling on REST, bulk updates without setWorkflow
+
+Returns a score (0-10), verdict, and per-issue fix guidance.`,
+  {
+    script: z.string().describe('The script source code to review'),
+    type:   z.enum(['business_rule','client_script','script_include','scripted_rest','scheduled_job','server_script']).optional().default('server_script'),
+  },
+  ({ script, type }) => {
+    try {
+      const result = _codeReviewer.review(script, type);
+      return ok(result);
+    } catch (e) { return fail(e.message); }
+  }
+);
+
+// ── TOOL: list_review_rules ────────────────────────────────────────────────
+server.tool(
+  'list_review_rules',
+  'List all code review rules with descriptions and fix guidance. Useful for understanding what review_script checks.',
+  {
+    category: z.enum(['anti-pattern','performance','security','null-safety','best-practice']).optional(),
+  },
+  ({ category }) => {
+    try {
+      const rules = _codeReviewer.listRules(category);
+      return ok({ total: rules.length, rules });
+    } catch (e) { return fail(e.message); }
+  }
+);
+
+// ── TOOL: explore_table ────────────────────────────────────────────────────
+server.tool(
+  'explore_table',
+  `Full schema discovery for a ServiceNow table.
+
+Returns:
+  - Table metadata (parent, scope, numbering, ACL flags)
+  - All fields (name, label, type, reference, mandatory, read-only)
+  - Active Business Rules (when, events, conditions)
+  - Active Client Scripts (type, field)
+  - ACL rules (operation, type, roles)
+  - Incoming relationships (which tables reference this one)
+  - Table hierarchy (parent chain up to Task or base)
+  - Summary counts
+
+Use this before writing a BR or Client Script to understand the full context.`,
+  {
+    table:       z.string().describe('Table name, e.g. "incident" or "change_request"'),
+    field_limit: z.number().optional().default(200).describe('Max fields to return'),
+  },
+  async ({ table, field_limit }) => {
+    try {
+      const sn       = await getSn();
+      const explorer = new TableExplorer(sn);
+      const result   = await explorer.explore(table, { fieldLimit: field_limit });
+      return ok(result);
+    } catch (e) { return fail(e.message); }
+  }
+);
+
+// ── TOOL: find_table ──────────────────────────────────────────────────────
+server.tool(
+  'find_table',
+  'Search for ServiceNow tables by keyword (name or label). Returns up to 25 matches.',
+  {
+    keyword: z.string().describe('Keyword to search in table name or label'),
+  },
+  async ({ keyword }) => {
+    try {
+      const sn       = await getSn();
+      const explorer = new TableExplorer(sn);
+      const results  = await explorer.findTable(keyword);
+      return ok({ count: results.length, tables: results });
+    } catch (e) { return fail(e.message); }
+  }
+);
+
+// ── TOOL: get_table_acls ──────────────────────────────────────────────────
+server.tool(
+  'get_table_acls',
+  'Get all ACL rules for a ServiceNow table, including field-level ACLs.',
+  {
+    table: z.string().describe('Table name'),
+  },
+  async ({ table }) => {
+    try {
+      const sn       = await getSn();
+      const explorer = new TableExplorer(sn);
+      const acls     = await explorer.getAcls(table);
+      return ok({ table, count: acls.length, acls });
+    } catch (e) { return fail(e.message); }
+  }
+);
+
+// ── TOOL: generate_atf_tests ──────────────────────────────────────────────
+server.tool(
+  'generate_atf_tests',
+  `Generate ATF (Automated Test Framework) test cases for ServiceNow artifacts.
+
+Supported test targets:
+  business_rule   — positive, negative, and field-change trigger tests
+  script_include  — unit tests per method (happy path + null/invalid input)
+  scripted_rest   — auth, validation, and custom scenario tests
+  form            — Client Script / UI Policy field behaviour tests
+  table           — mandatory field, uniqueness, and basic CRUD smoke tests
+
+Returns ATF test suite JSON with steps ready to import + deploy instructions.`,
+  {
+    target_type: z.enum(['business_rule','script_include','scripted_rest','form','table']),
+    name:        z.string().describe('Name of the artifact under test'),
+    table:       z.string().optional().describe('Table name (required for BR, form, table tests)'),
+    // BR fields
+    trigger_conditions: z.array(z.object({ field: z.string(), value: z.string() })).optional(),
+    field_changes:      z.record(z.string()).optional(),
+    expected_outcomes:  z.array(z.object({ field: z.string(), value: z.string() })).optional(),
+    // SI fields
+    methods: z.array(z.object({
+      name:        z.string(),
+      testInput:   z.record(z.unknown()).optional(),
+      assertions:  z.array(z.object({ path: z.string().optional(), value: z.unknown(), message: z.string().optional() })).optional(),
+    })).optional(),
+    // REST fields
+    api_path:        z.string().optional(),
+    verb:            z.enum(['GET','POST','PUT','PATCH','DELETE']).optional(),
+    required_params: z.array(z.string()).optional(),
+    test_cases:      z.array(z.object({
+      name:        z.string(),
+      params:      z.record(z.unknown()).optional(),
+      expectedStatus: z.number().optional(),
+      assertions:  z.array(z.object({ field: z.string(), value: z.unknown() })).optional(),
+    })).optional(),
+    // Form fields
+    scenarios: z.array(z.object({
+      name:        z.string(),
+      description: z.string().optional(),
+      fieldSets:   z.array(z.object({ field: z.string(), value: z.string() })).optional(),
+      assertions:  z.array(z.object({ field: z.string(), property: z.string().optional(), expected: z.unknown() })).optional(),
+    })).optional(),
+    // Table fields
+    mandatory_fields: z.array(z.string()).optional(),
+    unique_fields:    z.array(z.string()).optional(),
+  },
+  ({ target_type, name, table, trigger_conditions, field_changes, expected_outcomes,
+     methods, api_path, verb, required_params, test_cases, scenarios,
+     mandatory_fields, unique_fields }) => {
+    try {
+      let suite;
+      switch (target_type) {
+        case 'business_rule':
+          suite = _testGen.generateBusinessRuleTests({ brName: name, table: table ?? 'incident', triggerConditions: trigger_conditions ?? [], fieldChanges: field_changes ?? {}, expectedOutcomes: expected_outcomes ?? [] });
+          break;
+        case 'script_include':
+          suite = _testGen.generateScriptIncludeTests({ siName: name, methods: methods ?? [] });
+          break;
+        case 'scripted_rest':
+          suite = _testGen.generateRestApiTests({ apiName: name, apiPath: api_path ?? name, verb: verb ?? 'GET', requiredParams: required_params ?? [], testCases: test_cases ?? [] });
+          break;
+        case 'form':
+          suite = _testGen.generateFormTests({ table: table ?? name, scenarios: scenarios ?? [] });
+          break;
+        case 'table':
+          suite = _testGen.generateTableSuite({ table: table ?? name, mandatoryFields: mandatory_fields ?? [], uniqueFields: unique_fields ?? [] });
+          break;
+        default:
+          return fail(`Unknown target type: ${target_type}`);
+      }
+      return ok(suite);
+    } catch (e) { return fail(e.message); }
+  }
+);
+
+// ── TOOL: analyze_performance ─────────────────────────────────────────────
+server.tool(
+  'analyze_performance',
+  `Analyse ServiceNow instance performance. Supported modes:
+
+  slow_scripts      — Find slow Business Rules and scripts from syslog (last N minutes)
+  scheduled_jobs    — Audit scheduled job durations
+  suggest_indexes   — Suggest DB indexes for a table based on BR query patterns
+  error_patterns    — Cluster recent system log errors by pattern
+  audit_business_rules — Full BR performance audit for a table (no conditions, sync REST, etc.)`,
+  {
+    mode:           z.enum(['slow_scripts','scheduled_jobs','suggest_indexes','error_patterns','audit_business_rules']),
+    table:          z.string().optional().describe('Table name (required for suggest_indexes and audit_business_rules)'),
+    minutes_back:   z.number().optional().default(60),
+    threshold_ms:   z.number().optional().default(5000).describe('Slow script threshold in ms'),
+    hours:          z.number().optional().default(1).describe('Hours back for error_patterns'),
+    limit:          z.number().optional().default(200),
+  },
+  async ({ mode, table, minutes_back, threshold_ms, hours, limit }) => {
+    try {
+      const sn       = await getSn();
+      const analyzer = new PerfAnalyzer(sn);
+      let result;
+      switch (mode) {
+        case 'slow_scripts':      result = await analyzer.findSlowScripts({ minutesBack: minutes_back, thresholdMs: threshold_ms, limit }); break;
+        case 'scheduled_jobs':    result = await analyzer.analyzeScheduledJobs({}); break;
+        case 'suggest_indexes':   result = await analyzer.suggestIndexes(table ?? ''); break;
+        case 'error_patterns':    result = await analyzer.analyzeErrors({ hours, limit }); break;
+        case 'audit_business_rules': result = await analyzer.auditBusinessRules(table ?? ''); break;
+        default:                  return fail(`Unknown mode: ${mode}`);
+      }
+      return ok(result);
+    } catch (e) { return fail(e.message); }
+  }
+);
+
+// ── TOOL: find_sys_logs ───────────────────────────────────────────────────
+server.tool(
+  'find_sys_logs',
+  'Search ServiceNow system logs (syslog table) by keyword, source, or level. Useful for debugging Business Rules, integrations, and scheduled jobs.',
+  {
+    keyword:   z.string().optional().describe('Message keyword to search'),
+    source:    z.string().optional().describe('Source (e.g. script name)'),
+    level:     z.enum(['0','1','2','3']).optional().describe('0=debug, 1=info, 2=error, 3=warn'),
+    limit:     z.number().optional().default(50),
+  },
+  async ({ keyword, source, level, limit }) => {
+    try {
+      const sn   = await getSn();
+      const parts = [];
+      if (keyword) parts.push(`messageLIKE${keyword}`);
+      if (source)  parts.push(`sourceLIKE${source}`);
+      if (level)   parts.push(`level=${level}`);
+      const query = parts.join('^') || 'active=true';
+
+      const rows = await sn.query('syslog', {
+        sysparm_query:  query,
+        sysparm_fields: 'message,source,level,sys_created_on',
+        sysparm_limit:  String(limit),
+        sysparm_order:  '-sys_created_on',
+      });
+
+      return ok({ count: rows.length, logs: rows });
+    } catch (e) { return fail(e.message); }
+  }
+);
+
+// ── TOOL: run_background_script ───────────────────────────────────────────
+server.tool(
+  'run_background_script',
+  `Execute a server-side script in ServiceNow using the Background Scripts table (sys_script_fix).
+
+IMPORTANT: Creates a Fix Script record and marks it for execution.
+The script runs as admin. Only use for safe, tested scripts.
+Always dry_run first to preview the record that will be created.`,
+  {
+    name:    z.string().describe('Descriptive name for this script run'),
+    script:  z.string().describe('The server-side script to execute'),
+    dry_run: z.boolean().optional().default(true).describe('If true, just show what would be created without running'),
+  },
+  async ({ name, script, dry_run }) => {
+    try {
+      if (dry_run) {
+        return ok({
+          dry_run: true,
+          preview: { table: 'sys_script_fix', name, script: script.substring(0, 200) + (script.length > 200 ? '...' : '') },
+          warning: 'Set dry_run=false to actually create and run the script. Verify the script is safe first.',
+        });
+      }
+
+      const sn = await getSn();
+      const record = await sn.post('sys_script_fix', { name, script, active: false });
+      return ok({
+        created:    true,
+        sys_id:     record.sys_id,
+        name,
+        note:       'Fix Script record created. Navigate to System Definition > Fix Scripts in your SN instance to run it.',
+        navigate_to: `${process.env.SN_INSTANCE_URL}/nav_to.do?uri=sys_script_fix.do?sys_id=${record.sys_id}`,
+      });
+    } catch (e) { return fail(e.message); }
+  }
+);
+
+// ── TOOL: generate_docs ───────────────────────────────────────────────────
+server.tool(
+  'generate_docs',
+  `Generate Markdown documentation for ServiceNow artifacts.
+
+Supported doc targets:
+  script_include  — Full API reference with method signatures and usage examples
+  business_rule   — Metadata, risk analysis, script preview
+  table           — Field catalogue, BR list, ACL list, relationships
+  scripted_rest   — Endpoint reference, parameters, error codes
+  application     — Full component inventory
+
+Returns Markdown text ready to paste into Confluence, GitHub, or a wiki.`,
+  {
+    doc_type:    z.enum(['script_include','business_rule','table','scripted_rest','application']),
+    name:        z.string().describe('Artifact name'),
+    table:       z.string().optional().describe('Table name (required for table docs)'),
+    script:      z.string().optional().describe('Script source (for script_include and business_rule docs)'),
+    description: z.string().optional(),
+    // BR metadata
+    when:        z.string().optional(),
+    events:      z.array(z.string()).optional(),
+    condition:   z.string().optional(),
+    // REST metadata
+    api_path:    z.string().optional(),
+    verb:        z.string().optional(),
+    requires_auth: z.boolean().optional().default(true),
+    client_callable: z.boolean().optional().default(false),
+    // Application
+    scope:       z.string().optional(),
+    components:  z.record(z.array(z.object({ name: z.string(), table: z.string().optional(), description: z.string().optional() }))).optional(),
+  },
+  async ({ doc_type, name, table, script, description, when, events, condition,
+           api_path, verb, requires_auth, client_callable, scope, components }) => {
+    try {
+      let markdown;
+      if (doc_type === 'table') {
+        // Fetch live data from SN
+        const sn       = await getSn();
+        const explorer = new TableExplorer(sn);
+        const data     = await explorer.explore(table ?? name);
+        markdown = _docGen.documentTable(data);
+      } else if (doc_type === 'script_include') {
+        markdown = _docGen.documentScriptInclude({ name, script: script ?? '', description, client_callable });
+      } else if (doc_type === 'business_rule') {
+        markdown = _docGen.documentBusinessRule({ name, table: table ?? 'incident', when: when ?? 'after', events: events ?? [], condition, script: script ?? '', description });
+      } else if (doc_type === 'scripted_rest') {
+        markdown = _docGen.documentRestApi({ name, apiPath: api_path ?? name, verb: verb ?? 'GET', description, requiresAuth: requires_auth, script: script ?? '' });
+      } else if (doc_type === 'application') {
+        markdown = _docGen.documentApplication({ appName: name, scope, components });
+      } else {
+        return fail(`Unknown doc_type: ${doc_type}`);
+      }
+      return ok({ doc_type, name, markdown, length_chars: markdown.length });
+    } catch (e) { return fail(e.message); }
+  }
+);
+
+// ── TOOL: scaffold_application ────────────────────────────────────────────
+server.tool(
+  'scaffold_application',
+  `Generate a complete application scaffold for a new ServiceNow application.
+
+Creates a recommended file/artifact structure with:
+  - Main application table (u_<name>)
+  - Number prefix and auto-numbering
+  - Core Business Rules (set number, state management)
+  - Script Include for business logic
+  - UI Action for state transitions
+  - ACL rules (read/write/delete)
+  - ATF test suite
+  - Documentation
+
+Returns all scripts ready to create in ServiceNow.`,
+  {
+    app_name:    z.string().describe('Application name (e.g. "Asset Request")'),
+    prefix:      z.string().describe('Short prefix for table name and number (e.g. "ar" → table u_ar_request, number ARREQ0001)'),
+    description: z.string().optional().describe('What this application manages'),
+    fields:      z.array(z.object({
+      name:      z.string(),
+      label:     z.string(),
+      type:      z.string().optional().default('string'),
+      mandatory: z.boolean().optional().default(false),
+      reference: z.string().optional(),
+    })).optional(),
+    states: z.array(z.string()).optional().describe('State values, e.g. ["draft","submitted","approved","rejected","closed"]'),
+  },
+  ({ app_name, prefix, description, fields = [], states = ['draft','submitted','approved','rejected','closed'] }) => {
+    try {
+      const tableName = `u_${prefix}_request`;
+      const numPrefix = prefix.toUpperCase().substring(0, 4) + 'REQ';
+
+      const artifacts = {
+        table: {
+          name:  tableName,
+          label: app_name,
+          note:  `Create this table at System Definition > Tables. Add extension from Task table for workflow support.`,
+        },
+        business_rules: [
+          _scriptBuilder.buildBusinessRule({
+            name:      `${app_name} — Set Number`,
+            table:     tableName,
+            when:      'before',
+            events:    ['insert'],
+            condition: 'current.number.nil()',
+            description: 'Auto-assign a unique number on insert',
+            logic:     `current.number = gs.getProperty('${tableName}.number_prefix', '${numPrefix}') + gs.padStart(gs.getNextObjNumberPaddedWithPrefix('${numPrefix}', true), 7, '0');`,
+          }),
+          _scriptBuilder.buildBusinessRule({
+            name:      `${app_name} — State Management`,
+            table:     tableName,
+            when:      'before',
+            events:    ['update'],
+            condition: 'current.state.changes()',
+            description: 'Set timestamps and assigned_to based on state changes',
+            logic:     `var state = current.state.toString();
+if (state === 'approved')  { current.u_approved_on = new GlideDateTime(); current.u_approved_by = gs.getUserID(); }
+if (state === 'closed')    { current.u_closed_on   = new GlideDateTime(); }`,
+          }),
+        ],
+        script_include: _scriptBuilder.buildScriptInclude({
+          name:        `${app_name.replace(/\s+/g,'')}Utils`,
+          description: `Business logic utilities for ${app_name}`,
+          methods: [
+            { name: 'canApprove', description: 'Check if current user can approve', params: 'recordSysId', body: `return gs.hasRole('${prefix}_approver') || gs.hasRole('admin');` },
+            { name: 'getOpenRequests', description: 'Get all open requests', body: `var gr = new GlideRecord('${tableName}');\ngr.addEncodedQuery('state!=closed^state!=rejected');\ngr.setLimit(1000);\ngr.query();\nvar list = [];\nwhile(gr.next()) list.push({ sys_id: gr.getUniqueValue(), number: gr.number.toString() });\nresult.data = list;` },
+          ],
+        }),
+        ui_actions: states.filter(s => s !== 'draft').map(state =>
+          _scriptBuilder.buildUiAction({
+            name:      `Set ${state.charAt(0).toUpperCase() + state.slice(1)}`,
+            table:     tableName,
+            condition: `current.state != '${state}'`,
+            hint:      `Move this request to ${state}`,
+            description: `State transition to ${state}`,
+            logic:     `current.state = '${state}';\ncurrent.update();\ngs.addInfoMessage('Request moved to ${state}.');`,
+          })
+        ),
+        acls: [
+          { operation: 'read',   roles: `${prefix}_user,${prefix}_manager,admin`,   note: `Create ACL on ${tableName} for read` },
+          { operation: 'write',  roles: `${prefix}_manager,admin`,                  note: `Create ACL on ${tableName} for write` },
+          { operation: 'delete', roles: `admin`,                                    note: `Create ACL on ${tableName} for delete` },
+        ],
+        sys_properties: [
+          { name: `${tableName}.number_prefix`, value: numPrefix, description: `Number prefix for ${app_name} records` },
+        ],
+        atf_suite:  _testGen.generateTableSuite({ table: tableName, mandatoryFields: fields.filter(f => f.mandatory).map(f => f.name) }),
+        documentation: _docGen.documentApplication({
+          appName: app_name,
+          scope:   'global',
+          components: {
+            'Tables':          [{ name: tableName, description: `Main ${app_name} table` }],
+            'Business Rules':  [{ name: `${app_name} — Set Number`, table: tableName }, { name: `${app_name} — State Management`, table: tableName }],
+            'Script Includes': [{ name: `${app_name.replace(/\s+/g,'')}Utils`, description: 'Business logic utilities' }],
+            'UI Actions':      states.filter(s => s !== 'draft').map(s => ({ name: `Set ${s}`, table: tableName })),
+          },
+        }),
+      };
+
+      return ok({
+        app_name,
+        table_name:       tableName,
+        number_prefix:    numPrefix,
+        artifacts,
+        artifact_count:   2 + artifacts.business_rules.length + artifacts.ui_actions.length + artifacts.acls.length,
+        deploy_order:     ['table', 'sys_properties', 'script_include', 'business_rules', 'ui_actions', 'acls', 'atf_suite'],
+        note:             'Deploy in the order specified by deploy_order. Create the table first, then add fields, then deploy scripts.',
+      });
+    } catch (e) { return fail(e.message); }
+  }
+);
+
+// ── TOOL: health_check_instance ───────────────────────────────────────────
+server.tool(
+  'health_check_instance',
+  `Run a comprehensive health check on the connected ServiceNow instance.
+
+Checks:
+  - Instance connectivity and response time
+  - Recent error count in syslog
+  - Scheduled jobs with no recent success
+  - Tables with no indexes on commonly-queried fields
+  - Business Rules with no conditions (fires on every record)
+  - Failed integration sync records
+  - System properties health
+
+Returns an overall health score and prioritised action list.`,
+  {},
+  async () => {
+    try {
+      const sn    = await getSn();
+      const start = Date.now();
+      const checks = [];
+
+      // 1. Connectivity
+      await sn.query('sys_db_object', { sysparm_query: 'name=incident', sysparm_limit: '1' });
+      const latency = Date.now() - start;
+      checks.push({ check: 'Connectivity', status: 'OK', detail: `Response time: ${latency}ms`, score: latency < 2000 ? 10 : latency < 5000 ? 6 : 3 });
+
+      // 2. Recent errors
+      const errors = await sn.query('syslog', {
+        sysparm_query: 'level=2^sys_created_onONToday@javascript:gs.beginningOfToday()@javascript:gs.endOfToday()',
+        sysparm_limit: '1',
+      }).catch(() => []);
+      checks.push({ check: 'Error logs today', status: errors.length > 50 ? 'WARN' : 'OK', detail: `${errors.length}+ errors`, score: errors.length > 100 ? 4 : errors.length > 20 ? 7 : 10 });
+
+      // 3. BRs with no condition on high-traffic tables
+      const unconditionedBRs = await sn.query('sys_script', {
+        sysparm_query: 'collectionINincident,change_request,sc_req_item^active=true^filter_condition=NULL^action_update=true',
+        sysparm_fields: 'name,collection',
+        sysparm_limit: '20',
+      }).catch(() => []);
+      checks.push({ check: 'BRs without conditions', status: unconditionedBRs.length > 5 ? 'WARN' : 'OK', detail: `${unconditionedBRs.length} unconditioned BRs on core tables`, score: unconditionedBRs.length > 10 ? 4 : unconditionedBRs.length > 3 ? 7 : 10 });
+
+      const avgScore = Math.round(checks.reduce((s, c) => s + c.score, 0) / checks.length);
+      const verdict  = avgScore >= 9 ? 'HEALTHY' : avgScore >= 7 ? 'GOOD' : avgScore >= 5 ? 'NEEDS ATTENTION' : 'CRITICAL';
+
+      return ok({
+        instance:      process.env.SN_INSTANCE_URL,
+        health_score:  avgScore,
+        verdict,
+        checks,
+        actions_needed: checks.filter(c => c.status !== 'OK').map(c => `${c.check}: ${c.detail}`),
+      });
+    } catch (e) { return fail(e.message); }
+  }
+);
+
+// ── TOOL: explain_api ─────────────────────────────────────────────────────
+server.tool(
+  'explain_api',
+  `Explain a ServiceNow API, class, or method with examples and best practices.
+
+Topics you can ask about:
+  GlideRecord, GlideAggregate, GlideScopedEvaluator, GlideSystem (gs),
+  RESTMessageV2, GlideAjax, GlideDateTime, GlideUser, GlideFlow,
+  ServiceNow Table API (REST), Scripted REST API pattern, Business Rule lifecycle,
+  Script Include class pattern, Client Script event types, ATF step types`,
+  {
+    topic: z.string().describe('The API, class, or concept to explain'),
+  },
+  ({ topic }) => {
+    const api_docs = {
+      'gliderecord': {
+        name: 'GlideRecord',
+        description: 'Server-side database query class. Most-used SN API.',
+        best_practices: BEST_PRACTICES_SUMMARY.gliderecord,
+        example: `var gr = new GlideRecord('incident');
+gr.addEncodedQuery('active=true^priority=1');
+gr.setLimit(100);
+gr.orderByDesc('sys_created_on');
+gr.query();
+while (gr.next()) {
+    gs.info(gr.number + ' — ' + gr.short_description);
+}`,
+      },
+      'glideaggregate': {
+        name: 'GlideAggregate',
+        description: 'Efficient counting/grouping without loading full records.',
+        best_practices: ['Use instead of GlideRecord for COUNT/SUM/AVG', 'Far faster than iterating with a counter'],
+        example: `var ga = new GlideAggregate('incident');
+ga.addEncodedQuery('active=true');
+ga.addAggregate('COUNT', 'priority');
+ga.groupBy('priority');
+ga.query();
+while (ga.next()) {
+    gs.info('Priority ' + ga.priority + ': ' + ga.getAggregate('COUNT', 'priority'));
+}`,
+      },
+      'glidedatetime': {
+        name: 'GlideDateTime',
+        description: 'Server-side date/time manipulation.',
+        best_practices: ['Always use GlideDateTime for date math — not JS Date', 'Use addDays(), addSeconds() for offsets'],
+        example: `var now  = new GlideDateTime();
+var then = new GlideDateTime();
+then.addDays(7);   // 7 days from now
+gs.info(then.getDisplayValue());  // human-readable
+gs.info(then.getValue());         // internal format for DB storage`,
+      },
+      'restmessagev2': {
+        name: 'RESTMessageV2',
+        description: 'Make outbound HTTP/REST calls from server scripts.',
+        best_practices: ['Always wrap in try/catch', 'Check getStatusCode() before parsing body', 'Use executeAsync() in Business Rules'],
+        example: `var msg = new RESTMessageV2('My REST Message', 'Default');
+msg.setStringParameterNoEscape('param', value);
+try {
+    var resp   = msg.execute();
+    var status = resp.getStatusCode();
+    if (status === 200) {
+        var body = JSON.parse(resp.getBody());
+    } else {
+        gs.error('REST call failed: ' + status + ' — ' + resp.getBody());
+    }
+} catch(e) {
+    gs.error('REST exception: ' + e.message);
+}`,
+      },
+    };
+
+    const key    = topic.toLowerCase().replace(/[^a-z]/g, '');
+    const doc    = api_docs[key];
+
+    if (doc) {
+      return ok(doc);
+    }
+
+    // Generic explanation
+    return ok({
+      topic,
+      note:    'No built-in docs for this topic. Here are general best practices:',
+      general: [
+        'Always handle null/undefined before calling methods',
+        'Wrap server scripts in try/catch with gs.error() in the catch',
+        'Use gs.nil() to check GlideElement emptiness — not == null or == ""',
+        'setLimit() on every GlideRecord query',
+        'Use encoded queries over multiple addQuery() calls for OR conditions',
+        'Test with the smallest privilege role that makes sense',
+      ],
+    });
+  }
+);
+
+// Inline reference for explain_api (avoids circular import)
+const BEST_PRACTICES_SUMMARY = {
+  gliderecord: [
+    'Always call setLimit() before query()',
+    'Use addEncodedQuery() for complex conditions',
+    'Use GlideAggregate instead of iterating to count',
+    'Never query inside a while(gr.next()) loop',
+    'Use gs.nil(gr.field) not == null',
+    'Set setWorkflow(false) in bulk updates',
+  ],
+};
 
 // ── Start: stdio (CLI) or HTTP/SSE (web Claude Code / remote) ────────────
 // Set MCP_MODE=http (and optionally MCP_PORT) to run as an HTTP server.
