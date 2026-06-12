@@ -3097,7 +3097,47 @@ server.tool(
   }
 );
 
-// ── Start ──────────────────────────────────────────────────────────────────
-const transport = new StdioServerTransport();
-await server.connect(transport);
-logger.info('sn-data-migration MCP server running');
+// ── Start: stdio (CLI) or HTTP/SSE (web Claude Code / remote) ────────────
+// Set MCP_MODE=http (and optionally MCP_PORT) to run as an HTTP server.
+// Default is stdio for local Claude Code CLI use.
+if (process.env.MCP_MODE === 'http') {
+  const { default: express } = await import('express');
+  const { SSEServerTransport } = await import('@modelcontextprotocol/sdk/server/sse.js');
+
+  const app  = express();
+  const port = parseInt(process.env.MCP_PORT ?? '3000', 10);
+  const clients = new Map();
+
+  app.use(express.json());
+
+  // Health check
+  app.get('/health', (_req, res) => res.json({ status: 'ok', server: 'sn-data-migration' }));
+
+  // SSE endpoint — web Claude Code connects here
+  app.get('/sse', async (req, res) => {
+    res.setHeader('Access-Control-Allow-Origin', '*');
+    const transport = new SSEServerTransport('/messages', res);
+    clients.set(transport.sessionId, transport);
+    res.on('close', () => clients.delete(transport.sessionId));
+    await server.connect(transport);
+    logger.info(`SSE client connected (session: ${transport.sessionId})`);
+  });
+
+  // Message endpoint — receives tool calls from the client
+  app.post('/messages', async (req, res) => {
+    const sessionId  = req.query.sessionId;
+    const transport  = clients.get(sessionId);
+    if (!transport) { res.status(404).json({ error: 'Session not found' }); return; }
+    await transport.handlePostMessage(req, res);
+  });
+
+  app.listen(port, () => {
+    logger.info(`sn-data-migration MCP server running in HTTP mode on port ${port}`);
+    logger.info(`SSE endpoint: http://localhost:${port}/sse`);
+  });
+} else {
+  // Default: stdio for Claude Code CLI
+  const transport = new StdioServerTransport();
+  await server.connect(transport);
+  logger.info('sn-data-migration MCP server running (stdio)');
+}

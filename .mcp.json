@@ -1,0 +1,9 @@
+{
+  "mcpServers": {
+    "sn-data-migration": {
+      "type": "http",
+      "url": "https://your-deployed-server.example.com/sse",
+      "description": "ServiceNow data migration & bidirectional integration MCP server"
+    }
+  }
+}
