@@ -4835,6 +4835,296 @@ Common use: adding custom states, priorities, categories, or types.`,
 );
 
 // ═══════════════════════════════════════════════════════════════════════════
+// DICTIONARY OVERRIDE TOOLS
+// ═══════════════════════════════════════════════════════════════════════════
+
+// ── TOOL: create_dictionary_override ─────────────────────────────────────
+server.tool(
+  'create_dictionary_override',
+  `Create or update a ServiceNow Dictionary Override on a child table.
+
+Dictionary overrides let you change how an inherited field behaves in a child table
+WITHOUT modifying the parent table's dictionary entry. This is the correct SN best
+practice for table extensions (e.g. incident extends task).
+
+IMPORTANT: Each override requires BOTH a value AND its matching override_X=true flag.
+This tool sets them correctly — doing it manually often silently fails.
+
+Supported overrides (specify any combination):
+  mandatory      — Make the field required in the child table (true/false)
+  default_value  — Set a different default value for the child table
+  column_label   — Rename the field label in the child table only
+  read_only      — Make the field read-only in the child table (true/false)
+  display        — Show or hide the field in the child table (true/false)
+  calculation    — Override a calculated field formula (script string)
+  choice         — Override the choice list (use create_choice to add child-table choices, then set this)
+  dependent      — Override the dependent field name
+
+Examples:
+  Make "business_service" mandatory on incident (but not on task):
+    table="incident"  field="business_service"  overrides={mandatory: true}
+
+  Set a different default priority on change_request than task:
+    table="change_request"  field="priority"  overrides={default_value: "3"}
+
+  Rename "caller_id" label to "Requested By" on sc_request:
+    table="sc_request"  field="caller_id"  overrides={column_label: "Requested By"}
+
+  Hide a parent field on a specific child table:
+    table="hr_case"  field="parent"  overrides={display: false}`,
+  {
+    table: z.string().describe('Child table name (e.g. "incident", "change_request", "hr_case")'),
+    field: z.string().describe('Field (element) name inherited from the parent table (e.g. "priority", "caller_id")'),
+    overrides: z.object({
+      mandatory:     z.boolean().optional().describe('true = required in child table'),
+      default_value: z.string().optional().describe('Default value for this field in the child table'),
+      column_label:  z.string().optional().describe('Override the field label shown to users'),
+      read_only:     z.boolean().optional().describe('true = read-only in child table'),
+      display:       z.boolean().optional().describe('false = hide field in child table'),
+      calculation:   z.string().optional().describe('Override calculated field script'),
+      choice:        z.boolean().optional().describe('true = activate choice override (add choices separately via create_choice)'),
+      dependent:     z.string().optional().describe('Override the dependent field name'),
+    }).describe('One or more override properties to apply'),
+    dry_run: z.boolean().optional().default(false).describe('Preview the payload without creating'),
+  },
+  async ({ table, field, overrides, dry_run }) => {
+    try {
+      // ── Validate: the field must exist on a parent table ─────────────────
+      const sn = await getSn();
+      const parentCheck = await sn.get('sys_dictionary', {
+        sysparm_query:  `name=${table}^element=${field}`,
+        sysparm_fields: 'element,name,column_label,internal_type,mandatory,default_value',
+        sysparm_limit:  '1',
+      });
+
+      // Also check if an override already exists
+      const existingOverride = await sn.get('sys_dictionary_override', {
+        sysparm_query:  `name=${table}^element=${field}`,
+        sysparm_fields: 'sys_id,name,element',
+        sysparm_limit:  '1',
+      });
+
+      // ── Build the payload ─────────────────────────────────────────────────
+      // Each override needs BOTH the value field AND override_X=true.
+      // Setting the value without the flag = silently ignored by SN.
+      const payload = { name: table, element: field };
+      const appliedOverrides = [];
+
+      if (overrides.mandatory !== undefined) {
+        payload.override_mandatory = true;
+        payload.mandatory          = overrides.mandatory;
+        appliedOverrides.push(`mandatory → ${overrides.mandatory}`);
+      }
+      if (overrides.default_value !== undefined) {
+        payload.override_default_value = true;
+        payload.default_value          = overrides.default_value;
+        appliedOverrides.push(`default_value → "${overrides.default_value}"`);
+      }
+      if (overrides.column_label !== undefined) {
+        payload.override_label = true;
+        payload.column_label   = overrides.column_label;
+        appliedOverrides.push(`column_label → "${overrides.column_label}"`);
+      }
+      if (overrides.read_only !== undefined) {
+        payload.override_read_only = true;
+        payload.read_only          = overrides.read_only;
+        appliedOverrides.push(`read_only → ${overrides.read_only}`);
+      }
+      if (overrides.display !== undefined) {
+        payload.override_display = true;
+        payload.display          = overrides.display;
+        appliedOverrides.push(`display → ${overrides.display}`);
+      }
+      if (overrides.calculation !== undefined) {
+        payload.override_calculation = true;
+        payload.calculation          = overrides.calculation;
+        appliedOverrides.push('calculation → (script)');
+      }
+      if (overrides.choice !== undefined) {
+        payload.override_choice = overrides.choice;
+        appliedOverrides.push(`choice override → ${overrides.choice}`);
+      }
+      if (overrides.dependent !== undefined) {
+        payload.override_dependent = true;
+        payload.dependent          = overrides.dependent;
+        appliedOverrides.push(`dependent → "${overrides.dependent}"`);
+      }
+
+      if (!appliedOverrides.length) {
+        return fail('No override properties specified. Provide at least one override (mandatory, default_value, column_label, read_only, display, calculation, choice, or dependent).');
+      }
+
+      const parentField = parentCheck[0] ?? null;
+      const existing    = existingOverride[0] ?? null;
+
+      if (dry_run) {
+        return ok({
+          dry_run:           true,
+          table,
+          field,
+          parent_field_found: !!parentField,
+          parent_definition:  parentField,
+          existing_override:  existing,
+          payload_to_deploy:  payload,
+          overrides_to_apply: appliedOverrides,
+          action:             existing ? 'PATCH (update existing override)' : 'POST (create new override)',
+          note:               'Set dry_run=false to apply.',
+        });
+      }
+
+      let result;
+      if (existing) {
+        // Update existing override
+        result = await sn.patch('sys_dictionary_override', existing.sys_id, payload);
+        return ok({
+          action:     'updated',
+          sys_id:     existing.sys_id,
+          table, field,
+          overrides_applied: appliedOverrides,
+          result,
+          note: 'Existing dictionary override updated. Changes take effect immediately (no cache clear needed).',
+        });
+      } else {
+        // Create new override
+        result = await sn.post('sys_dictionary_override', payload);
+        return ok({
+          action:     'created',
+          sys_id:     result?.sys_id,
+          table, field,
+          overrides_applied: appliedOverrides,
+          result,
+          note: 'Dictionary override created. Changes take effect immediately on the child table.',
+        });
+      }
+    } catch (e) { return fail(e.message); }
+  }
+);
+
+// ── TOOL: get_dictionary_overrides ───────────────────────────────────────
+server.tool(
+  'get_dictionary_overrides',
+  `List all dictionary overrides on a table, or find overrides for a specific field.
+
+Use this to audit what a child table has customised vs its parent, or to check
+whether an override already exists before creating one.
+
+Examples:
+  table="incident"                        — all overrides on incident
+  table="incident" field="priority"       — override for one specific field
+  field="mandatory" override_type="mandatory" — find all tables overriding mandatory`,
+  {
+    table:         z.string().optional().describe('Child table name to list overrides for'),
+    field:         z.string().optional().describe('Specific field (element) name'),
+    override_type: z.enum(['mandatory','default_value','column_label','read_only','display','calculation','choice','dependent','any']).optional().default('any'),
+  },
+  async ({ table, field, override_type }) => {
+    try {
+      const sn     = await getSn();
+      const parts  = [];
+      if (table) parts.push(`name=${table}`);
+      if (field) parts.push(`element=${field}`);
+
+      // Filter to only active overrides (where an override flag is actually set)
+      const overrideFlagMap = {
+        mandatory:     'override_mandatory=true',
+        default_value: 'override_default_value=true',
+        column_label:  'override_label=true',
+        read_only:     'override_read_only=true',
+        display:       'override_display=true',
+        calculation:   'override_calculation=true',
+        choice:        'override_choice=true',
+        dependent:     'override_dependent=true',
+      };
+      if (override_type && override_type !== 'any' && overrideFlagMap[override_type]) {
+        parts.push(overrideFlagMap[override_type]);
+      }
+
+      if (!parts.length) return fail('Provide at least a table or field to search.');
+
+      const rows = await sn.get('sys_dictionary_override', {
+        sysparm_query:  parts.join('^'),
+        sysparm_fields: 'sys_id,name,element,column_label,override_label,mandatory,override_mandatory,default_value,override_default_value,read_only,override_read_only,display,override_display,override_calculation,override_choice,override_dependent,dependent',
+        sysparm_limit:  '100',
+      });
+
+      const overrides = rows.map(r => {
+        const active = [];
+        if (r.override_mandatory    === 'true') active.push(`mandatory=${r.mandatory}`);
+        if (r.override_default_value === 'true') active.push(`default_value="${r.default_value}"`);
+        if (r.override_label        === 'true') active.push(`column_label="${r.column_label}"`);
+        if (r.override_read_only    === 'true') active.push(`read_only=${r.read_only}`);
+        if (r.override_display      === 'true') active.push(`display=${r.display}`);
+        if (r.override_calculation  === 'true') active.push('calculation=(script)');
+        if (r.override_choice       === 'true') active.push('choice=overridden');
+        if (r.override_dependent    === 'true') active.push(`dependent="${r.dependent}"`);
+        return {
+          sys_id:          r.sys_id,
+          table:           r.name,
+          field:           r.element,
+          active_overrides: active,
+          raw:             r,
+        };
+      });
+
+      return ok({
+        table,
+        field,
+        count:     overrides.length,
+        overrides,
+        note:      overrides.length === 0
+          ? 'No dictionary overrides found for the given criteria.'
+          : `Found ${overrides.length} override(s). Use create_dictionary_override to add or modify.`,
+      });
+    } catch (e) { return fail(e.message); }
+  }
+);
+
+// ── TOOL: delete_dictionary_override ─────────────────────────────────────
+server.tool(
+  'delete_dictionary_override',
+  `Delete a dictionary override, restoring the child table field to its parent table defaults.
+
+SAFETY: Requires confirm=true. Deleting an override immediately restores parent behaviour —
+e.g. if the override made the field mandatory, it will become optional again after deletion.
+
+Find the sys_id first with get_dictionary_overrides.`,
+  {
+    table:   z.string().describe('Child table name'),
+    field:   z.string().describe('Field (element) name'),
+    confirm: z.boolean().describe('Must be true to execute'),
+  },
+  async ({ table, field, confirm }) => {
+    try {
+      const sn = await getSn();
+      const rows = await sn.get('sys_dictionary_override', {
+        sysparm_query:  `name=${table}^element=${field}`,
+        sysparm_fields: 'sys_id,name,element,override_mandatory,override_label,override_default_value',
+        sysparm_limit:  '1',
+      });
+
+      if (!rows.length) return fail(`No dictionary override found for ${table}.${field}`);
+      const override = rows[0];
+
+      if (!confirm) {
+        return ok({
+          confirm_required: true,
+          preview:  { table, field, sys_id: override.sys_id, override },
+          warning:  `Set confirm=true to delete this override. The field "${field}" on "${table}" will revert to its parent table definition immediately.`,
+        });
+      }
+
+      await sn.delete('sys_dictionary_override', override.sys_id);
+      return ok({
+        deleted: true,
+        table, field,
+        sys_id:  override.sys_id,
+        note:    `Override deleted. "${field}" on "${table}" now inherits from parent table definition.`,
+      });
+    } catch (e) { return fail(e.message); }
+  }
+);
+
+// ═══════════════════════════════════════════════════════════════════════════
 // CRUD TOOLS — general-purpose Create / Read / Update / Delete
 // Covers ServiceNow, Jira, and Salesforce via a single unified interface.
 // Delete operations always require confirm=true to prevent accidents.
