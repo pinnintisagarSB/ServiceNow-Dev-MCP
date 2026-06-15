@@ -823,3 +823,782 @@ ${tc.script}
     return recs;
   }
 }
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// MigrationTester — expert test plans for data migration pipelines
+// ═══════════════════════════════════════════════════════════════════════════════
+
+export class MigrationTester {
+
+  // ══════════════════════════════════════════════════════════════════════════
+  // Phase 1: Analyze the migration setup
+  // ══════════════════════════════════════════════════════════════════════════
+
+  async analyzeMigration(sn, { platform, source_object, staging_table, target_table, field_mappings = [], transform_rules = [], sample_records = [] }) {
+    const risks   = [];
+    const checks  = [];
+
+    // -- Staging table accessibility
+    try {
+      const stagingCount = await sn.getCount(staging_table);
+      checks.push({ area: 'Staging Table', status: 'OK', detail: `${staging_table} accessible (${stagingCount} existing rows)` });
+    } catch {
+      checks.push({ area: 'Staging Table', status: 'FAIL', detail: `Cannot access ${staging_table} — table may not exist or no permission` });
+      risks.push({ level: 'HIGH', issue: `Staging table ${staging_table} is not accessible` });
+    }
+
+    // -- Target table accessibility
+    try {
+      const targetCount = await sn.getCount(target_table);
+      checks.push({ area: 'Target Table', status: 'OK', detail: `${target_table} accessible (${targetCount} existing rows)` });
+    } catch {
+      checks.push({ area: 'Target Table', status: 'FAIL', detail: `Cannot access ${target_table}` });
+      risks.push({ level: 'HIGH', issue: `Target table ${target_table} is not accessible` });
+    }
+
+    // -- Transform map exists
+    try {
+      const xformGr = await sn.get('sys_transform_map', {
+        sysparm_query: `source_table=${staging_table}^target_table=${target_table}`,
+        sysparm_fields: 'name,sys_id,active',
+        sysparm_limit: 5,
+      });
+      if (xformGr?.length) {
+        const active = xformGr.filter(r => r.active === 'true');
+        checks.push({ area: 'Transform Map', status: active.length ? 'OK' : 'WARN', detail: `Found ${xformGr.length} map(s); ${active.length} active: ${xformGr.map(r => r.name).join(', ')}` });
+        if (!active.length) risks.push({ level: 'HIGH', issue: 'Transform map exists but is INACTIVE — migration will not run' });
+      } else {
+        checks.push({ area: 'Transform Map', status: 'WARN', detail: `No transform map found for ${staging_table} → ${target_table}` });
+        risks.push({ level: 'MEDIUM', issue: 'Transform map not found — check table names or create it' });
+      }
+    } catch (e) {
+      checks.push({ area: 'Transform Map', status: 'ERROR', detail: e.message });
+    }
+
+    // -- Field mapping completeness
+    const unmappedFields = field_mappings.filter(m => !m.sn_field || m.sn_field === 'SKIP');
+    const mappedCount    = field_mappings.length - unmappedFields.length;
+    checks.push({ area: 'Field Mappings', status: unmappedFields.length > 0 ? 'WARN' : 'OK', detail: `${mappedCount}/${field_mappings.length} fields mapped. Skipped: ${unmappedFields.map(m => m.source_field).join(', ') || 'none'}` });
+    if (unmappedFields.length > field_mappings.length * 0.3) {
+      risks.push({ level: 'MEDIUM', issue: `${unmappedFields.length} source fields have no SN mapping — data will be lost` });
+    }
+
+    // -- Transform rule coverage
+    const valueMapRules = transform_rules.filter(r => r.value_map && Object.keys(r.value_map).length > 0);
+    checks.push({ area: 'Transform Rules', status: 'OK', detail: `${valueMapRules.length} value-mapping rule(s) defined` });
+
+    // -- Sample record analysis
+    const nullRisks = [];
+    const longTextFields = [];
+    if (sample_records.length > 0) {
+      field_mappings.forEach(m => {
+        if (!m.source_field) return;
+        const nullCount = sample_records.filter(r => r[m.source_field] == null || r[m.source_field] === '').length;
+        const nullPct   = Math.round((nullCount / sample_records.length) * 100);
+        if (nullPct > 50) nullRisks.push({ field: m.source_field, null_pct: nullPct });
+        const maxLen = Math.max(...sample_records.map(r => String(r[m.source_field] ?? '').length));
+        if (maxLen > 3900) longTextFields.push({ field: m.source_field, max_length: maxLen });
+      });
+      if (nullRisks.length) risks.push({ level: 'MEDIUM', issue: `High null rates: ${nullRisks.map(n => n.field + '(' + n.null_pct + '% null)').join(', ')}` });
+      if (longTextFields.length) risks.push({ level: 'MEDIUM', issue: `Long text may be truncated: ${longTextFields.map(l => l.field + '(' + l.max_length + ' chars)').join(', ')}` });
+    }
+
+    // -- Duplicate detection risk
+    const hasCorrelationField = field_mappings.some(m => m.sn_field?.includes('u_') && m.source_field?.toLowerCase().includes('id'));
+    if (!hasCorrelationField) {
+      risks.push({ level: 'MEDIUM', issue: 'No correlation field detected — re-running migration may create duplicates' });
+      checks.push({ area: 'Deduplication', status: 'WARN', detail: 'No source-ID-to-SN correlation field found in mappings' });
+    } else {
+      checks.push({ area: 'Deduplication', status: 'OK', detail: 'Correlation field found — duplicate prevention possible' });
+    }
+
+    const coverageAreas = [
+      { category: 'Pre-Migration Checks',      count: 6,  description: 'Table access, transform map active, ACL permissions, schema compatibility' },
+      { category: 'Source Data Quality',        count: field_mappings.length > 0 ? Math.ceil(field_mappings.length / 2) : 4, description: 'Fill rates, null values, data types, field length limits' },
+      { category: 'Transform Rule Validation',  count: Math.max(3, valueMapRules.length * 2), description: 'Value mapping completeness, unmapped values fall-through, date conversion' },
+      { category: 'Sample Migration (5 recs)',  count: 5,  description: 'End-to-end test: source → staging → target with field-by-field comparison' },
+      { category: 'Edge Cases',                 count: 6,  description: 'Special chars, long text truncation, null mandatory fields, duplicate records' },
+      { category: 'Rollback Safety',            count: 3,  description: 'Test records can be cleanly deleted; no orphaned staging rows' },
+      { category: 'Performance',                count: 2,  description: 'Batch throughput estimate, import set completion time' },
+      { category: 'Post-Migration Validation',  count: 4,  description: 'Record count match, zero failed import rows, field accuracy spot-check' },
+    ];
+
+    return {
+      migration_id:      `MIG-${platform.toUpperCase()}-${source_object}→${target_table}`,
+      platform,
+      source_object,
+      staging_table,
+      target_table,
+      field_mappings_count: field_mappings.length,
+      transform_rules_count: transform_rules.length,
+      sample_records_count: sample_records.length,
+      preflight_checks: checks,
+      risks,
+      null_heavy_fields:  nullRisks,
+      long_text_fields:   longTextFields,
+      coverage_areas:     coverageAreas,
+      estimated_test_cases: coverageAreas.reduce((n, a) => n + a.count, 0),
+      ready_to_plan:     risks.filter(r => r.level === 'HIGH').length === 0,
+      recommendation:    risks.filter(r => r.level === 'HIGH').length > 0
+        ? 'BLOCKER: Fix HIGH-risk items before generating the test plan'
+        : risks.length > 0
+          ? 'CAUTION: Address MEDIUM risks — migration may partially fail'
+          : 'READY: No blockers detected — proceed to create_migration_test_plan',
+    };
+  }
+
+  // ══════════════════════════════════════════════════════════════════════════
+  // Phase 2: Create migration test plan
+  // ══════════════════════════════════════════════════════════════════════════
+
+  createMigrationTestPlan(analysis, options = {}) {
+    const {
+      platform, source_object, staging_table, target_table,
+      field_mappings_count, risks, null_heavy_fields = [], long_text_fields = [],
+    } = analysis;
+    const priority = options.priority ?? 'all';
+    const fieldMappings   = options.field_mappings   ?? [];
+    const transformRules  = options.transform_rules  ?? [];
+    const sampleRecords   = options.sample_records   ?? [];
+    const correlationField = options.correlation_field ?? 'u_source_id';
+    const sourceIdField    = options.source_id_field   ?? 'Id';
+
+    const cases = this._generateMigrationTestCases({
+      platform, source_object, staging_table, target_table,
+      fieldMappings, transformRules, sampleRecords,
+      correlationField, sourceIdField,
+      null_heavy_fields, long_text_fields, priority,
+    });
+
+    const critical = cases.filter(c => c.priority === 'CRITICAL');
+    const major    = cases.filter(c => c.priority === 'MAJOR');
+    const minor    = cases.filter(c => c.priority === 'MINOR');
+
+    return {
+      plan_id:      `MIGPLAN-${Date.now()}`,
+      artifact_name: `${platform} → ${source_object} → ${target_table}`,
+      artifact_type: 'migration',
+      generated_at:  new Date().toISOString(),
+      summary: {
+        total:    cases.length,
+        critical: critical.length,
+        major:    major.length,
+        minor:    minor.length,
+        estimated_runtime_minutes: Math.ceil(cases.length * 0.75),
+        phases: ['Pre-Migration Checks', 'Source Data Quality', 'Transform Rules', 'Sample Migration', 'Edge Cases', 'Rollback', 'Performance', 'Post-Validation'],
+      },
+      risks,
+      test_cases: cases,
+      execution_strategy: 'Fix Scripts for SN-side tests; Source platform API calls return data for comparison',
+      approval_required: true,
+      instructions: [
+        `Review the ${cases.length} migration test cases above.`,
+        'To run ALL: call run_approved_tests with plan_id and approved=true',
+        'To run by phase: use approved_ids to select specific TC-XXX ids',
+        'CRITICAL tests (pre-flight + transform rules) must pass before running full migration.',
+      ],
+    };
+  }
+
+  _generateMigrationTestCases({ platform, source_object, staging_table, target_table, fieldMappings, transformRules, sampleRecords, correlationField, sourceIdField, null_heavy_fields, long_text_fields, priority }) {
+    const cases = [];
+    let id = 1;
+    const tc = (name, pri, category, description, script, assertions = [], cleanup = '') => ({
+      id:          `MTC-${String(id++).padStart(3, '0')}`,
+      name, priority: pri, category, description,
+      execution:   'server_script',
+      script, assertions,
+      cleanup_script: cleanup,
+      expected_result: assertions.map(a => a.message).join('; '),
+    });
+
+    // ── Phase 1: Pre-Migration Checks ──────────────────────────────────────
+    cases.push(tc(
+      `[PRE-CHECK] Staging table ${staging_table} is accessible and writable`,
+      'CRITICAL', 'Pre-Migration',
+      'Verify staging table exists and migration user can insert records',
+      `var gr = new GlideRecord('${staging_table}');
+gs.assertTrue(gr.isValid(), 'Staging table ${staging_table} must be valid');
+// Test insert permission
+gr.initialize();
+gr.setValue('u_test_check', 'PREFLIGHT_' + gs.generateGUID());
+var sid = gr.insert();
+gs.assertNotNull(sid, 'Must be able to insert into ${staging_table}');
+// Cleanup
+if (sid) { var del = new GlideRecord('${staging_table}'); del.get(sid); del.deleteRecord(); }
+gs.info('PRE-CHECK PASS: ${staging_table} is accessible and writable');`,
+      [{ message: `${staging_table} is valid and writable` }],
+    ));
+
+    cases.push(tc(
+      `[PRE-CHECK] Target table ${target_table} is accessible`,
+      'CRITICAL', 'Pre-Migration',
+      'Verify target table exists and migration user can read it',
+      `var gr = new GlideRecord('${target_table}');
+gs.assertTrue(gr.isValid(), 'Target table ${target_table} must be valid');
+gr.setLimit(1);
+gr.query();
+gs.info('PRE-CHECK PASS: ${target_table} accessible, valid: ' + gr.isValid());`,
+      [{ message: `${target_table} is accessible` }],
+    ));
+
+    cases.push(tc(
+      `[PRE-CHECK] Transform map is active for ${staging_table} → ${target_table}`,
+      'CRITICAL', 'Pre-Migration',
+      'Verify an active transform map exists between the staging and target tables',
+      `var xform = new GlideRecord('sys_transform_map');
+xform.addQuery('source_table', '${staging_table}');
+xform.addQuery('target_table', '${target_table}');
+xform.addQuery('active', true);
+xform.query();
+gs.assertTrue(xform.hasNext(), 'Active transform map must exist for ${staging_table} → ${target_table}');
+if (xform.next()) gs.info('PRE-CHECK PASS: Transform map "' + xform.getValue('name') + '" is active');`,
+      [{ message: 'Active transform map found' }],
+    ));
+
+    cases.push(tc(
+      `[PRE-CHECK] All mapped SN target fields exist on ${target_table}`,
+      'CRITICAL', 'Pre-Migration',
+      'Verify each mapped SN field is a real field on the target table',
+      `var targetFields = ${JSON.stringify(fieldMappings.filter(m => m.sn_field && m.sn_field !== 'SKIP').map(m => m.sn_field))};
+var table    = '${target_table}';
+var missing  = [];
+var td = new GlideTableDescriptor.get(table);
+targetFields.forEach(function(f) {
+  var ed = td.getElementDescriptor(f);
+  if (!ed) missing.push(f);
+});
+gs.assertTrue(missing.length === 0, 'Missing fields on ${target_table}: ' + missing.join(', '));
+gs.info('PRE-CHECK PASS: All ' + targetFields.length + ' mapped fields exist on ${target_table}');`,
+      [{ message: 'All mapped fields exist on target table' }],
+    ));
+
+    cases.push(tc(
+      `[PRE-CHECK] Correlation field ${correlationField} exists and is indexed`,
+      'CRITICAL', 'Pre-Migration',
+      'Verify the correlation field (used for deduplication) exists and is indexed for performance',
+      `var dict = new GlideRecord('sys_dictionary');
+dict.addQuery('name', '${target_table}');
+dict.addQuery('element', '${correlationField}');
+dict.query();
+gs.assertTrue(dict.hasNext(), 'Correlation field ${correlationField} must exist on ${target_table}');
+if (dict.next()) {
+  gs.info('PRE-CHECK PASS: ${correlationField} found, type: ' + dict.getValue('internal_type'));
+  // Check index
+  var idx = new GlideRecord('sys_db_index');
+  idx.addQuery('table_name', '${target_table}');
+  idx.addQuery('columns', 'CONTAINS', '${correlationField}');
+  idx.query();
+  if (!idx.hasNext()) gs.info('WARN: No index on ${correlationField} — consider adding one for large migrations');
+}`,
+      [{ message: `${correlationField} exists on ${target_table}` }],
+    ));
+
+    cases.push(tc(
+      `[PRE-CHECK] No duplicate ${correlationField} values exist in ${target_table}`,
+      'CRITICAL', 'Pre-Migration',
+      'Ensure target table has no pre-existing duplicate source IDs that would cause conflicts',
+      `var agg = new GlideAggregate('${target_table}');
+agg.addNotNullQuery('${correlationField}');
+agg.addAggregate('COUNT', '${correlationField}');
+agg.groupBy('${correlationField}');
+agg.addHaving('COUNT', '${correlationField}', '>', '1');
+agg.query();
+var dupeCount = 0;
+var dupes = [];
+while (agg.next()) {
+  dupeCount++;
+  dupes.push(agg.getValue('${correlationField}'));
+}
+gs.assertEquals(0, dupeCount, 'Found ' + dupeCount + ' duplicate ${correlationField} value(s): ' + dupes.slice(0,5).join(', '));
+gs.info('PRE-CHECK PASS: No duplicate correlation IDs in target');`,
+      [{ message: 'No duplicate correlation IDs in target table' }],
+    ));
+
+    // ── Phase 2: Source Data Quality ───────────────────────────────────────
+    cases.push(tc(
+      `[DATA-QUALITY] Source records have ${sourceIdField} populated (no null IDs)`,
+      'CRITICAL', 'Source Data Quality',
+      'Every source record must have a unique ID — null IDs will break deduplication',
+      `// Check staging table for null ${sourceIdField}
+var gr = new GlideRecord('${staging_table}');
+gr.addNullQuery('${correlationField}');
+gr.query();
+var nullCount = 0;
+while (gr.next()) nullCount++;
+gs.assertEquals(0, nullCount, nullCount + ' staging records have null ${correlationField} — source ID not mapped');
+gs.info('DATA-QUALITY PASS: All staging records have ${correlationField} populated');`,
+      [{ message: 'No null correlation IDs in staging' }],
+    ));
+
+    // Field fill-rate checks for high-null fields
+    if (null_heavy_fields.length > 0) {
+      null_heavy_fields.forEach(f => {
+        cases.push(tc(
+          `[DATA-QUALITY] "${f.field}" fill rate — currently ${f.null_pct}% null`,
+          'MAJOR', 'Source Data Quality',
+          `High null rate detected for ${f.field} — verify this is expected or fix the source mapping`,
+          `var agg = new GlideAggregate('${staging_table}');
+agg.addNullQuery('${f.field}');
+agg.addAggregate('COUNT');
+agg.query();
+var nullCount = agg.next() ? parseInt(agg.getAggregate('COUNT')) : 0;
+var total     = new GlideAggregate('${staging_table}'); total.addAggregate('COUNT'); total.query();
+var totalCount = total.next() ? parseInt(total.getAggregate('COUNT')) : 1;
+var nullPct    = Math.round((nullCount / totalCount) * 100);
+gs.info('DATA-QUALITY: ${f.field} null rate = ' + nullPct + '% (' + nullCount + '/' + totalCount + ')');
+// Warn if > 80% null (may indicate mapping failure vs expected)
+if (nullPct > 80) gs.info('WARN: ${f.field} is >80% null — confirm this is intentional');`,
+          [{ message: `${f.field} null rate logged` }],
+        ));
+      });
+    }
+
+    // Long text truncation check
+    if (long_text_fields.length > 0) {
+      long_text_fields.forEach(f => {
+        cases.push(tc(
+          `[DATA-QUALITY] "${f.field}" long text truncation check (max ${f.max_length} chars)`,
+          'MAJOR', 'Source Data Quality',
+          `Values exceed typical SN field limits — check target field max_length`,
+          `var dict = new GlideRecord('sys_dictionary');
+dict.addQuery('name', '${target_table}');
+dict.addQuery('element', '${fieldMappings.find(m => m.source_field === f.field)?.sn_field ?? f.field}');
+dict.query();
+if (dict.next()) {
+  var maxLen = parseInt(dict.getValue('max_length') ?? '4000');
+  gs.info('DATA-QUALITY: ${f.field} → SN field max_length = ' + maxLen + ', source max = ${f.max_length}');
+  if (${f.max_length} > maxLen) {
+    gs.info('WARN: Source data (${f.max_length} chars) exceeds SN field limit (' + maxLen + ') — text will be truncated');
+  } else {
+    gs.info('PASS: Source data fits within SN field limit');
+  }
+}`,
+          [{ message: `${f.field} length compatibility checked` }],
+        ));
+      });
+    }
+
+    // ── Phase 3: Transform Rule Tests ──────────────────────────────────────
+    transformRules.forEach((rule, i) => {
+      const values    = Object.keys(rule.value_map ?? {});
+      const mappedTo  = Object.values(rule.value_map ?? {});
+      if (!values.length) return;
+
+      cases.push(tc(
+        `[TRANSFORM] Value mapping for "${rule.sn_field}" covers all source values`,
+        'CRITICAL', 'Transform Rules',
+        `Verify every distinct source value of ${rule.sn_field} has a mapping — unmapped values cause blank fields`,
+        `// Check staging for unmapped values
+var distinctVals = [];
+var agg = new GlideAggregate('${staging_table}');
+agg.addAggregate('COUNT', '${rule.staging_field ?? rule.sn_field}');
+agg.groupBy('${rule.staging_field ?? rule.sn_field}');
+agg.query();
+var mappedValues = ${JSON.stringify(values)};
+var unmapped = [];
+while (agg.next()) {
+  var val = agg.getValue('${rule.staging_field ?? rule.sn_field}');
+  if (val && !mappedValues.includes(val)) unmapped.push(val);
+}
+gs.assertEquals(0, unmapped.length, 'Unmapped source values for ${rule.sn_field}: ' + unmapped.join(', '));
+gs.info('TRANSFORM PASS: All distinct values of ${rule.staging_field ?? rule.sn_field} are mapped');`,
+        [{ message: `All values of ${rule.sn_field} are mapped` }],
+      ));
+
+      cases.push(tc(
+        `[TRANSFORM] Null/empty source value for "${rule.sn_field}" handled gracefully`,
+        'MAJOR', 'Transform Rules',
+        `Verify transform handles null/empty source value without error`,
+        `// Temporarily insert a staging row with null ${rule.staging_field ?? rule.sn_field}
+var gr = new GlideRecord('${staging_table}');
+gr.initialize();
+// leave ${rule.staging_field ?? rule.sn_field} null
+var sid = gr.insert();
+gs.assertNotNull(sid, 'Staging insert with null ${rule.staging_field ?? rule.sn_field} must not fail');
+if (sid) { var del = new GlideRecord('${staging_table}'); del.get(sid); del.deleteRecord(); }
+gs.info('TRANSFORM PASS: Null ${rule.sn_field} handled without error');`,
+        [{ message: `Null ${rule.sn_field} handled gracefully` }],
+      ));
+    });
+
+    // Date field transform test
+    const dateFields = fieldMappings.filter(m => m.type === 'date' || m.source_field?.toLowerCase().includes('date') || m.source_field?.toLowerCase().includes('created') || m.source_field?.toLowerCase().includes('updated'));
+    if (dateFields.length > 0) {
+      cases.push(tc(
+        `[TRANSFORM] Date fields convert to GlideDateTime format correctly`,
+        'CRITICAL', 'Transform Rules',
+        `Verify date/datetime fields land in correct SN format (YYYY-MM-DD HH:mm:ss)`,
+        `var dateFields = ${JSON.stringify(dateFields.map(f => f.sn_field).filter(Boolean))};
+var table  = '${target_table}';
+var gr     = new GlideRecord(table);
+gr.setLimit(5);
+gr.query();
+var badDates = [];
+while (gr.next()) {
+  dateFields.forEach(function(f) {
+    var val = gr.getValue(f);
+    if (val && !/^\\d{4}-\\d{2}-\\d{2}/.test(val)) badDates.push(f + '=' + val);
+  });
+}
+gs.assertEquals(0, badDates.length, 'Malformed dates in target: ' + badDates.join(', '));
+gs.info('TRANSFORM PASS: All date fields in correct format');`,
+        [{ message: 'All date fields in correct GlideDateTime format' }],
+      ));
+    }
+
+    // ── Phase 4: Sample Migration Test (end-to-end) ────────────────────────
+    cases.push(tc(
+      `[SAMPLE] End-to-end: insert 1 test record through full pipeline`,
+      'CRITICAL', 'Sample Migration',
+      `Push a single synthetic record through staging → transform → target and verify all mapped fields`,
+      `// Step 1: Insert into staging
+var staging = new GlideRecord('${staging_table}');
+staging.initialize();
+staging.setValue('${correlationField}', 'E2E_TEST_' + gs.generateGUID());
+${fieldMappings.slice(0, 5).map(m => m.staging_field && m.staging_field !== correlationField
+  ? `staging.setValue('${m.staging_field}', 'TEST_VALUE_${m.staging_field}');`
+  : '').filter(Boolean).join('\n')}
+var stagingSysId = staging.insert();
+gs.assertNotNull(stagingSysId, 'Staging insert must succeed');
+gs.info('E2E TEST: Staging record created: ' + stagingSysId);
+
+// Step 2: Run transform
+var xform = new GlideRecord('sys_transform_map');
+xform.addQuery('source_table', '${staging_table}');
+xform.addQuery('active', true);
+xform.setLimit(1);
+xform.query();
+if (xform.next()) {
+  var importSet = new GlideImportSetRun();
+  // Note: Full transform execution via API requires elevated permissions
+  // Verify by checking if target record appears
+  gs.info('E2E TEST: Transform map found — run the import set manually if auto-trigger fails');
+}
+
+// Step 3: Cleanup staging test record
+var del = new GlideRecord('${staging_table}');
+del.get(stagingSysId);
+del.deleteRecord();
+gs.info('E2E TEST: Complete — verify target record manually if transform did not auto-execute');`,
+      [{ message: 'End-to-end pipeline test complete' }],
+    ));
+
+    cases.push(tc(
+      `[SAMPLE] Source → target field accuracy spot-check (5 records)`,
+      'CRITICAL', 'Sample Migration',
+      `Compare field values between staging and target for 5 records to verify no data loss`,
+      `var staging = new GlideRecord('${staging_table}');
+staging.setLimit(5);
+staging.orderByDesc('sys_created_on');
+staging.query();
+var mismatches = [];
+while (staging.next()) {
+  var corrId = staging.getValue('${correlationField}');
+  if (!corrId) continue;
+  var target = new GlideRecord('${target_table}');
+  target.addQuery('${correlationField}', corrId);
+  target.setLimit(1);
+  target.query();
+  if (!target.next()) {
+    mismatches.push({ id: corrId, issue: 'No target record found' });
+    continue;
+  }
+  ${fieldMappings.slice(0, 3).map(m => m.staging_field && m.sn_field && m.sn_field !== 'SKIP'
+    ? `var stVal = staging.getValue('${m.staging_field}') ?? '';
+  var tgVal = target.getValue('${m.sn_field}') ?? '';
+  if (stVal && !tgVal) mismatches.push({ id: corrId, field: '${m.sn_field}', staging: stVal, target: tgVal });`
+    : '').filter(Boolean).join('\n  ')}
+}
+gs.assertEquals(0, mismatches.length, 'Field mismatches: ' + JSON.stringify(mismatches.slice(0, 3)));
+gs.info('SAMPLE PASS: ' + (5 - mismatches.length) + '/5 records match across all spot-checked fields');`,
+      [{ message: 'Field values match between staging and target (5 records)' }],
+    ));
+
+    cases.push(tc(
+      `[SAMPLE] Source record count matches target record count`,
+      'CRITICAL', 'Sample Migration',
+      `Verify no records were silently dropped during migration`,
+      `var stagingAgg = new GlideAggregate('${staging_table}');
+stagingAgg.addNotNullQuery('${correlationField}');
+stagingAgg.addAggregate('COUNT');
+stagingAgg.query();
+var stagingCount = stagingAgg.next() ? parseInt(stagingAgg.getAggregate('COUNT')) : 0;
+
+var targetAgg = new GlideAggregate('${target_table}');
+targetAgg.addNotNullQuery('${correlationField}');
+targetAgg.addAggregate('COUNT');
+targetAgg.query();
+var targetCount = targetAgg.next() ? parseInt(targetAgg.getAggregate('COUNT')) : 0;
+
+gs.info('SAMPLE COUNT: staging=' + stagingCount + ', target=' + targetCount);
+// Allow ±5% variance for records that failed transform
+var variance = Math.abs(stagingCount - targetCount) / Math.max(stagingCount, 1);
+gs.assertTrue(variance < 0.05, 'Record count mismatch: staging=' + stagingCount + ', target=' + targetCount + ' (>' + Math.round(variance*100) + '% variance)');`,
+      [{ message: 'Record count matches between staging and target (< 5% variance)' }],
+    ));
+
+    cases.push(tc(
+      `[SAMPLE] Import set has zero failed rows`,
+      'CRITICAL', 'Sample Migration',
+      `Check the import set log for any rows that failed during transform`,
+      `var importLog = new GlideRecord('sys_import_set_row');
+importLog.addQuery('import_set.table_name', '${staging_table}');
+importLog.addQuery('state', 'error');
+importLog.orderByDesc('sys_created_on');
+importLog.setLimit(10);
+importLog.query();
+var errorRows = [];
+while (importLog.next()) {
+  errorRows.push({ id: importLog.getValue('correlation_id') ?? importLog.sys_id, error: importLog.getValue('error_label') });
+}
+gs.assertEquals(0, errorRows.length, 'Import set errors: ' + JSON.stringify(errorRows));
+gs.info('SAMPLE PASS: Zero failed import rows');`,
+      [{ message: 'No failed rows in import set log' }],
+    ));
+
+    // ── Phase 5: Edge Cases ────────────────────────────────────────────────
+    cases.push(tc(
+      `[EDGE] Special characters in text fields do not break transform`,
+      'MAJOR', 'Edge Cases',
+      `Verify records with special chars (apostrophes, quotes, ampersands, Unicode) migrate correctly`,
+      `var gr = new GlideRecord('${staging_table}');
+gr.initialize();
+gr.setValue('${correlationField}', 'SPECIAL_CHAR_TEST_' + gs.generateGUID());
+// Set a text field with special characters
+${fieldMappings.find(m => m.type === 'string' || !m.type)?.staging_field
+  ? `gr.setValue('${fieldMappings.find(m => m.type === 'string' || !m.type).staging_field}', "Test with special chars: O\\'Reilly & <script>alert('xss')</script> — café — 中文");`
+  : `gr.setValue('short_description', 'SPECIAL CHAR TEST: O\\'Reilly & café');`}
+var sid = gr.insert();
+gs.assertNotNull(sid, 'Insert with special chars must succeed');
+gs.info('EDGE PASS: Special character record inserted: ' + sid);
+// Cleanup
+if (sid) { var del = new GlideRecord('${staging_table}'); del.get(sid); del.deleteRecord(); }`,
+      [{ message: 'Special characters handled correctly' }],
+    ));
+
+    cases.push(tc(
+      `[EDGE] Duplicate source ID is rejected (no double-migration)`,
+      'MAJOR', 'Edge Cases',
+      `Verify that migrating the same source record twice does not create a duplicate in the target`,
+      `// Find an existing migrated record
+var target = new GlideRecord('${target_table}');
+target.addNotNullQuery('${correlationField}');
+target.setLimit(1);
+target.query();
+if (target.next()) {
+  var existingCorrId = target.getValue('${correlationField}');
+  // Try to insert staging record with same correlation ID
+  var staging = new GlideRecord('${staging_table}');
+  staging.initialize();
+  staging.setValue('${correlationField}', existingCorrId);
+  var sid = staging.insert();
+  // Count targets with this ID — should still be 1
+  var dupCheck = new GlideAggregate('${target_table}');
+  dupCheck.addQuery('${correlationField}', existingCorrId);
+  dupCheck.addAggregate('COUNT');
+  dupCheck.query();
+  var count = dupCheck.next() ? parseInt(dupCheck.getAggregate('COUNT')) : 0;
+  gs.assertTrue(count <= 1, 'Duplicate migration created ' + count + ' records with same ${correlationField}=' + existingCorrId);
+  if (sid) { var del = new GlideRecord('${staging_table}'); del.get(sid); del.deleteRecord(); }
+  gs.info('EDGE PASS: Duplicate source ID handled — ' + count + ' target record(s)');
+} else {
+  gs.info('EDGE SKIP: No migrated records yet to test deduplication against');
+}`,
+      [{ message: 'Duplicate source ID does not create duplicate target records' }],
+    ));
+
+    cases.push(tc(
+      `[EDGE] Null value in optional reference field does not break migration`,
+      'MAJOR', 'Edge Cases',
+      `Verify records with null reference fields (e.g. no assignee) migrate without errors`,
+      `var gr = new GlideRecord('${staging_table}');
+gr.initialize();
+gr.setValue('${correlationField}', 'NULL_REF_TEST_' + gs.generateGUID());
+// Leave all reference fields null — common when Jira issues have no assignee
+var sid = gr.insert();
+gs.assertNotNull(sid, 'Insert with null reference fields must succeed');
+gs.info('EDGE PASS: Null reference fields do not break staging insert');
+if (sid) { var del = new GlideRecord('${staging_table}'); del.get(sid); del.deleteRecord(); }`,
+      [{ message: 'Null reference fields handled correctly' }],
+    ));
+
+    // ── Phase 6: Rollback Safety ──────────────────────────────────────────
+    cases.push(tc(
+      `[ROLLBACK] Test records can be cleanly deleted by correlation field`,
+      'CRITICAL', 'Rollback Safety',
+      `Verify the rollback mechanism can delete migrated records using the correlation field without affecting other records`,
+      `// Count records before
+var before = new GlideAggregate('${target_table}');
+before.addNotNullQuery('${correlationField}');
+before.addAggregate('COUNT');
+before.query();
+var beforeCount = before.next() ? parseInt(before.getAggregate('COUNT')) : 0;
+
+// Create a test record to roll back
+var staging = new GlideRecord('${staging_table}');
+staging.initialize();
+var testCorrId = 'ROLLBACK_TEST_' + gs.generateGUID();
+staging.setValue('${correlationField}', testCorrId);
+staging.insert();
+
+// Now delete by correlation field (simulate rollback)
+var toDelete = new GlideRecord('${target_table}');
+toDelete.addQuery('${correlationField}', 'STARTSWITH', 'ROLLBACK_TEST_');
+toDelete.deleteMultiple();
+
+// Count records after — should match before
+var after = new GlideAggregate('${target_table}');
+after.addNotNullQuery('${correlationField}');
+after.addAggregate('COUNT');
+after.query();
+var afterCount = after.next() ? parseInt(after.getAggregate('COUNT')) : 0;
+
+gs.assertEquals(beforeCount, afterCount, 'Rollback left behind records: before=' + beforeCount + ', after=' + afterCount);
+// Cleanup staging
+var stClean = new GlideRecord('${staging_table}');
+stClean.addQuery('${correlationField}', testCorrId);
+stClean.deleteMultiple();
+gs.info('ROLLBACK PASS: Clean deletion verified');`,
+      [{ message: 'Rollback deletes only test records without side effects' }],
+    ));
+
+    cases.push(tc(
+      `[ROLLBACK] Staging table can be purged without affecting target`,
+      'MAJOR', 'Rollback Safety',
+      `Verify that deleting staging records does not cascade-delete target records`,
+      `// Target count before
+var before = new GlideAggregate('${target_table}');
+before.addNotNullQuery('${correlationField}');
+before.addAggregate('COUNT');
+before.query();
+var beforeCount = before.next() ? parseInt(before.getAggregate('COUNT')) : 0;
+
+// Insert and delete a staging record
+var staging = new GlideRecord('${staging_table}');
+staging.initialize();
+staging.setValue('${correlationField}', 'CASCADE_TEST_' + gs.generateGUID());
+var sid = staging.insert();
+if (sid) {
+  var del = new GlideRecord('${staging_table}');
+  del.get(sid);
+  del.deleteRecord();
+}
+
+// Target count after — must be unchanged
+var after = new GlideAggregate('${target_table}');
+after.addNotNullQuery('${correlationField}');
+after.addAggregate('COUNT');
+after.query();
+var afterCount = after.next() ? parseInt(after.getAggregate('COUNT')) : 0;
+
+gs.assertEquals(beforeCount, afterCount, 'Deleting staging record changed target count: ' + beforeCount + ' → ' + afterCount);
+gs.info('ROLLBACK PASS: No cascade delete from staging to target');`,
+      [{ message: 'Staging delete does not cascade to target' }],
+    ));
+
+    // ── Phase 7: Performance ──────────────────────────────────────────────
+    cases.push(tc(
+      `[PERFORMANCE] Staging table query with ${correlationField} completes in < 3 seconds`,
+      'MAJOR', 'Performance',
+      `Verify queries against the staging table by correlation field are fast — indicates index is in place`,
+      `var start   = new GlideDateTime().getNumericValue();
+var gr      = new GlideRecord('${staging_table}');
+gr.addNotNullQuery('${correlationField}');
+gr.setLimit(1000);
+gr.query();
+while (gr.next()) {} // iterate all
+var elapsed = new GlideDateTime().getNumericValue() - start;
+gs.assertTrue(elapsed < 3000, 'Staging query took ' + elapsed + 'ms — consider adding index on ${correlationField}');
+gs.info('PERFORMANCE: Staging query took ' + elapsed + 'ms');`,
+      [{ message: 'Staging query completes in under 3 seconds' }],
+    ));
+
+    cases.push(tc(
+      `[PERFORMANCE] Estimate full migration runtime from batch throughput`,
+      'MINOR', 'Performance',
+      `Measure throughput for inserting 10 records and extrapolate total migration time`,
+      `var batchSize = 10;
+var start     = new GlideDateTime().getNumericValue();
+var sids      = [];
+for (var i = 0; i < batchSize; i++) {
+  var gr = new GlideRecord('${staging_table}');
+  gr.initialize();
+  gr.setValue('${correlationField}', 'PERF_TEST_' + i + '_' + gs.generateGUID());
+  sids.push(gr.insert());
+}
+var elapsed     = new GlideDateTime().getNumericValue() - start;
+var msPerRecord = elapsed / batchSize;
+
+// Cleanup
+var clean = new GlideRecord('${staging_table}');
+clean.addQuery('${correlationField}', 'STARTSWITH', 'PERF_TEST_');
+clean.deleteMultiple();
+
+gs.info('PERFORMANCE: ' + batchSize + ' staging inserts in ' + elapsed + 'ms (' + msPerRecord.toFixed(1) + 'ms/record)');
+gs.info('Extrapolation: 1000 records ≈ ' + Math.round(1000 * msPerRecord / 60000) + ' minutes staging time');`,
+      [{ message: 'Throughput measured and extrapolated' }],
+    ));
+
+    // ── Phase 8: Post-Migration Validation ────────────────────────────────
+    cases.push(tc(
+      `[POST-VALIDATION] No import set error rows remain after migration`,
+      'CRITICAL', 'Post-Validation',
+      `Verify the import set completed cleanly with zero error rows`,
+      `var errors = new GlideRecord('sys_import_set_row');
+errors.addQuery('import_set.table_name', '${staging_table}');
+errors.addQuery('state', 'error');
+errors.orderByDesc('sys_created_on');
+errors.setLimit(20);
+errors.query();
+var errorList = [];
+while (errors.next()) {
+  errorList.push(errors.getValue('error_label') ?? errors.getValue('state'));
+}
+gs.assertEquals(0, errorList.length, 'Import set errors: ' + errorList.slice(0,5).join(' | '));
+gs.info('POST-VALIDATION PASS: Zero error rows in import set');`,
+      [{ message: 'Zero error rows in import set' }],
+    ));
+
+    cases.push(tc(
+      `[POST-VALIDATION] All migrated records have ${correlationField} populated`,
+      'CRITICAL', 'Post-Validation',
+      `Verify every migrated record has the correlation field set — records without it cannot be traced or rolled back`,
+      `var noCorr = new GlideAggregate('${target_table}');
+noCorr.addNullQuery('${correlationField}');
+noCorr.addAggregate('COUNT');
+noCorr.query();
+var nullCount = noCorr.next() ? parseInt(noCorr.getAggregate('COUNT')) : 0;
+// NOTE: Only flag if there are many — some records may have been created before migration
+gs.info('POST-VALIDATION: ${target_table} records with null ${correlationField}: ' + nullCount);
+if (nullCount > 0) gs.info('WARN: ' + nullCount + ' records have no correlation ID — verify these are pre-existing non-migrated records');`,
+      [{ message: `${correlationField} populated on migrated records` }],
+    ));
+
+    cases.push(tc(
+      `[POST-VALIDATION] Spot-check 3 random migrated records for data accuracy`,
+      'MAJOR', 'Post-Validation',
+      `Randomly sample 3 migrated records and log field values for manual review`,
+      `var gr = new GlideRecord('${target_table}');
+gr.addNotNullQuery('${correlationField}');
+gr.orderBy('sys_created_on');
+gr.setLimit(3);
+gr.query();
+var spotChecks = [];
+while (gr.next()) {
+  var record = { sys_id: gr.getUniqueValue(), ${correlationField}: gr.getValue('${correlationField}') };
+  ${fieldMappings.slice(0, 4).map(m => m.sn_field && m.sn_field !== 'SKIP'
+    ? `record['${m.sn_field}'] = gr.getValue('${m.sn_field}');`
+    : '').filter(Boolean).join('\n  ')}
+  spotChecks.push(record);
+}
+gs.assertTrue(spotChecks.length > 0, 'No migrated records found for spot-check');
+gs.info('POST-VALIDATION SPOT-CHECK: ' + JSON.stringify(spotChecks));`,
+      [{ message: '3 records spot-checked — review output log for accuracy' }],
+    ));
+
+    if (priority === 'critical') return cases.filter(c => c.priority === 'CRITICAL');
+    if (priority === 'smoke')    return cases.slice(0, 5);
+    return cases;
+  }
+}

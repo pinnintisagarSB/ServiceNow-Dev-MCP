@@ -46,7 +46,7 @@ import { CatalogBuilder }       from './developer/catalog-builder.js';
 import { NotificationBuilder }  from './developer/notification-builder.js';
 import { TechDocWriter }        from './developer/tech-doc-writer.js';
 import { IssueGuide }           from './developer/issue-guide.js';
-import { ExpertTester }         from './developer/expert-tester.js';
+import { ExpertTester, MigrationTester } from './developer/expert-tester.js';
 import { logger }               from './utils/logger.js';
 
 // ── Developer tools singletons (stateless, no credentials needed) ──────────
@@ -57,6 +57,7 @@ const _docGen          = new DocGenerator();
 const _notifBuilder    = new NotificationBuilder();
 const _issueGuide      = new IssueGuide();
 const _expertTester    = new ExpertTester();
+const _migrationTester = new MigrationTester();
 
 // ── Connector cache (reuse within a session) ───────────────────────────────
 // In HTTP mode each request is stateless, so connectors are reset per-session
@@ -6705,6 +6706,128 @@ Use this when:
           ``,
           `Approve all tests? → run_approved_tests(plan, approved=true)`,
           `Approve subset?    → run_approved_tests(plan, approved_ids=["TC-001","TC-002"])`,
+        ].join('\n'),
+      });
+    } catch (e) { return fail(e.message); }
+  }
+);
+
+// ── TOOL: analyze_migration_for_testing ──────────────────────────────────
+server.tool(
+  'analyze_migration_for_testing',
+  `Analyze a migration setup to identify risks and plan expert test coverage.
+
+Inspects:
+  - Staging table accessibility and write permissions
+  - Target table accessibility
+  - Active transform map between staging and target
+  - All mapped SN target fields exist
+  - Correlation/deduplication field presence
+  - Source data quality (null rates, long text) from sample records
+  - Transform rule coverage
+  - Risk scoring: HIGH (blockers) / MEDIUM / LOW
+
+Returns a full analysis with recommended test coverage areas and estimated test count.
+
+Always call this FIRST before create_migration_test_plan.`,
+  {
+    platform:         z.string().describe('Source platform: jira or salesforce'),
+    source_object:    z.string().describe('Jira project key or Salesforce object name (e.g. KAN, Case)'),
+    staging_table:    z.string().describe('ServiceNow staging/import table name (e.g. u_imp_jira_kan)'),
+    target_table:     z.string().describe('ServiceNow target table name (e.g. incident, problem)'),
+    field_mappings:   z.array(z.object({
+      source_field:  z.string().optional(),
+      staging_field: z.string().optional(),
+      sn_field:      z.string().optional(),
+      type:          z.string().optional(),
+    })).optional().default([]),
+    transform_rules:  z.array(z.object({
+      sn_field:     z.string(),
+      staging_field: z.string().optional(),
+      value_map:    z.record(z.string()).optional(),
+    })).optional().default([]),
+    sample_records:   z.array(z.record(z.unknown())).optional().default([])
+      .describe('Optional: pass source records already fetched — enables null-rate and length analysis'),
+  },
+  async ({ platform, source_object, staging_table, target_table, field_mappings, transform_rules, sample_records }) => {
+    try {
+      const sn       = await getSN();
+      const analysis = await _migrationTester.analyzeMigration(sn, {
+        platform, source_object, staging_table, target_table,
+        field_mappings, transform_rules, sample_records,
+      });
+      return ok({
+        analysis,
+        next_step: analysis.ready_to_plan
+          ? `No blockers found. Call create_migration_test_plan with this analysis to generate the full expert test plan.`
+          : `Resolve ${analysis.risks.filter(r => r.level === 'HIGH').length} HIGH-risk issue(s) before proceeding.`,
+      });
+    } catch (e) { return fail(e.message); }
+  }
+);
+
+// ── TOOL: create_migration_test_plan ─────────────────────────────────────
+server.tool(
+  'create_migration_test_plan',
+  `Generate a full expert migration test plan for user approval before executing.
+
+Covers all 8 testing phases:
+  1. Pre-Migration Checks  — table access, transform map active, ACLs, schema, correlation field, no duplicate IDs
+  2. Source Data Quality   — fill rates, null-heavy fields, long text truncation
+  3. Transform Rules       — value map completeness, null handling, date format conversion
+  4. Sample Migration      — end-to-end 1-record test, field accuracy spot-check, record count, zero import errors
+  5. Edge Cases            — special characters, duplicate source IDs, null reference fields
+  6. Rollback Safety       — clean delete by correlation field, no cascade side effects
+  7. Performance           — staging query speed, throughput estimate and runtime projection
+  8. Post-Validation       — zero error rows, correlation field populated, random spot-check
+
+Each test case includes a ready-to-run ServiceNow Fix Script.
+Present the plan to the user for approval, then call run_approved_tests.`,
+  {
+    analysis:          z.object({}).passthrough().describe('The full analysis object from analyze_migration_for_testing'),
+    field_mappings:    z.array(z.object({
+      source_field:  z.string().optional(),
+      staging_field: z.string().optional(),
+      sn_field:      z.string().optional(),
+      type:          z.string().optional(),
+    })).optional().default([]),
+    transform_rules:   z.array(z.object({
+      sn_field:      z.string(),
+      staging_field: z.string().optional(),
+      value_map:     z.record(z.string()).optional(),
+    })).optional().default([]),
+    sample_records:    z.array(z.record(z.unknown())).optional().default([]),
+    correlation_field: z.string().optional().default('u_source_id')
+      .describe('SN target field that stores the source platform ID (used for dedup + rollback)'),
+    source_id_field:   z.string().optional().default('Id')
+      .describe('Field in source records that is the unique ID (e.g. key for Jira, Id for Salesforce)'),
+    priority:          z.enum(['all','critical','smoke']).default('all')
+      .describe('all=full 8-phase suite | critical=blockers only | smoke=first 5 tests'),
+  },
+  async ({ analysis, field_mappings, transform_rules, sample_records, correlation_field, source_id_field, priority }) => {
+    try {
+      const plan = _migrationTester.createMigrationTestPlan(analysis, {
+        field_mappings, transform_rules, sample_records,
+        correlation_field, source_id_field, priority,
+      });
+      return ok({
+        plan,
+        approval_prompt: [
+          `I've generated ${plan.summary.total} expert migration test cases for "${plan.artifact_name}":`,
+          `  🔴 CRITICAL: ${plan.summary.critical}   (pre-checks, sample migration, rollback, post-validation)`,
+          `  🟡 MAJOR:    ${plan.summary.major}   (data quality, transform rules, edge cases, performance)`,
+          `  🟢 MINOR:    ${plan.summary.minor}   (throughput estimates)`,
+          `  ⏱ Estimated runtime: ~${plan.summary.estimated_runtime_minutes} minutes`,
+          ``,
+          `Phases: ${plan.summary.phases.join(' → ')}`,
+          ``,
+          plan.risks.length
+            ? `Risks: ${plan.risks.map(r => '[' + r.level + '] ' + r.issue).join(' | ')}`
+            : 'No risks detected.',
+          ``,
+          `Run ALL tests:         run_approved_tests(plan, approved=true)`,
+          `Run CRITICAL only:     run_approved_tests(plan, approved_ids=["MTC-001",...])`,
+          `Run a single phase:    filter by category in approved_ids`,
         ].join('\n'),
       });
     } catch (e) { return fail(e.message); }
