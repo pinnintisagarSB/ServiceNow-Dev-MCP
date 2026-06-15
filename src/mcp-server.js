@@ -46,6 +46,7 @@ import { CatalogBuilder }       from './developer/catalog-builder.js';
 import { NotificationBuilder }  from './developer/notification-builder.js';
 import { TechDocWriter }        from './developer/tech-doc-writer.js';
 import { IssueGuide }           from './developer/issue-guide.js';
+import { ExpertTester }         from './developer/expert-tester.js';
 import { logger }               from './utils/logger.js';
 
 // ── Developer tools singletons (stateless, no credentials needed) ──────────
@@ -55,6 +56,7 @@ const _testGen         = new TestGenerator();
 const _docGen          = new DocGenerator();
 const _notifBuilder    = new NotificationBuilder();
 const _issueGuide      = new IssueGuide();
+const _expertTester    = new ExpertTester();
 
 // ── Connector cache (reuse within a session) ───────────────────────────────
 // In HTTP mode each request is stateless, so connectors are reset per-session
@@ -6520,6 +6522,224 @@ action:
       }
 
       return fail(`Unknown action: ${action}`);
+    } catch (e) { return fail(e.message); }
+  }
+);
+
+// ══════════════════════════════════════════════════════════════════════════
+//  EXPERT TESTING SYSTEM  (5 tools)
+// ══════════════════════════════════════════════════════════════════════════
+
+// ── TOOL: analyze_for_testing ─────────────────────────────────────────────
+server.tool(
+  'analyze_for_testing',
+  `Deep-analyze a ServiceNow artifact to understand what needs to be tested.
+
+Two input modes:
+  A) Provide \`code\` directly (paste script content or user uploads a file)
+  B) Provide \`artifact_type\` + \`artifact_name\` (or \`sys_id\`) to fetch live from SN
+
+Returns:
+  - Artifact type detected
+  - Complexity score and risk areas
+  - Methods, tables, and conditions detected
+  - Coverage areas with estimated test case count
+  - Recommendation (thorough / smoke / etc.)
+
+Always call this FIRST before create_test_plan.`,
+  {
+    code:          z.string().optional().describe('Script/code content to analyze (paste or file content)'),
+    artifact_type: z.enum(['business_rule','script_include','client_script','scripted_rest','scheduled_job','widget','ui_action']).optional()
+      .describe('SN artifact type — required when fetching live from SN'),
+    artifact_name: z.string().optional().describe('Name of the SN artifact to fetch live'),
+    sys_id:        z.string().optional().describe('sys_id of the SN artifact to fetch live'),
+  },
+  async ({ code, artifact_type, artifact_name, sys_id }) => {
+    try {
+      let analysis;
+      if (code) {
+        analysis = _expertTester.analyzeCode({ code, artifact_name: artifact_name ?? 'Provided Code', artifact_type });
+      } else {
+        if (!artifact_type) return fail('Provide either code or both artifact_type and artifact_name/sys_id');
+        const sn = await getSN();
+        analysis = await _expertTester.analyzeLiveArtifact(sn, { artifact_type, artifact_name, sys_id });
+      }
+      return ok({
+        analysis,
+        next_step: `Call create_test_plan with this analysis to generate the full expert test plan for approval.`,
+      });
+    } catch (e) { return fail(e.message); }
+  }
+);
+
+// ── TOOL: create_test_plan ────────────────────────────────────────────────
+server.tool(
+  'create_test_plan',
+  `Generate a detailed expert test plan from an analysis result.
+
+This is the APPROVAL STEP — present the full plan to the user before running anything.
+
+The plan includes:
+  - CRITICAL tests (security, null safety, primary function)
+  - MAJOR tests   (branch coverage, data integrity, performance)
+  - MINOR tests   (edge cases, minor validations)
+  - Ready-to-run ServiceNow Fix Scripts for each test case
+  - Estimated runtime
+
+After presenting the plan, ask the user:
+  "Approve all and run? Or select specific test IDs?"
+
+Then call run_approved_tests.`,
+  {
+    analysis:     z.object({}).passthrough().describe('The full analysis object returned by analyze_for_testing'),
+    priority:     z.enum(['all','critical','smoke']).default('all')
+      .describe('all=full suite | critical=CRITICAL only | smoke=first 3 tests'),
+  },
+  async ({ analysis, priority }) => {
+    try {
+      const plan = _expertTester.createTestPlan(analysis, { priority });
+      return ok({
+        plan,
+        approval_prompt: [
+          `I've generated ${plan.summary.total} expert test cases for "${plan.artifact_name}":`,
+          `  🔴 CRITICAL: ${plan.summary.critical}  (security, primary function, null safety)`,
+          `  🟡 MAJOR:    ${plan.summary.major}  (branches, data integrity, performance)`,
+          `  🟢 MINOR:    ${plan.summary.minor}  (edge cases)`,
+          `  ⏱ Estimated runtime: ~${plan.summary.estimated_runtime_minutes} minutes`,
+          ``,
+          `Risks identified: ${plan.risks.map(r => r.level + ': ' + r.issue).join(' | ') || 'None'}`,
+          ``,
+          `To run ALL tests:         run_approved_tests(plan_id="${plan.plan_id}", approved=true, plan=<plan>)`,
+          `To run CRITICAL only:     run_approved_tests(plan_id="${plan.plan_id}", approved_ids=[TC-001, TC-002, ...], plan=<plan>)`,
+          `To add a custom case:     include extra_cases=[{name, script}] in run_approved_tests`,
+        ].join('\n'),
+      });
+    } catch (e) { return fail(e.message); }
+  }
+);
+
+// ── TOOL: run_approved_tests ──────────────────────────────────────────────
+server.tool(
+  'run_approved_tests',
+  `Execute the approved test cases on ServiceNow and return a detailed results report.
+
+IMPORTANT: Only call this after the user has reviewed and approved the test plan.
+
+Execution method:
+  - Creates a Fix Script record in ServiceNow for each test case
+  - Attempts to execute it via the SN API
+  - If the run endpoint is unavailable, marks as MANUAL_REQUIRED and provides the Fix Script name to find in SN
+  - Returns PASS / FAIL / MANUAL_REQUIRED / ERROR per test case
+  - Full result report with score%, verdict, and remediation steps
+
+After execution:
+  - CRITICAL FAIL → surface immediately, do not suggest deploy
+  - MANUAL_REQUIRED → list the Fix Script names and guide user to run them in SN
+  - ALL PASS → confirm artifact is ready for UAT/deploy`,
+  {
+    plan:          z.object({}).passthrough().describe('The full plan object from create_test_plan'),
+    approved:      z.boolean().optional().describe('true = run all test cases in the plan'),
+    approved_ids:  z.array(z.string()).optional().describe('Array of specific TC-XXX ids to run (if not running all)'),
+    extra_cases:   z.array(z.object({
+      name:    z.string(),
+      script:  z.string(),
+      priority: z.string().optional().default('MAJOR'),
+      category: z.string().optional().default('Custom'),
+      description: z.string().optional().default(''),
+    })).optional().describe('Additional custom test cases to add alongside the plan'),
+  },
+  async ({ plan, approved, approved_ids, extra_cases = [] }) => {
+    try {
+      if (!approved && !approved_ids?.length && !extra_cases.length) {
+        return fail('Approval required: set approved=true to run all tests, or pass approved_ids=[TC-001, ...] for specific cases');
+      }
+      const sn = await getSN();
+      const report = await _expertTester.runTests(sn, plan, {
+        approved_ids: approved ? null : approved_ids,
+        extra_cases,
+      });
+      return ok({ report });
+    } catch (e) { return fail(e.message); }
+  }
+);
+
+// ── TOOL: test_code_file ──────────────────────────────────────────────────
+server.tool(
+  'test_code_file',
+  `One-shot shortcut: user provides code (or file content), get back a full expert test plan immediately.
+
+Combines analyze_for_testing + create_test_plan in one call.
+The plan is still presented for approval before running — call run_approved_tests to execute.
+
+Use this when:
+  - User says "test this code" and pastes a script
+  - User uploads a .js file and asks to test it
+  - User provides a Script Include, Business Rule, or REST script directly`,
+  {
+    code:          z.string().describe('The full script/code content to test'),
+    artifact_name: z.string().optional().default('Provided Script').describe('Name for this artifact in the test plan'),
+    artifact_type: z.enum(['business_rule','script_include','client_script','scripted_rest','scheduled_job','widget','ui_action']).optional()
+      .describe('Override auto-detected artifact type'),
+    priority:      z.enum(['all','critical','smoke']).default('all'),
+  },
+  async ({ code, artifact_name, artifact_type, priority }) => {
+    try {
+      const analysis = _expertTester.analyzeCode({ code, artifact_name, artifact_type });
+      const plan     = _expertTester.createTestPlan(analysis, { priority });
+      return ok({
+        analysis: {
+          artifact_type:     analysis.artifact_type,
+          complexity_score:  analysis.complexity_score,
+          risks:             analysis.risks,
+          methods_detected:  analysis.methods_detected.length,
+          tables_referenced: analysis.tables_referenced,
+          recommendation:    analysis.recommendation,
+        },
+        plan,
+        approval_prompt: [
+          `Ready to test "${plan.artifact_name}" (${analysis.artifact_type}) — ${plan.summary.total} test cases generated:`,
+          `  🔴 CRITICAL: ${plan.summary.critical}   🟡 MAJOR: ${plan.summary.major}   🟢 MINOR: ${plan.summary.minor}`,
+          `  ⏱ ~${plan.summary.estimated_runtime_minutes} min  |  Complexity: ${analysis.complexity_score}  |  ${analysis.recommendation}`,
+          ``,
+          plan.risks.length ? `Risks: ${plan.risks.map(r => '[' + r.level + '] ' + r.issue).join(' | ')}` : 'No risks detected.',
+          ``,
+          `Approve all tests? → run_approved_tests(plan, approved=true)`,
+          `Approve subset?    → run_approved_tests(plan, approved_ids=["TC-001","TC-002"])`,
+        ].join('\n'),
+      });
+    } catch (e) { return fail(e.message); }
+  }
+);
+
+// ── TOOL: get_test_report ─────────────────────────────────────────────────
+server.tool(
+  'get_test_report',
+  `Re-generate a structured test report from raw results — useful when a user ran Fix Scripts manually in SN and wants to record the outcomes.
+
+Takes a list of manual results (test case ID + status + notes) and combines them with the original plan
+to produce a final pass/fail report with score, verdict, and recommendations.
+
+Use this when:
+  - Some or all tests were MANUAL_REQUIRED
+  - User has run the Fix Scripts in SN and wants to record outcomes
+  - You want a clean summary of mixed auto + manual results`,
+  {
+    plan:    z.object({}).passthrough().describe('The original plan from create_test_plan'),
+    results: z.array(z.object({
+      id:     z.string().describe('TC-XXX id'),
+      status: z.enum(['PASS','FAIL','SKIP']).describe('Outcome observed'),
+      notes:  z.string().optional().describe('Optional notes or error message'),
+    })).describe('Manual outcomes for each test case that was run'),
+  },
+  async ({ plan, results }) => {
+    try {
+      const enriched = results.map(r => {
+        const tc = plan.test_cases.find(t => t.id === r.id) ?? { id: r.id, name: r.id, priority: 'MAJOR', category: 'Manual' };
+        return { ...tc, status: r.status, output: r.notes ?? '', error: r.status === 'FAIL' ? (r.notes ?? 'Marked failed by user') : null };
+      });
+
+      const report = _expertTester._buildReport(plan, enriched);
+      return ok({ report });
     } catch (e) { return fail(e.message); }
   }
 );
