@@ -11,6 +11,11 @@
 import 'dotenv/config';
 import { AsyncLocalStorage }    from 'node:async_hooks';
 import { randomUUID }           from 'node:crypto';
+import { readFileSync }         from 'node:fs';
+import { fileURLToPath }        from 'node:url';
+import { dirname, join }        from 'node:path';
+
+const __dirname = dirname(fileURLToPath(import.meta.url));
 import { McpServer }            from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { z }                    from 'zod';
@@ -7141,6 +7146,15 @@ if (process.env.MCP_MODE === 'http') {
     res.json({ status: 'ok', server: 'sn-data-migration', tools: toolCount, sessions: clients.size })
   );
 
+  // ── Portal — self-service token registration UI ────────────────────────────
+  const portalHtml = readFileSync(join(__dirname, 'portal.html'), 'utf8');
+  app.get('/', (_req, res) => res.setHeader('Content-Type', 'text/html').end(portalHtml));
+
+  // Tells the portal JS whether to show the admin-key input field
+  app.get('/register-info', (_req, res) =>
+    res.json({ requires_admin_key: !!adminKey })
+  );
+
   // ── Token registration — POST /register ───────────────────────────────────
   // Generates a new per-user token.
   // Protected by ADMIN_KEY if set; open if not (useful during initial setup).
@@ -7150,7 +7164,7 @@ if (process.env.MCP_MODE === 'http') {
   //
   // Response: { "token": "sn-mcp-xxxx...", "name": "alice",
   //             "sse_url": "https://...", "instructions": "..." }
-  app.post('/register', rateLimit(5), (req, res) => {
+  app.post('/register', rateLimit(20), (req, res) => {
     if (adminKey && req.headers['authorization'] !== `Bearer ${adminKey}`) {
       res.status(401).json({ error: 'ADMIN_KEY required to register new tokens' });
       return;

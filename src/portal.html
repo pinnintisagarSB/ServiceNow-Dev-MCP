@@ -1,0 +1,312 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+<title>ServiceNow Dev MCP — Connect</title>
+<style>
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+    background: #0f0f0f;
+    color: #e8e8e8;
+    min-height: 100vh;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    padding: 24px;
+  }
+
+  .card {
+    background: #1a1a1a;
+    border: 1px solid #2a2a2a;
+    border-radius: 16px;
+    padding: 40px;
+    width: 100%;
+    max-width: 520px;
+    box-shadow: 0 24px 64px rgba(0,0,0,0.5);
+  }
+
+  .logo {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    margin-bottom: 28px;
+  }
+
+  .logo-icon {
+    width: 44px; height: 44px;
+    background: linear-gradient(135deg, #81b4ff, #5b8fff);
+    border-radius: 10px;
+    display: flex; align-items: center; justify-content: center;
+    font-size: 22px;
+    flex-shrink: 0;
+  }
+
+  .logo-text h1 { font-size: 18px; font-weight: 600; color: #fff; }
+  .logo-text p  { font-size: 13px; color: #888; margin-top: 2px; }
+
+  .badge-row {
+    display: flex; gap: 8px; margin-bottom: 28px; flex-wrap: wrap;
+  }
+  .badge {
+    font-size: 11px; font-weight: 500;
+    background: #252525; border: 1px solid #333;
+    border-radius: 20px; padding: 3px 10px; color: #aaa;
+  }
+  .badge.green { border-color: #1a4a2a; color: #4ade80; background: #0e2a18; }
+
+  h2 { font-size: 20px; font-weight: 600; color: #fff; margin-bottom: 6px; }
+  .sub { font-size: 14px; color: #888; margin-bottom: 24px; line-height: 1.5; }
+
+  label { display: block; font-size: 13px; color: #bbb; margin-bottom: 6px; font-weight: 500; }
+
+  input[type="text"], input[type="email"], input[type="password"] {
+    width: 100%; padding: 11px 14px;
+    background: #111; border: 1px solid #333;
+    border-radius: 8px; color: #e8e8e8; font-size: 14px;
+    outline: none; transition: border-color .15s;
+    margin-bottom: 16px;
+  }
+  input:focus { border-color: #5b8fff; }
+  input::placeholder { color: #555; }
+
+  .btn {
+    width: 100%; padding: 12px;
+    background: linear-gradient(135deg, #5b8fff, #3d6eff);
+    border: none; border-radius: 8px; color: #fff;
+    font-size: 15px; font-weight: 600; cursor: pointer;
+    transition: opacity .15s, transform .1s;
+  }
+  .btn:hover { opacity: .9; transform: translateY(-1px); }
+  .btn:active { transform: translateY(0); }
+  .btn:disabled { opacity: .5; cursor: not-allowed; transform: none; }
+
+  /* Result card */
+  .result { display: none; }
+  .result.show { display: block; }
+
+  .success-icon {
+    width: 48px; height: 48px; margin: 0 auto 16px;
+    background: #0e2a18; border: 1px solid #1a4a2a;
+    border-radius: 50%; display: flex; align-items: center;
+    justify-content: center; font-size: 22px;
+  }
+  .result h2 { text-align: center; margin-bottom: 4px; }
+  .result .sub { text-align: center; margin-bottom: 24px; }
+
+  .field-box {
+    background: #111; border: 1px solid #2a2a2a;
+    border-radius: 8px; padding: 12px 14px;
+    margin-bottom: 12px;
+  }
+  .field-box label { color: #666; font-size: 11px; text-transform: uppercase; letter-spacing: .05em; margin-bottom: 4px; }
+  .field-value {
+    font-family: 'SF Mono', 'Fira Code', monospace;
+    font-size: 13px; color: #e8e8e8;
+    word-break: break-all; line-height: 1.5;
+  }
+  .copy-row {
+    display: flex; align-items: center; gap: 8px;
+  }
+  .copy-row .field-value { flex: 1; }
+  .copy-btn {
+    padding: 5px 10px; font-size: 12px; font-weight: 500;
+    background: #252525; border: 1px solid #333;
+    border-radius: 6px; color: #aaa; cursor: pointer;
+    flex-shrink: 0; transition: all .15s;
+    white-space: nowrap;
+  }
+  .copy-btn:hover { background: #2e2e2e; color: #fff; border-color: #555; }
+  .copy-btn.copied { background: #0e2a18; border-color: #1a4a2a; color: #4ade80; }
+
+  .steps {
+    background: #111; border: 1px solid #2a2a2a;
+    border-radius: 8px; padding: 16px; margin-top: 16px;
+  }
+  .steps h4 { font-size: 13px; color: #888; margin-bottom: 12px; font-weight: 500; }
+  .step {
+    display: flex; gap: 12px; align-items: flex-start;
+    margin-bottom: 12px;
+  }
+  .step:last-child { margin-bottom: 0; }
+  .step-num {
+    width: 22px; height: 22px; flex-shrink: 0;
+    background: #1e2a4a; border: 1px solid #2a3a6a;
+    border-radius: 50%; display: flex; align-items: center;
+    justify-content: center; font-size: 11px; font-weight: 700; color: #7aa3ff;
+    margin-top: 1px;
+  }
+  .step-text { font-size: 13px; color: #bbb; line-height: 1.5; }
+  .step-text strong { color: #e8e8e8; }
+
+  .error-msg {
+    background: #2a1010; border: 1px solid #4a2020;
+    border-radius: 8px; padding: 12px 14px;
+    color: #f87171; font-size: 13px; margin-top: 12px;
+    display: none;
+  }
+  .error-msg.show { display: block; }
+
+  .divider { border: none; border-top: 1px solid #222; margin: 28px 0; }
+
+  .footer { text-align: center; margin-top: 24px; font-size: 12px; color: #444; }
+  .footer a { color: #5b8fff; text-decoration: none; }
+</style>
+</head>
+<body>
+
+<div class="card" id="registerCard">
+  <div class="logo">
+    <div class="logo-icon">⚡</div>
+    <div class="logo-text">
+      <h1>ServiceNow Dev MCP</h1>
+      <p>AI-powered toolkit for Claude</p>
+    </div>
+  </div>
+
+  <div class="badge-row">
+    <span class="badge green">● Live</span>
+    <span class="badge" id="toolCountBadge">125 tools</span>
+    <span class="badge">SSE transport</span>
+    <span class="badge">Claude.ai connector</span>
+  </div>
+
+  <h2>Get your access token</h2>
+  <p class="sub">Enter your name to generate a personal token. Use it to connect this MCP to Claude.ai — your ServiceNow, Jira, and Salesforce credentials are entered securely in the conversation.</p>
+
+  <div id="formView">
+    <label for="nameInput">Your name</label>
+    <input type="text" id="nameInput" placeholder="e.g. Alice" autocomplete="off" maxlength="32"/>
+
+    <div id="adminSection" style="display:none">
+      <label for="adminKeyInput">Admin key <span style="color:#555;font-weight:400">(required by server)</span></label>
+      <input type="password" id="adminKeyInput" placeholder="Ask your server admin for this"/>
+    </div>
+
+    <button class="btn" id="registerBtn" onclick="register()">Generate my token →</button>
+    <div class="error-msg" id="errorMsg"></div>
+  </div>
+
+  <div class="result" id="resultView">
+    <div class="success-icon">✓</div>
+    <h2>You're ready to connect!</h2>
+    <p class="sub">Token generated for <strong id="resultName"></strong>. Add this connector to Claude.ai in 3 steps.</p>
+
+    <div class="field-box">
+      <label>Connector URL</label>
+      <div class="copy-row">
+        <div class="field-value" id="sseUrl"></div>
+        <button class="copy-btn" onclick="copy('sseUrl', this)">Copy</button>
+      </div>
+    </div>
+
+    <div class="field-box">
+      <label>Authorization header value</label>
+      <div class="copy-row">
+        <div class="field-value" id="tokenDisplay"></div>
+        <button class="copy-btn" onclick="copy('tokenDisplay', this)">Copy</button>
+      </div>
+    </div>
+
+    <div class="steps">
+      <h4>Setup steps in Claude.ai</h4>
+      <div class="step">
+        <div class="step-num">1</div>
+        <div class="step-text">Open <strong>Claude.ai → Settings → Connectors → Add custom connector</strong></div>
+      </div>
+      <div class="step">
+        <div class="step-num">2</div>
+        <div class="step-text">Paste the <strong>Connector URL</strong> above, then set the <strong>Authorization</strong> header to the token value above</div>
+      </div>
+      <div class="step">
+        <div class="step-num">3</div>
+        <div class="step-text">Save — Claude will ask for your <strong>ServiceNow, Jira, or Salesforce</strong> credentials on first use (stored in session only, never logged)</div>
+      </div>
+    </div>
+
+    <hr class="divider"/>
+    <button class="btn" style="background:#1a1a1a;border:1px solid #333;color:#aaa" onclick="reset()">← Generate another token</button>
+  </div>
+</div>
+
+<div class="footer">
+  <a href="/health" target="_blank">Server health</a> · Powered by <a href="https://modelcontextprotocol.io" target="_blank">MCP</a>
+</div>
+
+<script>
+  // Fetch live tool count and whether admin key is required
+  fetch('/health')
+    .then(r => r.json())
+    .then(d => {
+      document.getElementById('toolCountBadge').textContent = `${d.tools} tools`;
+    }).catch(() => {});
+
+  fetch('/register-info')
+    .then(r => r.json())
+    .then(d => {
+      if (d.requires_admin_key) {
+        document.getElementById('adminSection').style.display = 'block';
+      }
+    }).catch(() => {});
+
+  function register() {
+    const name     = document.getElementById('nameInput').value.trim();
+    const adminKey = document.getElementById('adminKeyInput').value.trim();
+    const btn      = document.getElementById('registerBtn');
+    const errEl    = document.getElementById('errorMsg');
+
+    if (!name) { showError('Please enter your name.'); return; }
+
+    btn.disabled = true;
+    btn.textContent = 'Generating…';
+    errEl.classList.remove('show');
+
+    const headers = { 'Content-Type': 'application/json' };
+    if (adminKey) headers['Authorization'] = `Bearer ${adminKey}`;
+
+    fetch('/register', { method: 'POST', headers, body: JSON.stringify({ name }) })
+      .then(r => r.json().then(d => ({ ok: r.ok, data: d })))
+      .then(({ ok, data }) => {
+        if (!ok) { showError(data.error ?? 'Registration failed.'); return; }
+        document.getElementById('resultName').textContent = data.name;
+        document.getElementById('sseUrl').textContent     = data.sse_url;
+        document.getElementById('tokenDisplay').textContent = `Bearer ${data.token}`;
+        document.getElementById('formView').style.display  = 'none';
+        document.getElementById('resultView').classList.add('show');
+      })
+      .catch(() => showError('Network error — is the server reachable?'))
+      .finally(() => { btn.disabled = false; btn.textContent = 'Generate my token →'; });
+  }
+
+  function showError(msg) {
+    const el = document.getElementById('errorMsg');
+    el.textContent = msg;
+    el.classList.add('show');
+  }
+
+  function reset() {
+    document.getElementById('nameInput').value = '';
+    document.getElementById('adminKeyInput').value = '';
+    document.getElementById('formView').style.display = 'block';
+    document.getElementById('resultView').classList.remove('show');
+    document.getElementById('errorMsg').classList.remove('show');
+  }
+
+  function copy(elId, btn) {
+    const text = document.getElementById(elId).textContent;
+    navigator.clipboard.writeText(text).then(() => {
+      btn.textContent = 'Copied!';
+      btn.classList.add('copied');
+      setTimeout(() => { btn.textContent = 'Copy'; btn.classList.remove('copied'); }, 2000);
+    });
+  }
+
+  document.getElementById('nameInput').addEventListener('keydown', e => {
+    if (e.key === 'Enter') register();
+  });
+</script>
+</body>
+</html>
