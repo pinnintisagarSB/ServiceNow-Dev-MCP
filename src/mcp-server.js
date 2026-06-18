@@ -327,6 +327,202 @@ server.tool(
 );
 
 // ══════════════════════════════════════════════════════════════════════════
+// TOOLS: connect_servicenow / connect_jira / connect_salesforce
+//
+// One-step shortcut tools: accept credentials, store them, and immediately
+// verify the live connection — so the user never has to call configure_credentials
+// + connect as two separate steps. Claude should prefer these over the generic
+// configure_credentials tool when the user wants to connect a single platform.
+// ══════════════════════════════════════════════════════════════════════════
+
+server.tool(
+  'connect_servicenow',
+  `Connect to a ServiceNow instance in one step.
+
+  WHEN TO CALL: At the start of any session that needs ServiceNow access, or when
+  get_config shows servicenow.configured = false.
+
+  HOW TO ASK THE USER:
+    "To connect to your ServiceNow instance I need three things:
+     1. Your instance URL  (e.g. https://yourcompany.service-now.com)
+     2. Your username
+     3. Your password
+     These are held in memory for this session only — never stored or logged."
+
+  After calling this tool, tell the user whether the connection succeeded and
+  which instance you connected to. Then proceed with their request.`,
+  {
+    instance_url: z.string().url().describe('Full URL of the ServiceNow instance, e.g. https://yourcompany.service-now.com'),
+    username:     z.string().describe('ServiceNow username'),
+    password:     z.string().describe('ServiceNow password'),
+  },
+  async ({ instance_url, username, password }) => {
+    try {
+      // Store credentials for this session
+      _sessionCreds.servicenow = { instanceUrl: instance_url, username, password };
+      resetConnectors();
+
+      // Verify live connection immediately
+      process.env.SN_INSTANCE_URL = instance_url;
+      process.env.SN_USERNAME     = username;
+      process.env.SN_PASSWORD     = password;
+      const sn = await getSn();
+
+      // Quick smoke-test: fetch one record from sys_user
+      await sn.get('sys_user', { sysparm_limit: '1', sysparm_fields: 'sys_id' });
+
+      return ok({
+        connected:    true,
+        instance:     instance_url,
+        instructions_for_claude: [
+          `ServiceNow connected ✓ (${instance_url})`,
+          'Credentials are held in session memory only — they will be cleared when this conversation ends.',
+          'You can now use any ServiceNow tool. Proceed with the user\'s request.',
+        ],
+      });
+    } catch (e) {
+      // Clear bad credentials so a retry starts fresh
+      _sessionCreds.servicenow = null;
+      resetConnectors();
+      return fail(
+        `Could not connect to ServiceNow: ${e.message}\n` +
+        'Ask the user to check their instance URL, username, and password and try again.'
+      );
+    }
+  }
+);
+
+server.tool(
+  'connect_jira',
+  `Connect to a Jira Cloud instance in one step.
+
+  WHEN TO CALL: At the start of any session that needs Jira access, or when
+  get_config shows jira.configured = false.
+
+  HOW TO ASK THE USER:
+    "To connect to your Jira instance I need three things:
+     1. Your Atlassian URL  (e.g. https://yourcompany.atlassian.net)
+     2. Your Atlassian account email
+     3. A Jira API token — generate one at:
+        https://id.atlassian.com/manage-profile/security/api-tokens
+     These are held in memory for this session only — never stored or logged."
+
+  After calling this tool, confirm the connection and proceed with the user's request.`,
+  {
+    base_url:  z.string().url().describe('Atlassian URL, e.g. https://yourcompany.atlassian.net'),
+    email:     z.string().email().describe('Atlassian account email address'),
+    api_token: z.string().describe('Jira API token from id.atlassian.com/manage-profile/security/api-tokens'),
+  },
+  async ({ base_url, email, api_token }) => {
+    try {
+      _sessionCreds.jira = { baseUrl: base_url, email, apiToken: api_token };
+      resetConnectors();
+
+      process.env.JIRA_BASE_URL  = base_url;
+      process.env.JIRA_EMAIL     = email;
+      process.env.JIRA_API_TOKEN = api_token;
+      const jira = await getJira();
+
+      // Smoke-test: fetch current user
+      await jira.get('/rest/api/3/myself');
+
+      return ok({
+        connected:    true,
+        instance:     base_url,
+        instructions_for_claude: [
+          `Jira connected ✓ (${base_url})`,
+          'Credentials are held in session memory only.',
+          'You can now use any Jira tool. Proceed with the user\'s request.',
+        ],
+      });
+    } catch (e) {
+      _sessionCreds.jira = null;
+      resetConnectors();
+      return fail(
+        `Could not connect to Jira: ${e.message}\n` +
+        'Ask the user to verify their Atlassian URL, email, and API token. ' +
+        'API tokens are generated at https://id.atlassian.com/manage-profile/security/api-tokens'
+      );
+    }
+  }
+);
+
+server.tool(
+  'connect_salesforce',
+  `Connect to a Salesforce org in one step.
+
+  WHEN TO CALL: At the start of any session that needs Salesforce access, or when
+  get_config shows salesforce.configured = false.
+
+  HOW TO ASK THE USER:
+    "To connect to Salesforce I need:
+     1. Connected App consumer key (client ID)
+     2. Connected App consumer secret (client secret)
+     3. Your Salesforce username
+     4. Your Salesforce password
+     5. Your security token (optional — only needed if your IP is not allowlisted)
+     6. Login URL — use https://test.salesforce.com for sandboxes, otherwise leave default
+
+     To get a Connected App:
+       Salesforce Setup → App Manager → New Connected App
+       Enable OAuth, add 'api' and 'refresh_token' scopes
+
+     These are held in memory for this session only — never stored or logged."
+
+  After calling this tool, confirm the connection and proceed with the user's request.`,
+  {
+    client_id:      z.string().describe('Connected App consumer key'),
+    client_secret:  z.string().describe('Connected App consumer secret'),
+    username:       z.string().describe('Salesforce username (email format)'),
+    password:       z.string().describe('Salesforce password'),
+    security_token: z.string().optional().default('').describe('Security token — leave blank if IP is allowlisted'),
+    login_url:      z.string().url().optional().default('https://login.salesforce.com')
+                      .describe('https://login.salesforce.com for production, https://test.salesforce.com for sandboxes'),
+  },
+  async ({ client_id, client_secret, username, password, security_token, login_url }) => {
+    try {
+      _sessionCreds.salesforce = {
+        loginUrl:      login_url     ?? 'https://login.salesforce.com',
+        clientId:      client_id,
+        clientSecret:  client_secret,
+        username,
+        password,
+        securityToken: security_token ?? '',
+      };
+      resetConnectors();
+
+      process.env.SF_LOGIN_URL      = login_url      ?? 'https://login.salesforce.com';
+      process.env.SF_CLIENT_ID      = client_id;
+      process.env.SF_CLIENT_SECRET  = client_secret;
+      process.env.SF_USERNAME       = username;
+      process.env.SF_PASSWORD       = password;
+      process.env.SF_SECURITY_TOKEN = security_token ?? '';
+      const sf = await getSf();
+
+      // Smoke-test: fetch org info
+      const orgInfo = await sf.query('SELECT Id, Name FROM Organization LIMIT 1');
+
+      return ok({
+        connected:    true,
+        org:          orgInfo?.records?.[0]?.Name ?? 'connected',
+        instructions_for_claude: [
+          `Salesforce connected ✓ (org: ${orgInfo?.records?.[0]?.Name ?? username})`,
+          'Credentials are held in session memory only.',
+          'You can now use any Salesforce tool. Proceed with the user\'s request.',
+        ],
+      });
+    } catch (e) {
+      _sessionCreds.salesforce = null;
+      resetConnectors();
+      return fail(
+        `Could not connect to Salesforce: ${e.message}\n` +
+        'Ask the user to check their Connected App credentials and whether their IP needs a security token.'
+      );
+    }
+  }
+);
+
+// ══════════════════════════════════════════════════════════════════════════
 // TOOL: create_update_set
 // ══════════════════════════════════════════════════════════════════════════
 server.tool(
