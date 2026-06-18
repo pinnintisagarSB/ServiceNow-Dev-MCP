@@ -10,6 +10,7 @@
 
 import 'dotenv/config';
 import { AsyncLocalStorage }    from 'node:async_hooks';
+import { randomUUID }           from 'node:crypto';
 import { McpServer }            from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { z }                    from 'zod';
@@ -7061,7 +7062,31 @@ if (process.env.MCP_MODE === 'http') {
   const app     = express();
   const port    = parseInt(process.env.MCP_PORT ?? '3000', 10);
   const clients = new Map();
-  const apiKey  = process.env.MCP_API_KEY;
+
+  // ── Token registry ─────────────────────────────────────────────────────────
+  // MCP_API_KEY   : legacy single shared key (still works)
+  // ALLOWED_KEYS  : comma-separated list of per-user tokens
+  // ADMIN_KEY     : protects POST /register so only you can create tokens
+  //
+  // Priority: if ALLOWED_KEYS is set it is authoritative; MCP_API_KEY is
+  // included automatically so the server owner can always connect.
+  // If neither is set, the endpoint is open (safe for local/private deploys).
+
+  const adminKey = process.env.ADMIN_KEY;
+
+  // Build the live token set from env — re-evaluated on each request so you
+  // can update ALLOWED_KEYS via your deployment config without a restart.
+  // For runtime-registered tokens we maintain a separate in-memory set.
+  const _runtimeKeys = new Set(
+    (process.env.ALLOWED_KEYS ?? '').split(',').map(k => k.trim()).filter(Boolean)
+  );
+  if (process.env.MCP_API_KEY) _runtimeKeys.add(process.env.MCP_API_KEY);
+
+  function isValidToken(authHeader) {
+    if (_runtimeKeys.size === 0) return true; // open if no keys configured
+    if (!authHeader?.startsWith('Bearer ')) return false;
+    return _runtimeKeys.has(authHeader.slice(7));
+  }
 
   // ── Body size limit — prevents DoS via oversized payloads ─────────────────
   app.use(express.json({ limit: '1mb' }));
@@ -7085,7 +7110,6 @@ if (process.env.MCP_MODE === 'http') {
     _rateLimits.set(ip, times);
     return false;
   }
-  // Prune stale entries every 5 min to avoid unbounded memory growth
   setInterval(() => {
     const cutoff = Date.now() - 60_000;
     for (const [ip, times] of _rateLimits) {
@@ -7106,18 +7130,80 @@ if (process.env.MCP_MODE === 'http') {
     };
   }
 
-  // ── API key guard — skip if MCP_API_KEY is not set ─────────────────────────
   function checkApiKey(req, res, next) {
-    if (!apiKey) { next(); return; }
-    if (req.headers['authorization'] === `Bearer ${apiKey}`) { next(); return; }
-    res.status(401).json({ error: 'Unauthorized' });
+    if (isValidToken(req.headers['authorization'])) { next(); return; }
+    res.status(401).json({ error: 'Unauthorized — provide a valid Bearer token' });
   }
 
-  // ── Health — no auth, reports live tool count ──────────────────────────────
-  const toolCount = server._registeredTools ? Object.keys(server._registeredTools).length : 116;
+  // ── Health — public, no auth ───────────────────────────────────────────────
+  const toolCount = server._registeredTools ? Object.keys(server._registeredTools).length : 125;
   app.get('/health', (_req, res) =>
     res.json({ status: 'ok', server: 'sn-data-migration', tools: toolCount, sessions: clients.size })
   );
+
+  // ── Token registration — POST /register ───────────────────────────────────
+  // Generates a new per-user token.
+  // Protected by ADMIN_KEY if set; open if not (useful during initial setup).
+  //
+  // Request:  POST /register  { "name": "alice" }
+  //           Authorization: Bearer <ADMIN_KEY>   (only required if ADMIN_KEY is set)
+  //
+  // Response: { "token": "sn-mcp-xxxx...", "name": "alice",
+  //             "sse_url": "https://...", "instructions": "..." }
+  app.post('/register', rateLimit(5), (req, res) => {
+    if (adminKey && req.headers['authorization'] !== `Bearer ${adminKey}`) {
+      res.status(401).json({ error: 'ADMIN_KEY required to register new tokens' });
+      return;
+    }
+
+    const name = (req.body?.name ?? '').toString().trim().replace(/[^a-zA-Z0-9_-]/g, '') || 'user';
+    // crypto.randomUUID is available in Node 22
+    const token = `sn-mcp-${name}-${randomUUID().replace(/-/g, '').slice(0, 16)}`;
+    _runtimeKeys.add(token);
+
+    const host    = req.headers['x-forwarded-host'] ?? req.headers['host'] ?? `localhost:${port}`;
+    const proto   = req.headers['x-forwarded-proto'] ?? (port === 443 ? 'https' : 'http');
+    const sseUrl  = `${proto}://${host}/sse`;
+
+    logger.info(`New token registered for "${name}" (${token.slice(0, 20)}...)`);
+
+    res.json({
+      name,
+      token,
+      sse_url: sseUrl,
+      instructions: [
+        `1. Open Claude.ai → Settings → Connectors → Add connector`,
+        `2. Set URL to: ${sseUrl}`,
+        `3. Set Authorization header to: Bearer ${token}`,
+        `4. Save — Claude will ask for your ServiceNow/Jira/Salesforce credentials on first use`,
+      ],
+    });
+  });
+
+  // ── Token revocation — DELETE /register/:token ─────────────────────────────
+  // Requires ADMIN_KEY. Revoked tokens are removed from the live set immediately.
+  app.delete('/register/:token', (req, res) => {
+    if (!adminKey || req.headers['authorization'] !== `Bearer ${adminKey}`) {
+      res.status(401).json({ error: 'ADMIN_KEY required to revoke tokens' });
+      return;
+    }
+    const { token } = req.params;
+    if (_runtimeKeys.delete(token)) {
+      logger.info(`Token revoked: ${token.slice(0, 20)}...`);
+      res.json({ revoked: true, token });
+    } else {
+      res.status(404).json({ error: 'Token not found' });
+    }
+  });
+
+  // ── List active tokens — GET /register ────────────────────────────────────
+  app.get('/register', (req, res) => {
+    if (!adminKey || req.headers['authorization'] !== `Bearer ${adminKey}`) {
+      res.status(401).json({ error: 'ADMIN_KEY required' });
+      return;
+    }
+    res.json({ count: _runtimeKeys.size, tokens: [..._runtimeKeys].map(t => t.slice(0, 24) + '...') });
+  });
 
   // ── SSE endpoint — Claude.ai web connects here ────────────────────────────
   // Rate-limited to 10 new connections/min per IP to prevent session flooding
@@ -7155,7 +7241,7 @@ if (process.env.MCP_MODE === 'http') {
     logger.info(`sn-data-migration MCP server running in HTTP/SSE mode on port ${port}`);
     logger.info(`  SSE:     http://localhost:${port}/sse`);
     logger.info(`  Health:  http://localhost:${port}/health`);
-    logger.info(`  Auth:    ${apiKey ? 'Bearer token enabled' : 'open (set MCP_API_KEY to protect)'}`);
+    logger.info(`  Auth:    ${_runtimeKeys.size > 0 ? `${_runtimeKeys.size} token(s) active` : 'open — set ADMIN_KEY + use POST /register to issue tokens'}`);
   });
 
   function shutdown(signal) {
