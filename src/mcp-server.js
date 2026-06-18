@@ -7271,15 +7271,26 @@ if (process.env.MCP_MODE === 'http') {
   });
 
   // ── Streamable HTTP — Claude.ai web connector uses this ──────────────────
-  // Handles both GET (SSE stream) and POST (JSON-RPC) at /sse
-  // Each request gets its own transport + server instance (stateless-friendly)
+  // First request (no mcp-session-id): create new transport + server, store in map.
+  // Subsequent requests (with mcp-session-id): reuse existing transport.
   app.all('/sse', rateLimit(60), checkApiKey, async (req, res) => {
+    const existingId = req.headers['mcp-session-id'];
+
+    // Reuse existing session
+    if (existingId) {
+      const existing = clients.get(existingId);
+      if (!existing) { res.status(404).json({ error: 'Session not found or expired' }); return; }
+      await _sessionContext.run(existingId, () => existing.handleRequest(req, res, req.body));
+      return;
+    }
+
+    // New session
     const transport = new StreamableHTTPServerTransport({
       sessionIdGenerator: () => randomUUID(),
+      enableJsonResponse: true,
       onsessioninitialized: (sessionId) => {
         clients.set(sessionId, transport);
-        _sessionContext.run(sessionId, () => {});
-        logger.info(`Streamable HTTP session started (${sessionId})`);
+        logger.info(`Session started (${sessionId})`);
       },
     });
 
@@ -7287,7 +7298,7 @@ if (process.env.MCP_MODE === 'http') {
       if (transport.sessionId) {
         clients.delete(transport.sessionId);
         _sessions.delete(transport.sessionId);
-        logger.info(`Streamable HTTP session closed (${transport.sessionId})`);
+        logger.info(`Session closed (${transport.sessionId})`);
       }
     };
 
