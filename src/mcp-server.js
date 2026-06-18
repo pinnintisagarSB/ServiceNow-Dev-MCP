@@ -163,8 +163,16 @@ function resetConnectors() {
 const ok  = (data) => ({ content: [{ type: 'text', text: JSON.stringify(data, null, 2) }] });
 const fail = (msg) => ({ content: [{ type: 'text', text: `ERROR: ${msg}` }], isError: true });
 
-// ── Server ─────────────────────────────────────────────────────────────────
-const server = new McpServer({ name: 'sn-data-migration', version: '1.0.0' });
+// ── Server factory — one McpServer instance per SSE connection ─────────────
+// McpServer can only be connected to one transport at a time. For multi-user
+// SSE we create a fresh instance per connection via registerTools(server).
+function createServer() {
+  const s = new McpServer({ name: 'sn-data-migration', version: '2.1.0' });
+  registerTools(s);
+  return s;
+}
+
+function registerTools(server) {
 
 // ══════════════════════════════════════════════════════════════════════════
 // TOOL: get_config  (always call first in a new session)
@@ -7057,6 +7065,8 @@ Use this when:
   }
 );
 
+} // end registerTools
+
 // ── Start: stdio (CLI) or HTTP/SSE (web Claude Code / remote) ────────────
 // Set MCP_MODE=http (and optionally MCP_PORT) to run as an HTTP server.
 // Default is stdio for local Claude Code CLI use.
@@ -7143,7 +7153,8 @@ if (process.env.MCP_MODE === 'http') {
   }
 
   // ── Health — public, no auth ───────────────────────────────────────────────
-  const toolCount = server._registeredTools ? Object.keys(server._registeredTools).length : 125;
+  const _healthServer = createServer();
+  const toolCount = _healthServer._registeredTools ? Object.keys(_healthServer._registeredTools).length : 125;
   app.get('/health', (_req, res) =>
     res.json({ status: 'ok', server: 'sn-data-migration', tools: toolCount, sessions: clients.size })
   );
@@ -7223,7 +7234,8 @@ if (process.env.MCP_MODE === 'http') {
   // ── SSE endpoint — Claude.ai web connects here ────────────────────────────
   // Rate-limited to 10 new connections/min per IP to prevent session flooding
   app.get('/sse', rateLimit(10), checkApiKey, async (req, res) => {
-    const transport = new SSEServerTransport('/messages', res);
+    const transport  = new SSEServerTransport('/messages', res);
+    const mcpServer  = createServer(); // fresh instance — McpServer is 1:1 with transport
     clients.set(transport.sessionId, transport);
 
     // Heartbeat comment every 30 s — keeps connection alive through nginx/Cloudflare
@@ -7239,7 +7251,7 @@ if (process.env.MCP_MODE === 'http') {
       logger.info(`SSE client disconnected (session: ${transport.sessionId})`);
     });
 
-    await server.connect(transport);
+    await mcpServer.connect(transport);
     logger.info(`SSE client connected (session: ${transport.sessionId})`);
   });
 
@@ -7275,7 +7287,7 @@ if (process.env.MCP_MODE === 'http') {
 } else {
   // Default: stdio for Claude Code CLI
   const transport = new StdioServerTransport();
-  await server.connect(transport);
+  await createServer().connect(transport);
   logger.info('sn-data-migration MCP server running (stdio)');
 }
 
