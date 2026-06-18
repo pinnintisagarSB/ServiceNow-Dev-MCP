@@ -165,6 +165,78 @@ function resetConnectors() {
 const ok  = (data) => ({ content: [{ type: 'text', text: JSON.stringify(data, null, 2) }] });
 const fail = (msg) => ({ content: [{ type: 'text', text: `ERROR: ${msg}` }], isError: true });
 
+// ── Credential guards ──────────────────────────────────────────────────────
+// Each returns { connector } on success or { error: fail(...) } when credentials
+// are missing or authentication fails — so every tool can gate itself with:
+//   const { sn, error } = await _requireSn(); if (error) return error;
+
+function _sessionCreds() {
+  try { return _getSession().creds; } catch { return {}; }
+}
+
+async function _requireSn() {
+  const creds  = _sessionCreds();
+  const hasEnv = !!(process.env.SN_INSTANCE_URL && (process.env.SN_USERNAME || process.env.SN_USE_SDK_AUTH === 'true'));
+  if (!creds.servicenow && !hasEnv) {
+    return { error: fail(
+      'ServiceNow credentials are not configured for this session. ' +
+      'Please call connect_servicenow and provide your instance URL, username, and password.'
+    )};
+  }
+  try {
+    return { sn: await getSn() };
+  } catch (e) {
+    const msg = String(e.message ?? e);
+    return { error: fail(
+      /401|403|unauthorized|forbidden/i.test(msg)
+        ? 'ServiceNow authentication failed — call connect_servicenow again with the correct credentials.'
+        : `ServiceNow connection error: ${msg}`
+    )};
+  }
+}
+
+async function _requireJira() {
+  const creds  = _sessionCreds();
+  const hasEnv = !!(process.env.JIRA_BASE_URL && process.env.JIRA_EMAIL && process.env.JIRA_API_TOKEN);
+  if (!creds.jira && !hasEnv) {
+    return { error: fail(
+      'Jira credentials are not configured for this session. ' +
+      'Please call connect_jira and provide your Jira base URL, email, and API token.'
+    )};
+  }
+  try {
+    return { jira: await getJira() };
+  } catch (e) {
+    const msg = String(e.message ?? e);
+    return { error: fail(
+      /401|403|unauthorized|forbidden/i.test(msg)
+        ? 'Jira authentication failed — call connect_jira again with the correct credentials.'
+        : `Jira connection error: ${msg}`
+    )};
+  }
+}
+
+async function _requireSf() {
+  const creds  = _sessionCreds();
+  const hasEnv = !!(process.env.SF_CLIENT_ID && process.env.SF_USERNAME);
+  if (!creds.salesforce && !hasEnv) {
+    return { error: fail(
+      'Salesforce credentials are not configured for this session. ' +
+      'Please call connect_salesforce and provide your login URL, client ID, client secret, username, and password.'
+    )};
+  }
+  try {
+    return { sf: await getSf() };
+  } catch (e) {
+    const msg = String(e.message ?? e);
+    return { error: fail(
+      /401|403|unauthorized|forbidden/i.test(msg)
+        ? 'Salesforce authentication failed — call connect_salesforce again with the correct credentials.'
+        : `Salesforce connection error: ${msg}`
+    )};
+  }
+}
+
 // ── Server factory — one McpServer instance per SSE connection ─────────────
 // McpServer can only be connected to one transport at a time. For multi-user
 // SSE we create a fresh instance per connection via registerTools(server).
@@ -412,7 +484,8 @@ server.tool(
       process.env.SN_INSTANCE_URL = instance_url;
       process.env.SN_USERNAME     = username;
       process.env.SN_PASSWORD     = password;
-      const sn = await getSn();
+      const { sn, error: _snErr } = await _requireSn();
+      if (_snErr) return _snErr;
 
       // Quick smoke-test: fetch one record from sys_user
       await sn.get('sys_user', { sysparm_limit: '1', sysparm_fields: 'sys_id' });
@@ -467,7 +540,8 @@ server.tool(
       process.env.JIRA_BASE_URL  = base_url;
       process.env.JIRA_EMAIL     = email;
       process.env.JIRA_API_TOKEN = api_token;
-      const jira = await getJira();
+      const { jira, error: _jiraErr } = await _requireJira();
+      if (_jiraErr) return _jiraErr;
 
       // Smoke-test: fetch current user
       await jira.get('/rest/api/3/myself');
@@ -543,7 +617,8 @@ server.tool(
       process.env.SF_USERNAME       = username;
       process.env.SF_PASSWORD       = password;
       process.env.SF_SECURITY_TOKEN = security_token ?? '';
-      const sf = await getSf();
+      const { sf, error: _sfErr } = await _requireSf();
+      if (_sfErr) return _sfErr;
 
       // Smoke-test: fetch org info
       const orgInfo = await sf.query('SELECT Id, Name FROM Organization LIMIT 1');
@@ -594,7 +669,8 @@ server.tool(
   },
   async ({ name, description }) => {
     try {
-      const sn = await getSn();
+      const { sn, error: _snErr } = await _requireSn();
+      if (_snErr) return _snErr;
 
       // Create the update set
       const updateSet = await sn.createUpdateSet(name, description ?? `Migration setup: ${name}`);
@@ -633,7 +709,8 @@ server.tool(
   {},
   async () => {
     try {
-      const sn   = await getSn();
+      const { sn, error: _snErr } = await _requireSn();
+      if (_snErr) return _snErr;
       const sets = await sn.listUpdateSets();
       return ok({
         instructions_for_claude: sets.length
@@ -674,7 +751,8 @@ server.tool(
   },
   async ({ update_set_sys_id }) => {
     try {
-      const sn  = await getSn();
+      const { sn, error: _snErr } = await _requireSn();
+      if (_snErr) return _snErr;
       await sn.completeUpdateSet(update_set_sys_id);
       const url = `${sn.baseUrl}/nav_to.do?uri=sys_update_set.do?sys_id=${update_set_sys_id}`;
       return ok({
@@ -707,9 +785,15 @@ server.tool(
   },
   async ({ platform, object_name, sn_table, staging_table }) => {
     try {
-      const sn        = await getSn();
+      const { sn, error: _snErr } = await _requireSn();
+      if (_snErr) return _snErr;
       const discovery = new SchemaDiscovery(sn);
-      const source    = platform === 'salesforce' ? await getSf() : await getJira();
+      let source;
+      if (platform === 'salesforce') {
+        const { sf, error: _sfErr } = await _requireSf(); if (_sfErr) return _sfErr; source = sf;
+      } else {
+        const { jira, error: _jiraErr } = await _requireJira(); if (_jiraErr) return _jiraErr; source = jira;
+      }
 
       let sourceFields;
       if (platform === 'salesforce') sourceFields = await discovery.discoverSalesforceSchema(source, object_name);
@@ -779,15 +863,18 @@ server.tool(
     try {
       const results = {};
       if (platform === 'all' || platform === 'servicenow') {
-        const sn = await getSn();
+        const { sn, error: _snErr } = await _requireSn();
+        if (_snErr) return _snErr;
         results.servicenow = { connected: true, instance: sn.baseUrl };
       }
       if (platform === 'all' || platform === 'salesforce') {
-        const sf = await getSf();
+        const { sf, error: _sfErr } = await _requireSf();
+        if (_sfErr) return _sfErr;
         results.salesforce = { connected: true, instance: sf.instanceUrl, api_version: sf.apiVersion };
       }
       if (platform === 'all' || platform === 'jira') {
-        const jira = await getJira();
+        const { jira, error: _jiraErr } = await _requireJira();
+        if (_jiraErr) return _jiraErr;
         results.jira = { connected: true, base_url: jira.baseUrl };
       }
       return ok({ status: 'connected', ...results });
@@ -811,7 +898,8 @@ server.tool(
   },
   async ({ platform, object_name }) => {
     try {
-      const sn        = await getSn();
+      const { sn, error: _snErr } = await _requireSn();
+      if (_snErr) return _snErr;
       const discovery = new SchemaDiscovery(sn);
       const result    = await discovery.suggestTargetTable(object_name);
 
@@ -862,13 +950,17 @@ server.tool(
   },
   async ({ platform, object_name, sn_table }) => {
     try {
-      const sn        = await getSn();
+      const { sn, error: _snErr } = await _requireSn();
+      if (_snErr) return _snErr;
       const discovery = new SchemaDiscovery(sn);
 
       // Connector dispatch — generic, works for any platform
       let connector;
-      if (platform === 'salesforce') connector = await getSf();
-      else if (platform === 'jira')  connector = await getJira();
+      if (platform === 'salesforce') {
+        const { sf, error: _sfErr } = await _requireSf(); if (_sfErr) return _sfErr; connector = sf;
+      } else if (platform === 'jira') {
+        const { jira, error: _jiraErr } = await _requireJira(); if (_jiraErr) return _jiraErr; connector = jira;
+      }
       // else: custom connector must have been registered via SchemaDiscovery.registerConnector()
 
       const sourceFields = await discovery.discoverSourceSchema(platform, connector, object_name);
@@ -953,9 +1045,15 @@ server.tool(
   },
   async ({ platform, object_name, sn_table, mappings }) => {
     try {
-      const sn        = await getSn();
+      const { sn, error: _snErr } = await _requireSn();
+      if (_snErr) return _snErr;
       const discovery = new SchemaDiscovery(sn);
-      const source    = platform === 'salesforce' ? await getSf() : await getJira();
+      let source;
+      if (platform === 'salesforce') {
+        const { sf, error: _sfErr } = await _requireSf(); if (_sfErr) return _sfErr; source = sf;
+      } else {
+        const { jira, error: _jiraErr } = await _requireJira(); if (_jiraErr) return _jiraErr; source = jira;
+      }
 
       let sourceFields;
       if (platform === 'salesforce') sourceFields = await discovery.discoverSalesforceSchema(source, object_name);
@@ -1024,7 +1122,8 @@ server.tool(
   },
   async ({ platform, object_name, staging_table, target_table, mappings, sample_size, filter }) => {
     try {
-      const sn        = await getSn();
+      const { sn, error: _snErr } = await _requireSn();
+      if (_snErr) return _snErr;
       const runner    = new MigrationRunner(sn);
       const validator = new MigrationValidator(sn);
       const limit     = sample_size ?? parseInt(process.env.MIGRATION_TEST_LIMIT ?? '5', 10);
@@ -1050,13 +1149,15 @@ server.tool(
 
       let records = [];
       if (platform === 'jira') {
-        const jira   = await getJira();
+        const { jira, error: _jiraErr } = await _requireJira();
+        if (_jiraErr) return _jiraErr;
         const jql    = filter ? `project=${object_name} AND ${filter}` : `project=${object_name} ORDER BY created DESC`;
         const result = await jira.search({ jql, maxResults: limit });
         const full   = await Promise.all(result.issues.map(i => jira.get(`/rest/api/3/issue/${i.id}`)));
         records = full.map(flattenJira);
       } else {
-        const sf     = await getSf();
+        const { sf, error: _sfErr } = await _requireSf();
+        if (_sfErr) return _sfErr;
         const fields = [...new Set(mappings.map(m => m.source_field).filter(Boolean))].join(',');
         const where  = filter ? ` WHERE ${filter}` : '';
         const result = await sf.query(`SELECT ${fields} FROM ${object_name}${where} LIMIT ${limit}`);
@@ -1139,15 +1240,18 @@ server.tool(
   },
   async ({ platform, project_keys, auto_create_users }) => {
     try {
-      const sn       = await getSn();
+      const { sn, error: _snErr } = await _requireSn();
+      if (_snErr) return _snErr;
       const analyzer = new DependencyAnalyzer(sn);
 
       let analysis;
       if (platform === 'jira') {
-        const jira = await getJira();
+        const { jira, error: _jiraErr } = await _requireJira();
+        if (_jiraErr) return _jiraErr;
         analysis   = await analyzer.analyze(platform, jira, project_keys);
       } else {
-        const sf = await getSf();
+        const { sf, error: _sfErr } = await _requireSf();
+        if (_sfErr) return _sfErr;
         analysis  = await analyzer.analyze(platform, sf, project_keys);
       }
 
@@ -1214,7 +1318,8 @@ server.tool(
   },
   async ({ transform_map_sys_id }) => {
     try {
-      const sn       = await getSn();
+      const { sn, error: _snErr } = await _requireSn();
+      if (_snErr) return _snErr;
       const analyzer = new DependencyAnalyzer(sn);
       const analysis = await analyzer.analyzeTransformMap(transform_map_sys_id);
 
@@ -1252,11 +1357,13 @@ server.tool(
   },
   async ({ platform, object_name, staging_table, mappings, filter }) => {
     try {
-      const sn     = await getSn();
+      const { sn, error: _snErr } = await _requireSn();
+      if (_snErr) return _snErr;
       const runner = new MigrationRunner(sn);
 
       if (platform === 'jira') {
-        const jira       = await getJira();
+        const { jira, error: _jiraErr } = await _requireJira();
+        if (_jiraErr) return _jiraErr;
         const analyzer   = new DependencyAnalyzer(sn);
         const projectKeys = object_name.split(',').map(k => k.trim());
 
@@ -1313,7 +1420,8 @@ server.tool(
       }
 
       // Salesforce — batched paginated migration
-      const sf          = await getSf();
+      const { sf, error: _sfErr } = await _requireSf();
+      if (_sfErr) return _sfErr;
       const fields      = [...new Set(mappings.map(m => m.source_field).filter(Boolean))].join(',');
       const where       = filter ? ` WHERE ${filter}` : '';
       const flatSf      = (r) => {
@@ -1372,7 +1480,8 @@ server.tool(
         });
       }
 
-      const sn      = await getSn();
+      const { sn, error: _snErr } = await _requireSn();
+      if (_snErr) return _snErr;
       const cleanup = new MigrationCleanup(sn);
       const result  = await cleanup.cleanupAll({
         stagingTable:  staging_table,
@@ -1422,7 +1531,8 @@ server.tool(
   },
   async ({ platform, object_name, staging_table, target_table, confirmed }) => {
     try {
-      const sn      = await getSn();
+      const { sn, error: _snErr } = await _requireSn();
+      if (_snErr) return _snErr;
       const cleanup = new MigrationCleanup(sn);
 
       // Always discover first so we can show the user what will be deleted
@@ -1514,7 +1624,8 @@ server.tool(
   },
   async ({ platform, object_name, staging_table, target_table, project_field, filter }) => {
     try {
-      const sn      = await getSn();
+      const { sn, error: _snErr } = await _requireSn();
+      if (_snErr) return _snErr;
       const keys    = object_name.split(',').map(k => k.trim());
       const results = [];
 
@@ -1522,12 +1633,14 @@ server.tool(
         // ── Source count ──────────────────────────────────────────────────
         let sourceCount = 0;
         if (platform === 'jira') {
-          const jira  = await getJira();
+          const { jira, error: _jiraErr } = await _requireJira();
+          if (_jiraErr) return _jiraErr;
           const jql   = filter ? `project=${key} AND ${filter}` : `project=${key}`;
           const res   = await jira.search({ jql, maxResults: 0 });
           sourceCount = res.total ?? 0;
         } else {
-          const sf     = await getSf();
+          const { sf, error: _sfErr } = await _requireSf();
+          if (_sfErr) return _sfErr;
           const where  = filter ? ` WHERE ${filter}` : '';
           const res    = await sf.query(`SELECT COUNT() FROM ${key}${where}`);
           sourceCount  = res.totalSize ?? 0;
@@ -1614,7 +1727,9 @@ server.tool(
   {},
   async () => {
     try {
-      const retriever = new FlowRetriever(await getSf());
+      const { sf, error: _sfErr } = await _requireSf();
+      if (_sfErr) return _sfErr;
+      const retriever = new FlowRetriever(sf);
       const flows     = await retriever.listFlows();
       return ok({
         total: flows.length,
@@ -1653,7 +1768,9 @@ server.tool(
   },
   async ({ flow_api_name, sn_table }) => {
     try {
-      const retriever = new FlowRetriever(await getSf());
+      const { sf, error: _sfErr } = await _requireSf();
+      if (_sfErr) return _sfErr;
+      const retriever = new FlowRetriever(sf);
       const raw       = await retriever.getFlowMetadata(flow_api_name);
       if (!raw) throw new Error(`Flow "${flow_api_name}" not found or not active`);
       const structure = retriever.parseFlowStructure(raw);
@@ -1745,7 +1862,8 @@ server.tool(
   },
   async ({ source_platform, flow_analysis, sn_table, field_mappings, sn_instance_url }) => {
     try {
-      const sn   = await getSn();
+      const { sn, error: _snErr } = await _requireSn();
+      if (_snErr) return _snErr;
       const base = sn_instance_url ?? process.env.SN_INSTANCE_URL?.replace(/\/$/, '') ?? 'https://your-instance.service-now.com';
       const fa   = flow_analysis;
 
@@ -1967,7 +2085,8 @@ server.tool(
   },
   async ({ table, query, fields, limit, display_value }) => {
     try {
-      const sn = await getSn();
+      const { sn, error: _snErr } = await _requireSn();
+      if (_snErr) return _snErr;
       const params = { sysparm_limit: String(limit) };
       if (query)  params.sysparm_query = query;
       if (fields) params.sysparm_fields = fields;
@@ -2021,9 +2140,15 @@ server.tool(
   },
   async ({ platform, object_name, sn_table, mappings, artifacts, migration_stats, customer_name, prepared_by }) => {
     try {
-      const sn        = await getSn();
+      const { sn, error: _snErr } = await _requireSn();
+      if (_snErr) return _snErr;
       const discovery = new SchemaDiscovery(sn);
-      const source    = platform === 'salesforce' ? await getSf() : await getJira();
+      let source;
+      if (platform === 'salesforce') {
+        const { sf, error: _sfErr } = await _requireSf(); if (_sfErr) return _sfErr; source = sf;
+      } else {
+        const { jira, error: _jiraErr } = await _requireJira(); if (_jiraErr) return _jiraErr; source = jira;
+      }
 
       let sourceFields;
       if (platform === 'salesforce') sourceFields = await discovery.discoverSalesforceSchema(source, object_name);
@@ -2126,7 +2251,8 @@ server.tool(
   { sn_table: z.string() },
   async ({ sn_table }) => {
     try {
-      const sn  = await getSn();
+      const { sn, error: _snErr } = await _requireSn();
+      if (_snErr) return _snErr;
       const acl = await sn.checkTableAccess(sn_table);
       const chain = await sn.getTableExtensionChain(sn_table);
       const missing = Object.entries(acl).filter(([_, v]) => !v).map(([k]) => k);
@@ -2152,7 +2278,8 @@ server.tool(
   { staging_table: z.string(), staging_sys_id: z.string(), transform_map_sys_id: z.string() },
   async ({ staging_table, staging_sys_id, transform_map_sys_id }) => {
     try {
-      const sn = await getSn();
+      const { sn, error: _snErr } = await _requireSn();
+      if (_snErr) return _snErr;
       const preview = await sn.previewTransform(staging_table, staging_sys_id, transform_map_sys_id);
       return ok({ preview, message: 'These are the values that would land in the target record.' });
     } catch (e) { return fail(e.message); }
@@ -2175,7 +2302,8 @@ server.tool(
   },
   async ({ sn_table, correlation_prefix, confirm }) => {
     try {
-      const sn = await getSn();
+      const { sn, error: _snErr } = await _requireSn();
+      if (_snErr) return _snErr;
       const rows = await sn.get(sn_table, {
         sysparm_query:  `correlation_idSTARTSWITH${correlation_prefix}`,
         sysparm_fields: 'sys_id,correlation_id',
@@ -2210,7 +2338,8 @@ server.tool(
   },
   async ({ platform, source_ids, sn_table }) => {
     try {
-      const sn = await getSn();
+      const { sn, error: _snErr } = await _requireSn();
+      if (_snErr) return _snErr;
       const prefix = platform === 'salesforce' ? 'salesforce' : 'jira';
       let uploaded = 0, failed = 0, skipped = 0;
       const errors = [];
@@ -2220,7 +2349,8 @@ server.tool(
         if (!target) { skipped++; continue; }
 
         if (platform === 'jira') {
-          const jira = await getJira();
+          const { jira, error: _jiraErr } = await _requireJira();
+          if (_jiraErr) return _jiraErr;
           const atts = await jira.getAttachments(id);
           for (const a of atts) {
             try {
@@ -2230,7 +2360,8 @@ server.tool(
             } catch (e) { failed++; errors.push(`${id}/${a.filename}: ${e.message}`); }
           }
         } else {
-          const sf = await getSf();
+          const { sf, error: _sfErr } = await _requireSf();
+          if (_sfErr) return _sfErr;
           const versions = await sf.getContentVersionsFor(id);
           for (const v of versions) {
             try {
@@ -2262,7 +2393,8 @@ server.tool(
   },
   async ({ platform, source_ids, sn_table, journal_field }) => {
     try {
-      const sn = await getSn();
+      const { sn, error: _snErr } = await _requireSn();
+      if (_snErr) return _snErr;
       const prefix = platform === 'salesforce' ? 'salesforce' : 'jira';
       let added = 0, skipped = 0, failed = 0;
       for (const id of source_ids) {
@@ -2271,10 +2403,12 @@ server.tool(
         try {
           let comments = [];
           if (platform === 'jira') {
-            const jira = await getJira();
+            const { jira, error: _jiraErr } = await _requireJira();
+            if (_jiraErr) return _jiraErr;
             comments = await jira.getComments(id);
           } else {
-            const sf = await getSf();
+            const { sf, error: _sfErr } = await _requireSf();
+            if (_sfErr) return _sfErr;
             const raw = await sf.getCaseComments(id);
             comments = raw.map(c => ({ author: c.CreatedById, created: c.CreatedDate, body: c.CommentBody }));
           }
@@ -2306,7 +2440,8 @@ server.tool(
   },
   async ({ platform, object_or_project, sn_table, staging_table, watermark_key }) => {
     try {
-      const sn = await getSn();
+      const { sn, error: _snErr } = await _requireSn();
+      if (_snErr) return _snErr;
       const lastWatermark = await sn.getWatermark(watermark_key);
       const newWatermark  = new Date().toISOString();
 
@@ -2314,7 +2449,8 @@ server.tool(
       let processed = 0;
 
       if (platform === 'jira') {
-        const jira = await getJira();
+        const { jira, error: _jiraErr } = await _requireJira();
+        if (_jiraErr) return _jiraErr;
         const jql = lastWatermark
           ? `project=${object_or_project} AND updated>="${lastWatermark.substring(0,16).replace('T',' ')}"`
           : `project=${object_or_project}`;
@@ -2322,7 +2458,8 @@ server.tool(
         const result   = await runner.runFullMigration(staging_table, iterator, i => ({ jira_key: i.key, jira_summary: i.fields?.summary ?? '' }));
         processed = result.stats.total;
       } else {
-        const sf = await getSf();
+        const { sf, error: _sfErr } = await _requireSf();
+        if (_sfErr) return _sfErr;
         const soql = lastWatermark
           ? `SELECT Id, LastModifiedDate FROM ${object_or_project} WHERE LastModifiedDate > ${lastWatermark}`
           : `SELECT Id FROM ${object_or_project}`;
@@ -2354,7 +2491,8 @@ server.tool(
   { max_wait_seconds: z.number().optional().default(300) },
   async ({ max_wait_seconds }) => {
     try {
-      const sn = await getSn();
+      const { sn, error: _snErr } = await _requireSn();
+      if (_snErr) return _snErr;
       const started = Date.now();
       let last = null;
       while ((Date.now() - started) / 1000 < max_wait_seconds) {
@@ -2386,7 +2524,8 @@ server.tool(
   { days_old: z.number().optional().default(30) },
   async ({ days_old }) => {
     try {
-      const sn = await getSn();
+      const { sn, error: _snErr } = await _requireSn();
+      if (_snErr) return _snErr;
       const r = await sn.cleanupOldImportSetRuns(days_old);
       return ok({ ...r, message: `Scanned ${r.scanned} runs older than ${days_old} days. Deleted ${r.deleted}.` });
     } catch (e) { return fail(e.message); }
@@ -2415,7 +2554,8 @@ server.tool(
   async ({ platform, object_name, filter, fields }) => {
     try {
       if (platform === 'jira') {
-        const jira = await getJira();
+        const { jira, error: _jiraErr } = await _requireJira();
+        if (_jiraErr) return _jiraErr;
         const jql  = filter
           ? `project=${object_name} AND ${filter}`
           : `project=${object_name}`;
@@ -2450,7 +2590,8 @@ server.tool(
       }
 
       if (platform === 'salesforce') {
-        const sf         = await getSf();
+        const { sf, error: _sfErr } = await _requireSf();
+        if (_sfErr) return _sfErr;
         const previewFields = fields?.length ? fields : ['Id', 'Name', 'CreatedDate', 'LastModifiedDate'];
         const where      = filter ? ` WHERE ${filter}` : '';
         const countSoql  = `SELECT COUNT() FROM ${object_name}${where}`;
@@ -2494,7 +2635,8 @@ server.tool(
   },
   async ({ project_key }) => {
     try {
-      const jira      = await getJira();
+      const { jira, error: _jiraErr } = await _requireJira();
+      if (_jiraErr) return _jiraErr;
       const retriever = new JiraAutomationRetriever(jira);
       const rules     = await retriever.listAutomations(project_key ?? null);
 
@@ -2535,7 +2677,8 @@ server.tool(
   },
   async ({ rule_id, sn_table }) => {
     try {
-      const jira      = await getJira();
+      const { jira, error: _jiraErr } = await _requireJira();
+      if (_jiraErr) return _jiraErr;
       const retriever = new JiraAutomationRetriever(jira);
       const raw       = await retriever.getAutomation(rule_id);
       const parsed    = retriever.parseRule(raw);
@@ -2582,8 +2725,10 @@ server.tool(
   },
   async ({ rule_id, sn_table, flow_scope, field_mappings }) => {
     try {
-      const jira      = await getJira();
-      const sn        = await getSn();
+      const { jira, error: _jiraErr } = await _requireJira();
+      if (_jiraErr) return _jiraErr;
+      const { sn, error: _snErr } = await _requireSn();
+      if (_snErr) return _snErr;
       const retriever = new JiraAutomationRetriever(jira);
       const raw       = await retriever.getAutomation(rule_id);
       const parsed    = retriever.parseRule(raw);
@@ -2666,7 +2811,8 @@ server.tool(
   },
   async ({ source_users, fallback_user_email, fallback_group_name }) => {
     try {
-      const sn     = await getSn();
+      const { sn, error: _snErr } = await _requireSn();
+      if (_snErr) return _snErr;
       const mapper = new UserGroupMapper(sn);
       await mapper.build({ fallbackUser: fallback_user_email ?? null, fallbackGroup: fallback_group_name ?? null });
       const report = await mapper.matchSourceUsers(source_users ?? []);
@@ -2695,7 +2841,8 @@ server.tool(
   },
   async ({ sn_table, field_mappings, reference_fields, sample_records }) => {
     try {
-      const sn      = await getSn();
+      const { sn, error: _snErr } = await _requireSn();
+      if (_snErr) return _snErr;
       const checker = new PreMigrationChecker(sn);
       const result  = await checker.runAll(
         sn_table,
@@ -2891,7 +3038,8 @@ server.tool(
     transform_rules, date_fields, ignored_fields, limit, full_scan,
   }) => {
     try {
-      const sn = await getSn();
+      const { sn, error: _snErr } = await _requireSn();
+      if (_snErr) return _snErr;
 
       // Build transform map from rules
       const transformMap = new Map();
@@ -2963,7 +3111,8 @@ server.tool(
   },
   async ({ staging_table, target_table, field_mappings, sample_size, transform_rules, date_fields }) => {
     try {
-      const sn = await getSn();
+      const { sn, error: _snErr } = await _requireSn();
+      if (_snErr) return _snErr;
 
       // Fetch recent staging records
       const stagingRecords = await sn.get(staging_table, {
@@ -3137,7 +3286,8 @@ server.tool(
   async ({ platform, source_records, staging_table, target_table, field_mappings,
            correlation_field, source_id_field, transform_rules, date_fields }) => {
     try {
-      const sn = await getSn();
+      const { sn, error: _snErr } = await _requireSn();
+      if (_snErr) return _snErr;
 
       // ── Layer 1: staging fill-rate (existing MigrationValidator) ──────────
       const { MigrationValidator } = await import('./migration/validator.js');
@@ -3334,7 +3484,8 @@ server.tool(
   },
   async ({ plan, target_url, target_api_key }) => {
     try {
-      const sn      = await getSn();
+      const { sn, error: _snErr } = await _requireSn();
+      if (_snErr) return _snErr;
       const builder = new SNArtifactBuilder(sn);
       const results = await builder.buildAll(plan, { targetUrl: target_url, targetApiKey: target_api_key });
       return ok({
@@ -3370,7 +3521,8 @@ server.tool(
   },
   async ({ plan, inbound_url, webhook_secret }) => {
     try {
-      const jira    = await getJira();
+      const { jira, error: _jiraErr } = await _requireJira();
+      if (_jiraErr) return _jiraErr;
       const builder = new JiraArtifactBuilder(jira);
       const results = await builder.buildAll(plan, { inboundUrl: inbound_url, webhookSecret: webhook_secret });
       return ok({
@@ -3407,7 +3559,8 @@ server.tool(
   },
   async ({ plan, target_url }) => {
     try {
-      const sf      = await getSf().catch(() => null);
+      const { sf, error: _sfErr } = await _requireSf();
+      if (_sfErr) return _sfErr;
       const builder = new SFArtifactBuilder(sf);
       const results = builder.buildAll(plan, { targetUrl: target_url });
       return ok({
@@ -3439,7 +3592,8 @@ server.tool(
   },
   async ({ prefix, last_n_errors }) => {
     try {
-      const sn   = await getSn();
+      const { sn, error: _snErr } = await _requireSn();
+      if (_snErr) return _snErr;
       const correlTable = `u_${prefix}_correlation`;
       const retryTable  = `u_${prefix}_sync_error`;
 
@@ -3489,7 +3643,8 @@ server.tool(
   },
   async ({ prefix, direction, sn_record_sys_id, test_payload, sn_table }) => {
     try {
-      const sn          = await getSn();
+      const { sn, error: _snErr } = await _requireSn();
+      if (_snErr) return _snErr;
       const correlTable = `u_${prefix}_correlation`;
       const retryTable  = `u_${prefix}_sync_error`;
 
@@ -3563,7 +3718,8 @@ server.tool(
   },
   async ({ prefix }) => {
     try {
-      const sn      = await getSn();
+      const { sn, error: _snErr } = await _requireSn();
+      if (_snErr) return _snErr;
       const brName  = `${prefix}_sync_outbound`;
       const apiName = `${prefix}_inbound_api`;
       const results = {};
@@ -3606,7 +3762,8 @@ server.tool(
   },
   async ({ prefix }) => {
     try {
-      const sn      = await getSn();
+      const { sn, error: _snErr } = await _requireSn();
+      if (_snErr) return _snErr;
       const results = {};
 
       const br = await sn.get('sys_script', { sysparm_query: `name=${prefix}_sync_outbound`, sysparm_limit: '1' });
@@ -3644,7 +3801,8 @@ server.tool(
   },
   async ({ prefix, field_mappings, merge }) => {
     try {
-      const sn      = await getSn();
+      const { sn, error: _snErr } = await _requireSn();
+      if (_snErr) return _snErr;
       const propKey = `x_snmig.${prefix}.field_map`;
 
       const existing = await sn.get('sys_properties', { sysparm_query: `name=${propKey}`, sysparm_limit: '1' });
@@ -3686,7 +3844,8 @@ server.tool(
   },
   async ({ prefix, source_table, dry_run, limit }) => {
     try {
-      const sn         = await getSn();
+      const { sn, error: _snErr } = await _requireSn();
+      if (_snErr) return _snErr;
       const retryTable = `u_${prefix}_sync_error`;
 
       const pending = await sn.get(retryTable, {
@@ -3883,7 +4042,8 @@ Use this before writing a BR or Client Script to understand the full context.`,
   },
   async ({ table, field_limit }) => {
     try {
-      const sn       = await getSn();
+      const { sn, error: _snErr } = await _requireSn();
+      if (_snErr) return _snErr;
       const explorer = new TableExplorer(sn);
       const result   = await explorer.explore(table, { fieldLimit: field_limit });
       return ok(result);
@@ -3900,7 +4060,8 @@ server.tool(
   },
   async ({ keyword }) => {
     try {
-      const sn       = await getSn();
+      const { sn, error: _snErr } = await _requireSn();
+      if (_snErr) return _snErr;
       const explorer = new TableExplorer(sn);
       const results  = await explorer.findTable(keyword);
       return ok({ count: results.length, tables: results });
@@ -3917,7 +4078,8 @@ server.tool(
   },
   async ({ table }) => {
     try {
-      const sn       = await getSn();
+      const { sn, error: _snErr } = await _requireSn();
+      if (_snErr) return _snErr;
       const explorer = new TableExplorer(sn);
       const acls     = await explorer.getAcls(table);
       return ok({ table, count: acls.length, acls });
@@ -4022,7 +4184,8 @@ server.tool(
   },
   async ({ mode, table, minutes_back, threshold_ms, hours, limit }) => {
     try {
-      const sn       = await getSn();
+      const { sn, error: _snErr } = await _requireSn();
+      if (_snErr) return _snErr;
       const analyzer = new PerfAnalyzer(sn);
       let result;
       switch (mode) {
@@ -4050,7 +4213,8 @@ server.tool(
   },
   async ({ keyword, source, level, limit }) => {
     try {
-      const sn   = await getSn();
+      const { sn, error: _snErr } = await _requireSn();
+      if (_snErr) return _snErr;
       const parts = [];
       if (keyword) parts.push(`messageLIKE${keyword}`);
       if (source)  parts.push(`sourceLIKE${source}`);
@@ -4092,7 +4256,8 @@ Always dry_run first to preview the record that will be created.`,
         });
       }
 
-      const sn = await getSn();
+      const { sn, error: _snErr } = await _requireSn();
+      if (_snErr) return _snErr;
       const record = await sn.post('sys_script_fix', { name, script, active: false });
       return ok({
         created:    true,
@@ -4143,7 +4308,8 @@ Returns Markdown text ready to paste into Confluence, GitHub, or a wiki.`,
       let markdown;
       if (doc_type === 'table') {
         // Fetch live data from SN
-        const sn       = await getSn();
+        const { sn, error: _snErr } = await _requireSn();
+        if (_snErr) return _snErr;
         const explorer = new TableExplorer(sn);
         const data     = await explorer.explore(table ?? name);
         markdown = _docGen.documentTable(data);
@@ -4295,7 +4461,8 @@ Returns an overall health score and prioritised action list.`,
   {},
   async () => {
     try {
-      const sn    = await getSn();
+      const { sn, error: _snErr } = await _requireSn();
+      if (_snErr) return _snErr;
       const start = Date.now();
       const checks = [];
 
@@ -4464,7 +4631,8 @@ Use this before starting portal development to understand what already exists.`,
   },
   async ({ portal_id }) => {
     try {
-      const sn     = await getSn();
+      const { sn, error: _snErr } = await _requireSn();
+      if (_snErr) return _snErr;
       const portal = new PortalBuilder(sn);
       return ok(await portal.analyzePortal(portal_id));
     } catch (e) { return fail(e.message); }
@@ -4481,7 +4649,8 @@ server.tool(
   },
   async ({ keyword, limit }) => {
     try {
-      const sn     = await getSn();
+      const { sn, error: _snErr } = await _requireSn();
+      if (_snErr) return _snErr;
       const portal = new PortalBuilder(sn);
       return ok({ keyword, results: await portal.findWidgets(keyword, limit) });
     } catch (e) { return fail(e.message); }
@@ -4516,7 +4685,8 @@ Returns: POST-ready payload for sp_widget table + provenance comment in each sec
   },
   async ({ source_id, new_name, new_id, modifications }) => {
     try {
-      const sn     = await getSn();
+      const { sn, error: _snErr } = await _requireSn();
+      if (_snErr) return _snErr;
       const portal = new PortalBuilder(sn);
       return ok(await portal.cloneWidget({ sourceIdOrSysId: source_id, newName: new_name, newId: new_id, modifications: modifications ?? {} }));
     } catch (e) { return fail(e.message); }
@@ -4698,7 +4868,8 @@ You can override any field via modifications.`,
   },
   async ({ source, new_name, modifications }) => {
     try {
-      const sn      = await getSn();
+      const { sn, error: _snErr } = await _requireSn();
+      if (_snErr) return _snErr;
       const catalog = new CatalogBuilder(sn);
       return ok(await catalog.cloneCatalogItem({ sourceNameOrSysId: source, newName: new_name, modifications: modifications ?? {} }));
     } catch (e) { return fail(e.message); }
@@ -4732,7 +4903,8 @@ server.tool(
   },
   async ({ name_or_sys_id }) => {
     try {
-      const sn      = await getSn();
+      const { sn, error: _snErr } = await _requireSn();
+      if (_snErr) return _snErr;
       const catalog = new CatalogBuilder(sn);
       return ok(await catalog.getCatalogItem(name_or_sys_id));
     } catch (e) { return fail(e.message); }
@@ -4804,7 +4976,8 @@ Returns a notification inventory plus issues and recommendations.`,
   },
   async ({ table }) => {
     try {
-      const sn = await getSn();
+      const { sn, error: _snErr } = await _requireSn();
+      if (_snErr) return _snErr;
       const nb = new NotificationBuilder(sn);
       return ok(await nb.analyzeNotifications(table));
     } catch (e) { return fail(e.message); }
@@ -4887,7 +5060,8 @@ The document is ready to paste into Confluence, GitHub Wiki, or any Markdown ren
   },
   async ({ app_name, tables, scope, author, version }) => {
     try {
-      const sn     = await getSn();
+      const { sn, error: _snErr } = await _requireSn();
+      if (_snErr) return _snErr;
       const writer = new TechDocWriter(sn);
       return ok(await writer.generateProjectDoc({ appName: app_name, scope, tables, author, version }));
     } catch (e) { return fail(e.message); }
@@ -5007,7 +5181,8 @@ server.tool(
   },
   async ({ table, field }) => {
     try {
-      const sn   = await getSn();
+      const { sn, error: _snErr } = await _requireSn();
+      if (_snErr) return _snErr;
       const rows = await sn.query('sys_choice', {
         sysparm_query:  `name=${table}^element=${field}^language=en^inactive=false`,
         sysparm_fields: 'value,label,sequence,color,dependent_value',
@@ -5123,7 +5298,8 @@ Examples:
   async ({ table, field, overrides, dry_run }) => {
     try {
       // ── Validate: the field must exist on a parent table ─────────────────
-      const sn = await getSn();
+      const { sn, error: _snErr } = await _requireSn();
+      if (_snErr) return _snErr;
       const parentCheck = await sn.get('sys_dictionary', {
         sysparm_query:  `name=${table}^element=${field}`,
         sysparm_fields: 'element,name,column_label,internal_type,mandatory,default_value',
@@ -5252,7 +5428,8 @@ Examples:
   },
   async ({ table, field, override_type }) => {
     try {
-      const sn     = await getSn();
+      const { sn, error: _snErr } = await _requireSn();
+      if (_snErr) return _snErr;
       const parts  = [];
       if (table) parts.push(`name=${table}`);
       if (field) parts.push(`element=${field}`);
@@ -5328,7 +5505,8 @@ Find the sys_id first with get_dictionary_overrides.`,
   },
   async ({ table, field, confirm }) => {
     try {
-      const sn = await getSn();
+      const { sn, error: _snErr } = await _requireSn();
+      if (_snErr) return _snErr;
       const rows = await sn.get('sys_dictionary_override', {
         sysparm_query:  `name=${table}^element=${field}`,
         sysparm_fields: 'sys_id,name,element,override_mandatory,override_label,override_default_value',
@@ -5391,7 +5569,8 @@ Returns the created record including its sys_id.`,
   },
   async ({ table, fields, return_fields }) => {
     try {
-      const sn     = await getSn();
+      const { sn, error: _snErr } = await _requireSn();
+      if (_snErr) return _snErr;
       const params = return_fields ? { sysparm_fields: return_fields } : {};
       // SN POST doesn't accept sysparm_fields as query param — fetch after create
       const created = await sn.post(table, fields);
@@ -5429,7 +5608,8 @@ Examples:
   },
   async ({ table, sys_id, query, fields, limit, order_by }) => {
     try {
-      const sn = await getSn();
+      const { sn, error: _snErr } = await _requireSn();
+      if (_snErr) return _snErr;
       if (sys_id) {
         const params = {};
         if (fields) params.sysparm_fields = fields;
@@ -5467,7 +5647,8 @@ Returns the updated record.`,
   },
   async ({ table, sys_id, fields, return_fields }) => {
     try {
-      const sn      = await getSn();
+      const { sn, error: _snErr } = await _requireSn();
+      if (_snErr) return _snErr;
       const updated = await sn.patch(table, sys_id, fields);
       if (return_fields) {
         const record = await sn.getById(table, sys_id, { sysparm_fields: return_fields });
@@ -5498,7 +5679,8 @@ To preview what will be deleted without actually deleting, pass confirm=false (d
   async ({ table, sys_id, confirm }) => {
     try {
       if (!confirm) {
-        const sn     = await getSn();
+        const { sn, error: _snErr } = await _requireSn();
+        if (_snErr) return _snErr;
         const record = await sn.getById(table, sys_id, { sysparm_fields: 'sys_id,number,name,short_description,sys_created_on' }).catch(() => ({ sys_id }));
         return ok({
           confirm_required: true,
@@ -5506,7 +5688,8 @@ To preview what will be deleted without actually deleting, pass confirm=false (d
           warning:   'Set confirm=true to permanently delete this record. This cannot be undone.',
         });
       }
-      const sn = await getSn();
+      const { sn, error: _snErr } = await _requireSn();
+      if (_snErr) return _snErr;
       await sn.delete(table, sys_id);
       return ok({ deleted: true, table, sys_id });
     } catch (e) { return fail(e.message); }
@@ -5567,7 +5750,8 @@ Comment example:
   },
   async ({ resource_type, project_key, issue_type, summary, description, priority, assignee, labels, parent_key, extra_fields, issue_key, body, name, component_lead, release_date }) => {
     try {
-      const jira = await getJira();
+      const { jira, error: _jiraErr } = await _requireJira();
+      if (_jiraErr) return _jiraErr;
 
       if (resource_type === 'issue' || resource_type === 'subtask') {
         const fields = {
@@ -5645,7 +5829,8 @@ Examples:
   },
   async ({ resource_type, issue_key, jql, project_key, query, board_id, fields, limit }) => {
     try {
-      const jira = await getJira();
+      const { jira, error: _jiraErr } = await _requireJira();
+      if (_jiraErr) return _jiraErr;
 
       if (resource_type === 'issue') {
         const params = fields ? { fields } : {};
@@ -5722,7 +5907,8 @@ Transition example:
   },
   async ({ issue_key, update_type, fields, transition_id, comment_id, comment_body }) => {
     try {
-      const jira = await getJira();
+      const { jira, error: _jiraErr } = await _requireJira();
+      if (_jiraErr) return _jiraErr;
 
       if (update_type === 'fields') {
         await jira.put(_jiraIssue(issue_key), { fields: fields ?? {} });
@@ -5777,7 +5963,8 @@ Examples:
           warning:  'Set confirm=true to permanently delete. This cannot be undone. Issue deletion removes all sub-tasks, comments, and attachments.',
         });
       }
-      const jira = await getJira();
+      const { jira, error: _jiraErr } = await _requireJira();
+      if (_jiraErr) return _jiraErr;
       if (resource_type === 'issue') {
         await jira.delete(`${_jiraIssue(issue_key)}?deleteSubtasks=true`);
         return ok({ deleted: true, resource_type, issue_key });
@@ -5813,7 +6000,8 @@ Returns the Id of the created record.`,
   },
   async ({ object, fields }) => {
     try {
-      const sf   = await getSf();
+      const { sf, error: _sfErr } = await _requireSf();
+      if (_sfErr) return _sfErr;
       const result = await sf.post(`/services/data/${sf.apiVersion}/sobjects/${object}`, fields);
       return ok({ created: true, object, id: result.id, success: result.success, errors: result.errors ?? [] });
     } catch (e) { return fail(e.message); }
@@ -5845,7 +6033,8 @@ Examples:
   },
   async ({ read_type, object, id, fields, soql, limit }) => {
     try {
-      const sf = await getSf();
+      const { sf, error: _sfErr } = await _requireSf();
+      if (_sfErr) return _sfErr;
 
       if (read_type === 'by_id') {
         const path = `/services/data/${sf.apiVersion}/sobjects/${object}/${id}`;
@@ -5903,7 +6092,8 @@ Returns {updated: true} on success.`,
   },
   async ({ object, id, fields }) => {
     try {
-      const sf = await getSf();
+      const { sf, error: _sfErr } = await _requireSf();
+      if (_sfErr) return _sfErr;
       await sf.patch(`/services/data/${sf.apiVersion}/sobjects/${object}/${id}`, fields);
       return ok({ updated: true, object, id, fields_updated: Object.keys(fields) });
     } catch (e) { return fail(e.message); }
@@ -5929,7 +6119,8 @@ Pass confirm=false (default) to preview what would be deleted first.`,
   },
   async ({ object, id, confirm }) => {
     try {
-      const sf = await getSf();
+      const { sf, error: _sfErr } = await _requireSf();
+      if (_sfErr) return _sfErr;
       if (!confirm) {
         // Preview — fetch the record first to show what would be deleted
         const record = await sf.query(`SELECT Id, Name FROM ${object} WHERE Id = '${id}' LIMIT 1`)
@@ -5992,7 +6183,8 @@ Returns the new user's sys_id plus links to role and group records created.`,
            phone, mobile_phone, location, time_zone, date_format, language,
            password, active, vip, roles, groups, extra_fields }) => {
     try {
-      const sn = await getSn();
+      const { sn, error: _snErr } = await _requireSn();
+      if (_snErr) return _snErr;
 
       // ── Resolve manager sys_id if a name/email was given ─────────────────
       let managerSysId = null;
@@ -6101,7 +6293,8 @@ Returns the group sys_id plus member and role assignment results.`,
   },
   async ({ name, description, manager, email, type, active, parent, members, roles, extra_fields }) => {
     try {
-      const sn = await getSn();
+      const { sn, error: _snErr } = await _requireSn();
+      if (_snErr) return _snErr;
 
       // ── Resolve manager ────────────────────────────────────────────────────
       let managerSysId = null;
@@ -6210,7 +6403,8 @@ action options:
   },
   async ({ group, action, members }) => {
     try {
-      const sn = await getSn();
+      const { sn, error: _snErr } = await _requireSn();
+      if (_snErr) return _snErr;
 
       // Resolve group
       const groupRows = await sn.get('sys_user_group', {
@@ -6316,7 +6510,8 @@ Examples:
   },
   async ({ target_type, target, action, roles }) => {
     try {
-      const sn = await getSn();
+      const { sn, error: _snErr } = await _requireSn();
+      if (_snErr) return _snErr;
 
       // Resolve target
       const targetTable = target_type === 'user' ? 'sys_user' : 'sys_user_group';
@@ -6413,7 +6608,8 @@ Accepts username, email address, name (first/last), or sys_id.`,
   },
   async ({ identifier }) => {
     try {
-      const sn   = await getSn();
+      const { sn, error: _snErr } = await _requireSn();
+      if (_snErr) return _snErr;
       const rows = await sn.get('sys_user', {
         sysparm_query:  `user_name=${identifier}^ORemail=${identifier}^ORsys_id=${identifier}^ORname=${identifier}`,
         sysparm_fields: 'sys_id,user_name,name,first_name,last_name,email,title,department,manager,phone,mobile_phone,active,vip,location,time_zone,language,last_login',
@@ -6458,7 +6654,8 @@ server.tool(
   },
   async ({ identifier, include_members, include_roles }) => {
     try {
-      const sn   = await getSn();
+      const { sn, error: _snErr } = await _requireSn();
+      if (_snErr) return _snErr;
       const rows = await sn.get('sys_user_group', {
         sysparm_query:  `name=${identifier}^ORsys_id=${identifier}`,
         sysparm_fields: 'sys_id,name,description,manager,manager.name,email,type,active,parent,parent.name',
@@ -6516,7 +6713,8 @@ Useful before calling sn_assign_roles to confirm the exact role name.`,
   },
   async ({ keyword, limit }) => {
     try {
-      const sn    = await getSn();
+      const { sn, error: _snErr } = await _requireSn();
+      if (_snErr) return _snErr;
       const query = keyword ? `nameLIKE${keyword}` : 'active=true';
       const rows  = await sn.get('sys_user_role', {
         sysparm_query:  query,
@@ -6547,7 +6745,8 @@ Note: User creation in Jira Cloud is managed through Atlassian Admin (admin.atla
   },
   async ({ group_name, members }) => {
     try {
-      const jira   = await getJira();
+      const { jira, error: _jiraErr } = await _requireJira();
+      if (_jiraErr) return _jiraErr;
       const created = await jira.post('/rest/api/3/group', { name: group_name });
       const results = { created: true, group_name, group_id: created.groupId ?? created.name, members_added: [] };
 
@@ -6577,7 +6776,8 @@ action: add | remove | list`,
   },
   async ({ group_name, action, account_ids }) => {
     try {
-      const jira = await getJira();
+      const { jira, error: _jiraErr } = await _requireJira();
+      if (_jiraErr) return _jiraErr;
 
       if (action === 'list') {
         const result = await jira.get('/rest/api/3/group/member', {
@@ -6638,7 +6838,8 @@ Get ProfileId first:
   },
   async ({ username, first_name, last_name, email, alias, profile_id, title, department, phone, is_active, time_zone, locale, email_encoding, language, extra_fields }) => {
     try {
-      const sf = await getSf();
+      const { sf, error: _sfErr } = await _requireSf();
+      if (_sfErr) return _sfErr;
       const payload = {
         Username:           username,
         LastName:           last_name,
@@ -6698,7 +6899,8 @@ action:
   },
   async ({ action, name, developer_name, group_id, members, supported_objects, keyword }) => {
     try {
-      const sf = await getSf();
+      const { sf, error: _sfErr } = await _requireSf();
+      if (_sfErr) return _sfErr;
 
       if (action === 'create') {
         const result = await sf.post(`/services/data/${sf.apiVersion}/sobjects/Group`, {
@@ -7098,36 +7300,6 @@ Use this when:
 );
 
 // ── Leave & Onboarding — shared helpers ───────────────────────────────────
-
-// Wraps getSn() with a clear credential-missing message.
-// Returns { sn } on success or { error: fail(...) } if not configured.
-async function _requireSn() {
-  const snCreds = (() => { try { return _getSession().creds?.servicenow; } catch { return null; } })();
-  const hasEnv  = !!(process.env.SN_INSTANCE_URL && (process.env.SN_USERNAME || process.env.SN_USE_SDK_AUTH === 'true'));
-  if (!snCreds && !hasEnv) {
-    return {
-      error: fail(
-        'ServiceNow credentials are not configured for this session. ' +
-        'Please call connect_servicenow first and provide your instance URL, username, and password.'
-      ),
-    };
-  }
-  try {
-    const { sn, error: _snErr } = await _requireSn();
-    if (_snErr) return _snErr;
-    return { sn };
-  } catch (e) {
-    const msg = e.message ?? String(e);
-    const isAuth = /401|403|unauthorized|forbidden|credentials/i.test(msg);
-    return {
-      error: fail(
-        isAuth
-          ? 'ServiceNow authentication failed. Please call connect_servicenow again with the correct credentials.'
-          : `ServiceNow connection error: ${msg}`
-      ),
-    };
-  }
-}
 
 // Resolve a sys_user row from email, user_name, or sys_id.
 async function _snResolveUser(sn, identity) {
