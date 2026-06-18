@@ -1885,51 +1885,7 @@ server.tool(
   }
 );
 
-// ══════════════════════════════════════════════════════════════════════════
-// TOOL: reconcile_migration — compare source vs target field-by-field
-// ══════════════════════════════════════════════════════════════════════════
-server.tool(
-  'reconcile_migration',
-  `After a migration, compares a sample of source records against the target records (matched by correlation_id)
-   and reports any per-field discrepancies. Use to certify data fidelity.`,
-  {
-    platform: z.string().describe('Source platform (salesforce, jira, or any registered connector)'),
-    source_filter: z.string().describe('Jira JQL or SF SOQL WHERE clause'),
-    sn_table: z.string(),
-    sample_size: z.number().optional().default(20),
-  },
-  async ({ platform, source_filter, sn_table, sample_size }) => {
-    try {
-      const sn = await getSn();
-      const records = [];
-      if (platform === 'jira') {
-        const jira = await getJira();
-        const r = await jira.search({ jql: source_filter, maxResults: sample_size });
-        for (const i of r.issues ?? []) records.push({ id: i.key, source: i });
-      } else {
-        const sf = await getSf();
-        const r = await sf.query(source_filter);
-        for (const rec of r.records ?? []) records.push({ id: rec.Id, source: rec });
-      }
-      const prefix = platform === 'salesforce' ? 'salesforce' : 'jira';
-      const matched = [], missing = [];
-      for (const rec of records) {
-        const target = await sn.findByCorrelationId(sn_table, `${prefix}:${rec.id}`);
-        if (target) matched.push({ source_id: rec.id, target_sys_id: target.sys_id });
-        else missing.push(rec.id);
-      }
-      return ok({
-        sampled: records.length,
-        matched: matched.length,
-        missing: missing.length,
-        missing_source_ids: missing.slice(0, 20),
-        message: missing.length === 0
-          ? '✓ All sampled source records have a corresponding target record.'
-          : `⚠ ${missing.length} source records have no matching target. They may have failed or never been migrated.`,
-      });
-    } catch (e) { return fail(e.message); }
-  }
-);
+// reconcile_migration is defined later with full field-level comparison
 
 // ══════════════════════════════════════════════════════════════════════════
 // TOOL: rollback_migration — delete target records by correlation_id
@@ -4587,7 +4543,7 @@ server.tool(
   `Create a ServiceNow push notification for the Now Mobile app.
 
 Returns deploy-ready payload for sys_push_message table.
-Supports ${field} tokens in title and body — same as email notifications.`,
+Supports \${field} tokens in title and body — same as email notifications.`,
   {
     name:        z.string(),
     table:       z.string().describe('Table that triggers this push notification'),
@@ -6874,18 +6830,35 @@ if (process.env.MCP_MODE === 'http') {
   const { default: express } = await import('express');
   const { SSEServerTransport } = await import('@modelcontextprotocol/sdk/server/sse.js');
 
-  const app  = express();
-  const port = parseInt(process.env.MCP_PORT ?? '3000', 10);
+  const app     = express();
+  const port    = parseInt(process.env.MCP_PORT ?? '3000', 10);
   const clients = new Map();
+  const apiKey  = process.env.MCP_API_KEY; // optional — set to protect the endpoint
 
   app.use(express.json());
 
-  // Health check
-  app.get('/health', (_req, res) => res.json({ status: 'ok', server: 'sn-data-migration' }));
-
-  // SSE endpoint — web Claude Code connects here
-  app.get('/sse', async (req, res) => {
+  // CORS — required for Claude.ai web connector (browser sends preflight OPTIONS)
+  app.use((req, res, next) => {
     res.setHeader('Access-Control-Allow-Origin', '*');
+    res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+    res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization, mcp-session-id');
+    if (req.method === 'OPTIONS') { res.sendStatus(204); return; }
+    next();
+  });
+
+  // Optional API key guard — skip if MCP_API_KEY is not set
+  function checkApiKey(req, res, next) {
+    if (!apiKey) { next(); return; }
+    const auth = req.headers['authorization'];
+    if (auth === `Bearer ${apiKey}`) { next(); return; }
+    res.status(401).json({ error: 'Unauthorized' });
+  }
+
+  // Health check — no auth required
+  app.get('/health', (_req, res) => res.json({ status: 'ok', server: 'sn-data-migration', tools: 116 }));
+
+  // SSE endpoint — Claude.ai web connects here
+  app.get('/sse', checkApiKey, async (req, res) => {
     const transport = new SSEServerTransport('/messages', res);
     clients.set(transport.sessionId, transport);
     res.on('close', () => clients.delete(transport.sessionId));
@@ -6894,16 +6867,18 @@ if (process.env.MCP_MODE === 'http') {
   });
 
   // Message endpoint — receives tool calls from the client
-  app.post('/messages', async (req, res) => {
-    const sessionId  = req.query.sessionId;
-    const transport  = clients.get(sessionId);
+  app.post('/messages', checkApiKey, async (req, res) => {
+    const sessionId = req.query.sessionId;
+    const transport = clients.get(sessionId);
     if (!transport) { res.status(404).json({ error: 'Session not found' }); return; }
     await transport.handlePostMessage(req, res);
   });
 
   app.listen(port, () => {
-    logger.info(`sn-data-migration MCP server running in HTTP mode on port ${port}`);
-    logger.info(`SSE endpoint: http://localhost:${port}/sse`);
+    logger.info(`sn-data-migration MCP server running in HTTP/SSE mode on port ${port}`);
+    logger.info(`  SSE:     http://localhost:${port}/sse`);
+    logger.info(`  Health:  http://localhost:${port}/health`);
+    logger.info(`  Auth:    ${apiKey ? 'Bearer token enabled' : 'open (set MCP_API_KEY to protect)'}`);
   });
 } else {
   // Default: stdio for Claude Code CLI
