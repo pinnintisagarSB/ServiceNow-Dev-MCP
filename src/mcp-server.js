@@ -7147,8 +7147,7 @@ if (process.env.MCP_MODE === 'http') {
   );
 
   // ── Portal — self-service token registration UI ────────────────────────────
-  const portalHtml = readFileSync(join(__dirname, 'portal.html'), 'utf8');
-  app.get('/', (_req, res) => res.setHeader('Content-Type', 'text/html').end(portalHtml));
+  app.get('/', (_req, res) => res.setHeader('Content-Type', 'text/html').end(readFileSync(join(__dirname, 'portal.html'), 'utf8')));
 
   // Tells the portal JS whether to show the admin-key input field
   app.get('/register-info', (_req, res) =>

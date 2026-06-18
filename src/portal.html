@@ -3,254 +3,560 @@
 <head>
 <meta charset="UTF-8"/>
 <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
-<title>ServiceNow Dev MCP — Connect</title>
+<title>ServiceNow Dev MCP — Get access</title>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@tabler/icons-webfont@3.19.0/dist/tabler-icons.min.css"/>
 <style>
   *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
 
+  :root {
+    --bg: #fafaf9;
+    --surface: #ffffff;
+    --border: rgba(0,0,0,0.08);
+    --border-md: rgba(0,0,0,0.14);
+    --text-primary: #1a1a18;
+    --text-secondary: #6b6b66;
+    --text-tertiary: #9b9b96;
+    --accent: #cc785c;
+    --accent-bg: #fdf3ef;
+    --accent-border: rgba(204,120,92,0.25);
+    --success: #16a34a;
+    --success-bg: #f0fdf4;
+    --success-border: rgba(22,163,74,0.2);
+    --mono: 'SF Mono', 'Fira Code', 'Cascadia Code', monospace;
+    --r-sm: 6px;
+    --r-md: 10px;
+    --r-lg: 16px;
+  }
+
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #111110;
+      --surface: #1c1c1a;
+      --border: rgba(255,255,255,0.08);
+      --border-md: rgba(255,255,255,0.14);
+      --text-primary: #f0efec;
+      --text-secondary: #9b9b96;
+      --text-tertiary: #6b6b66;
+      --accent: #e8956d;
+      --accent-bg: rgba(204,120,92,0.1);
+      --accent-border: rgba(204,120,92,0.3);
+      --success: #4ade80;
+      --success-bg: rgba(22,163,74,0.08);
+      --success-border: rgba(74,222,128,0.2);
+    }
+  }
+
   body {
-    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
-    background: #0f0f0f;
-    color: #e8e8e8;
+    font-family: -apple-system, BlinkMacSystemFont, 'Inter', 'Segoe UI', sans-serif;
+    background: var(--bg);
+    color: var(--text-primary);
     min-height: 100vh;
     display: flex;
     flex-direction: column;
     align-items: center;
     justify-content: center;
-    padding: 24px;
+    padding: 40px 20px;
+    font-size: 14px;
+    line-height: 1.6;
+    -webkit-font-smoothing: antialiased;
   }
 
-  .card {
-    background: #1a1a1a;
-    border: 1px solid #2a2a2a;
-    border-radius: 16px;
-    padding: 40px;
+  .wrapper {
     width: 100%;
-    max-width: 520px;
-    box-shadow: 0 24px 64px rgba(0,0,0,0.5);
+    max-width: 460px;
+    display: flex;
+    flex-direction: column;
+    gap: 0;
   }
 
-  .logo {
+  .header {
     display: flex;
     align-items: center;
-    gap: 12px;
-    margin-bottom: 28px;
+    gap: 14px;
+    margin-bottom: 32px;
   }
 
-  .logo-icon {
-    width: 44px; height: 44px;
-    background: linear-gradient(135deg, #81b4ff, #5b8fff);
-    border-radius: 10px;
-    display: flex; align-items: center; justify-content: center;
-    font-size: 22px;
+  .logo-mark {
+    width: 40px;
+    height: 40px;
+    background: var(--text-primary);
+    border-radius: var(--r-md);
+    display: flex;
+    align-items: center;
+    justify-content: center;
     flex-shrink: 0;
   }
 
-  .logo-text h1 { font-size: 18px; font-weight: 600; color: #fff; }
-  .logo-text p  { font-size: 13px; color: #888; margin-top: 2px; }
-
-  .badge-row {
-    display: flex; gap: 8px; margin-bottom: 28px; flex-wrap: wrap;
+  .logo-mark svg {
+    width: 22px;
+    height: 22px;
+    fill: var(--bg);
   }
-  .badge {
-    font-size: 11px; font-weight: 500;
-    background: #252525; border: 1px solid #333;
-    border-radius: 20px; padding: 3px 10px; color: #aaa;
+
+  .header-text h1 {
+    font-size: 15px;
+    font-weight: 600;
+    color: var(--text-primary);
+    letter-spacing: -0.01em;
   }
-  .badge.green { border-color: #1a4a2a; color: #4ade80; background: #0e2a18; }
 
-  h2 { font-size: 20px; font-weight: 600; color: #fff; margin-bottom: 6px; }
-  .sub { font-size: 14px; color: #888; margin-bottom: 24px; line-height: 1.5; }
+  .header-text p {
+    font-size: 12px;
+    color: var(--text-tertiary);
+    margin-top: 1px;
+  }
 
-  label { display: block; font-size: 13px; color: #bbb; margin-bottom: 6px; font-weight: 500; }
+  .card {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: var(--r-lg);
+    overflow: hidden;
+  }
 
-  input[type="text"], input[type="email"], input[type="password"] {
-    width: 100%; padding: 11px 14px;
-    background: #111; border: 1px solid #333;
-    border-radius: 8px; color: #e8e8e8; font-size: 14px;
-    outline: none; transition: border-color .15s;
+  .card-body {
+    padding: 28px;
+  }
+
+  .pill-row {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+    margin-bottom: 24px;
+  }
+
+  .pill {
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+    font-size: 11px;
+    font-weight: 500;
+    color: var(--text-secondary);
+    background: var(--bg);
+    border: 1px solid var(--border);
+    border-radius: 20px;
+    padding: 3px 9px;
+    letter-spacing: 0.01em;
+  }
+
+  .pill.live {
+    color: var(--success);
+    background: var(--success-bg);
+    border-color: var(--success-border);
+  }
+
+  .pill .dot {
+    width: 5px;
+    height: 5px;
+    border-radius: 50%;
+    background: currentColor;
+    flex-shrink: 0;
+  }
+
+  .section-title {
+    font-size: 17px;
+    font-weight: 600;
+    color: var(--text-primary);
+    letter-spacing: -0.02em;
+    margin-bottom: 6px;
+  }
+
+  .section-sub {
+    font-size: 13px;
+    color: var(--text-secondary);
+    line-height: 1.55;
+    margin-bottom: 24px;
+  }
+
+  .form-group {
     margin-bottom: 16px;
   }
-  input:focus { border-color: #5b8fff; }
-  input::placeholder { color: #555; }
 
-  .btn {
-    width: 100%; padding: 12px;
-    background: linear-gradient(135deg, #5b8fff, #3d6eff);
-    border: none; border-radius: 8px; color: #fff;
-    font-size: 15px; font-weight: 600; cursor: pointer;
-    transition: opacity .15s, transform .1s;
+  label {
+    display: block;
+    font-size: 12px;
+    font-weight: 500;
+    color: var(--text-secondary);
+    margin-bottom: 6px;
+    letter-spacing: 0.01em;
   }
-  .btn:hover { opacity: .9; transform: translateY(-1px); }
-  .btn:active { transform: translateY(0); }
-  .btn:disabled { opacity: .5; cursor: not-allowed; transform: none; }
 
-  /* Result card */
+  input[type="text"],
+  input[type="password"] {
+    width: 100%;
+    padding: 9px 12px;
+    background: var(--bg);
+    border: 1px solid var(--border-md);
+    border-radius: var(--r-sm);
+    color: var(--text-primary);
+    font-size: 14px;
+    font-family: inherit;
+    outline: none;
+    transition: border-color 0.15s, box-shadow 0.15s;
+    appearance: none;
+  }
+
+  input[type="text"]:focus,
+  input[type="password"]:focus {
+    border-color: var(--accent);
+    box-shadow: 0 0 0 3px var(--accent-border);
+  }
+
+  input::placeholder { color: var(--text-tertiary); }
+
+  .btn-primary {
+    width: 100%;
+    padding: 10px 16px;
+    background: var(--text-primary);
+    color: var(--bg);
+    border: none;
+    border-radius: var(--r-sm);
+    font-size: 14px;
+    font-weight: 500;
+    font-family: inherit;
+    cursor: pointer;
+    transition: opacity 0.12s;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 6px;
+    letter-spacing: -0.01em;
+  }
+
+  .btn-primary:hover:not(:disabled) { opacity: 0.82; }
+  .btn-primary:disabled { opacity: 0.4; cursor: not-allowed; }
+
+  .btn-secondary {
+    width: 100%;
+    padding: 9px 16px;
+    background: transparent;
+    color: var(--text-secondary);
+    border: 1px solid var(--border-md);
+    border-radius: var(--r-sm);
+    font-size: 13px;
+    font-weight: 500;
+    font-family: inherit;
+    cursor: pointer;
+    transition: background 0.12s, color 0.12s;
+    margin-top: 12px;
+  }
+
+  .btn-secondary:hover { background: var(--bg); color: var(--text-primary); }
+
+  .error-box {
+    background: #fef2f2;
+    border: 1px solid rgba(220,38,38,0.2);
+    border-radius: var(--r-sm);
+    padding: 10px 12px;
+    font-size: 13px;
+    color: #dc2626;
+    margin-top: 12px;
+    display: none;
+  }
+
+  @media (prefers-color-scheme: dark) {
+    .error-box {
+      background: rgba(220,38,38,0.08);
+      border-color: rgba(220,38,38,0.25);
+      color: #f87171;
+    }
+  }
+
+  .error-box.show { display: block; }
+
+  .divider {
+    height: 1px;
+    background: var(--border);
+    margin: 0 28px;
+  }
+
   .result { display: none; }
   .result.show { display: block; }
 
-  .success-icon {
-    width: 48px; height: 48px; margin: 0 auto 16px;
-    background: #0e2a18; border: 1px solid #1a4a2a;
-    border-radius: 50%; display: flex; align-items: center;
-    justify-content: center; font-size: 22px;
+  .result-header {
+    padding: 20px 28px;
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    background: var(--success-bg);
+    border-bottom: 1px solid var(--success-border);
   }
-  .result h2 { text-align: center; margin-bottom: 4px; }
-  .result .sub { text-align: center; margin-bottom: 24px; }
 
-  .field-box {
-    background: #111; border: 1px solid #2a2a2a;
-    border-radius: 8px; padding: 12px 14px;
-    margin-bottom: 12px;
+  .check-circle {
+    width: 32px;
+    height: 32px;
+    border-radius: 50%;
+    background: var(--success);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    flex-shrink: 0;
   }
-  .field-box label { color: #666; font-size: 11px; text-transform: uppercase; letter-spacing: .05em; margin-bottom: 4px; }
+
+  .check-circle i { font-size: 16px; color: #fff; }
+
+  .result-header-text .title {
+    font-size: 14px;
+    font-weight: 600;
+    color: var(--text-primary);
+  }
+
+  .result-header-text .sub {
+    font-size: 12px;
+    color: var(--text-secondary);
+  }
+
+  .result-body {
+    padding: 20px 28px;
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+  }
+
+  .field-row {
+    background: var(--bg);
+    border: 1px solid var(--border);
+    border-radius: var(--r-sm);
+    overflow: hidden;
+  }
+
+  .field-label {
+    font-size: 10px;
+    font-weight: 600;
+    color: var(--text-tertiary);
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+    padding: 8px 12px 4px;
+  }
+
+  .field-value-row {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 0 8px 8px 12px;
+  }
+
   .field-value {
-    font-family: 'SF Mono', 'Fira Code', monospace;
-    font-size: 13px; color: #e8e8e8;
-    word-break: break-all; line-height: 1.5;
+    flex: 1;
+    font-family: var(--mono);
+    font-size: 12px;
+    color: var(--text-primary);
+    word-break: break-all;
+    line-height: 1.5;
   }
-  .copy-row {
-    display: flex; align-items: center; gap: 8px;
-  }
-  .copy-row .field-value { flex: 1; }
-  .copy-btn {
-    padding: 5px 10px; font-size: 12px; font-weight: 500;
-    background: #252525; border: 1px solid #333;
-    border-radius: 6px; color: #aaa; cursor: pointer;
-    flex-shrink: 0; transition: all .15s;
-    white-space: nowrap;
-  }
-  .copy-btn:hover { background: #2e2e2e; color: #fff; border-color: #555; }
-  .copy-btn.copied { background: #0e2a18; border-color: #1a4a2a; color: #4ade80; }
 
-  .steps {
-    background: #111; border: 1px solid #2a2a2a;
-    border-radius: 8px; padding: 16px; margin-top: 16px;
+  .copy-btn {
+    flex-shrink: 0;
+    padding: 4px 8px;
+    font-size: 11px;
+    font-weight: 500;
+    background: var(--surface);
+    border: 1px solid var(--border-md);
+    border-radius: var(--r-sm);
+    color: var(--text-secondary);
+    cursor: pointer;
+    transition: all 0.12s;
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    white-space: nowrap;
+    font-family: inherit;
   }
-  .steps h4 { font-size: 13px; color: #888; margin-bottom: 12px; font-weight: 500; }
-  .step {
-    display: flex; gap: 12px; align-items: flex-start;
+
+  .copy-btn:hover { border-color: var(--border-md); color: var(--text-primary); background: var(--bg); }
+  .copy-btn.copied { background: var(--success-bg); border-color: var(--success-border); color: var(--success); }
+
+  .steps-section {
+    margin: 4px 0 0;
+    padding: 16px;
+    background: var(--bg);
+    border: 1px solid var(--border);
+    border-radius: var(--r-sm);
+  }
+
+  .steps-label {
+    font-size: 10px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+    color: var(--text-tertiary);
     margin-bottom: 12px;
   }
-  .step:last-child { margin-bottom: 0; }
+
+  .step-item {
+    display: flex;
+    gap: 10px;
+    align-items: flex-start;
+    margin-bottom: 10px;
+  }
+
+  .step-item:last-child { margin-bottom: 0; }
+
   .step-num {
-    width: 22px; height: 22px; flex-shrink: 0;
-    background: #1e2a4a; border: 1px solid #2a3a6a;
-    border-radius: 50%; display: flex; align-items: center;
-    justify-content: center; font-size: 11px; font-weight: 700; color: #7aa3ff;
+    width: 18px;
+    height: 18px;
+    border-radius: 50%;
+    border: 1px solid var(--border-md);
+    background: var(--surface);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 10px;
+    font-weight: 600;
+    color: var(--text-secondary);
+    flex-shrink: 0;
     margin-top: 1px;
   }
-  .step-text { font-size: 13px; color: #bbb; line-height: 1.5; }
-  .step-text strong { color: #e8e8e8; }
 
-  .error-msg {
-    background: #2a1010; border: 1px solid #4a2020;
-    border-radius: 8px; padding: 12px 14px;
-    color: #f87171; font-size: 13px; margin-top: 12px;
-    display: none;
+  .step-text {
+    font-size: 12.5px;
+    color: var(--text-secondary);
+    line-height: 1.5;
   }
-  .error-msg.show { display: block; }
 
-  .divider { border: none; border-top: 1px solid #222; margin: 28px 0; }
+  .step-text strong { color: var(--text-primary); font-weight: 500; }
 
-  .footer { text-align: center; margin-top: 24px; font-size: 12px; color: #444; }
-  .footer a { color: #5b8fff; text-decoration: none; }
+  .footer {
+    text-align: center;
+    margin-top: 20px;
+    font-size: 11px;
+    color: var(--text-tertiary);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 16px;
+  }
+
+  .footer a {
+    color: var(--text-tertiary);
+    text-decoration: none;
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+  }
+
+  .footer a:hover { color: var(--text-secondary); }
 </style>
 </head>
 <body>
 
-<div class="card" id="registerCard">
-  <div class="logo">
-    <div class="logo-icon">⚡</div>
-    <div class="logo-text">
+<div class="wrapper">
+  <div class="header">
+    <div class="logo-mark">
+      <svg viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg">
+        <path d="M12 2L2 7v10l10 5 10-5V7L12 2zm0 2.18L20 8.5v7L12 19.82 4 15.5v-7l8-4.32zM12 8a4 4 0 100 8 4 4 0 000-8zm0 2a2 2 0 110 4 2 2 0 010-4z"/>
+      </svg>
+    </div>
+    <div class="header-text">
       <h1>ServiceNow Dev MCP</h1>
-      <p>AI-powered toolkit for Claude</p>
+      <p>Model Context Protocol server</p>
     </div>
   </div>
 
-  <div class="badge-row">
-    <span class="badge green">● Live</span>
-    <span class="badge" id="toolCountBadge">125 tools</span>
-    <span class="badge">SSE transport</span>
-    <span class="badge">Claude.ai connector</span>
+  <div class="card" id="mainCard">
+
+    <div class="card-body" id="formView">
+      <div class="pill-row">
+        <span class="pill live"><span class="dot"></span>Live</span>
+        <span class="pill" id="toolCountPill"><i class="ti ti-tool" style="font-size:11px"></i> <span id="toolCountText">loading</span></span>
+        <span class="pill"><i class="ti ti-broadcast" style="font-size:11px"></i> SSE transport</span>
+      </div>
+
+      <div class="section-title">Get your access token</div>
+      <p class="section-sub">Generate a personal token to connect this server to Claude.ai. Your ServiceNow, Jira, and Salesforce credentials are entered securely in the conversation — never stored.</p>
+
+      <div class="form-group">
+        <label for="nameInput">Your name</label>
+        <input type="text" id="nameInput" placeholder="e.g. Alice" autocomplete="off" maxlength="32"/>
+      </div>
+
+      <div id="adminSection" style="display:none">
+        <div class="form-group">
+          <label for="adminKeyInput">Admin key <span style="font-weight:400;opacity:0.7">(required by server)</span></label>
+          <input type="password" id="adminKeyInput" placeholder="Ask your server administrator"/>
+        </div>
+      </div>
+
+      <button class="btn-primary" id="registerBtn" onclick="register()">
+        Generate token
+        <i class="ti ti-arrow-right" style="font-size:14px" aria-hidden="true"></i>
+      </button>
+
+      <div class="error-box" id="errorMsg"></div>
+    </div>
+
+    <div class="result" id="resultView">
+      <div class="result-header">
+        <div class="check-circle">
+          <i class="ti ti-check" aria-hidden="true"></i>
+        </div>
+        <div class="result-header-text">
+          <div class="title">Token generated for <span id="resultName"></span></div>
+          <div class="sub">Add this connector to Claude.ai using the values below</div>
+        </div>
+      </div>
+
+      <div class="result-body">
+        <div class="field-row">
+          <div class="field-label">Connector URL</div>
+          <div class="field-value-row">
+            <div class="field-value" id="sseUrl"></div>
+            <button class="copy-btn" onclick="copy('sseUrl', this)">
+              <i class="ti ti-copy" style="font-size:12px" aria-hidden="true"></i> Copy
+            </button>
+          </div>
+        </div>
+
+        <div class="field-row">
+          <div class="field-label">Authorization header</div>
+          <div class="field-value-row">
+            <div class="field-value" id="tokenDisplay"></div>
+            <button class="copy-btn" onclick="copy('tokenDisplay', this)">
+              <i class="ti ti-copy" style="font-size:12px" aria-hidden="true"></i> Copy
+            </button>
+          </div>
+        </div>
+
+        <div class="steps-section">
+          <div class="steps-label">Setup in Claude.ai</div>
+          <div class="step-item">
+            <div class="step-num">1</div>
+            <div class="step-text">Go to <strong>Claude.ai → Settings → Connectors → Add custom connector</strong></div>
+          </div>
+          <div class="step-item">
+            <div class="step-num">2</div>
+            <div class="step-text">Paste the <strong>Connector URL</strong>, then add an <strong>Authorization</strong> header with the value above</div>
+          </div>
+          <div class="step-item">
+            <div class="step-num">3</div>
+            <div class="step-text">Save — Claude will prompt for your <strong>ServiceNow, Jira, or Salesforce</strong> credentials on first use</div>
+          </div>
+        </div>
+
+        <button class="btn-secondary" onclick="reset()">
+          <i class="ti ti-arrow-left" style="font-size:13px" aria-hidden="true"></i>
+          Generate another token
+        </button>
+      </div>
+    </div>
+
   </div>
 
-  <h2>Get your access token</h2>
-  <p class="sub">Enter your name to generate a personal token. Use it to connect this MCP to Claude.ai — your ServiceNow, Jira, and Salesforce credentials are entered securely in the conversation.</p>
-
-  <div id="formView">
-    <label for="nameInput">Your name</label>
-    <input type="text" id="nameInput" placeholder="e.g. Alice" autocomplete="off" maxlength="32"/>
-
-    <div id="adminSection" style="display:none">
-      <label for="adminKeyInput">Admin key <span style="color:#555;font-weight:400">(required by server)</span></label>
-      <input type="password" id="adminKeyInput" placeholder="Ask your server admin for this"/>
-    </div>
-
-    <button class="btn" id="registerBtn" onclick="register()">Generate my token →</button>
-    <div class="error-msg" id="errorMsg"></div>
+  <div class="footer">
+    <a href="/health" target="_blank"><i class="ti ti-activity" style="font-size:12px" aria-hidden="true"></i> Health</a>
+    <a href="https://modelcontextprotocol.io" target="_blank"><i class="ti ti-external-link" style="font-size:12px" aria-hidden="true"></i> MCP docs</a>
   </div>
-
-  <div class="result" id="resultView">
-    <div class="success-icon">✓</div>
-    <h2>You're ready to connect!</h2>
-    <p class="sub">Token generated for <strong id="resultName"></strong>. Add this connector to Claude.ai in 3 steps.</p>
-
-    <div class="field-box">
-      <label>Connector URL</label>
-      <div class="copy-row">
-        <div class="field-value" id="sseUrl"></div>
-        <button class="copy-btn" onclick="copy('sseUrl', this)">Copy</button>
-      </div>
-    </div>
-
-    <div class="field-box">
-      <label>Authorization header value</label>
-      <div class="copy-row">
-        <div class="field-value" id="tokenDisplay"></div>
-        <button class="copy-btn" onclick="copy('tokenDisplay', this)">Copy</button>
-      </div>
-    </div>
-
-    <div class="steps">
-      <h4>Setup steps in Claude.ai</h4>
-      <div class="step">
-        <div class="step-num">1</div>
-        <div class="step-text">Open <strong>Claude.ai → Settings → Connectors → Add custom connector</strong></div>
-      </div>
-      <div class="step">
-        <div class="step-num">2</div>
-        <div class="step-text">Paste the <strong>Connector URL</strong> above, then set the <strong>Authorization</strong> header to the token value above</div>
-      </div>
-      <div class="step">
-        <div class="step-num">3</div>
-        <div class="step-text">Save — Claude will ask for your <strong>ServiceNow, Jira, or Salesforce</strong> credentials on first use (stored in session only, never logged)</div>
-      </div>
-    </div>
-
-    <hr class="divider"/>
-    <button class="btn" style="background:#1a1a1a;border:1px solid #333;color:#aaa" onclick="reset()">← Generate another token</button>
-  </div>
-</div>
-
-<div class="footer">
-  <a href="/health" target="_blank">Server health</a> · Powered by <a href="https://modelcontextprotocol.io" target="_blank">MCP</a>
 </div>
 
 <script>
-  // Fetch live tool count and whether admin key is required
   fetch('/health')
     .then(r => r.json())
-    .then(d => {
-      document.getElementById('toolCountBadge').textContent = `${d.tools} tools`;
-    }).catch(() => {});
+    .then(d => { document.getElementById('toolCountText').textContent = d.tools + ' tools'; })
+    .catch(() => { document.getElementById('toolCountText').textContent = '116 tools'; });
 
   fetch('/register-info')
     .then(r => r.json())
-    .then(d => {
-      if (d.requires_admin_key) {
-        document.getElementById('adminSection').style.display = 'block';
-      }
-    }).catch(() => {});
+    .then(d => { if (d.requires_admin_key) document.getElementById('adminSection').style.display = 'block'; })
+    .catch(() => {});
 
   function register() {
     const name     = document.getElementById('nameInput').value.trim();
@@ -261,24 +567,27 @@
     if (!name) { showError('Please enter your name.'); return; }
 
     btn.disabled = true;
-    btn.textContent = 'Generating…';
+    btn.innerHTML = '<i class="ti ti-loader-2" style="font-size:14px;animation:spin 0.8s linear infinite" aria-hidden="true"></i> Generating…';
     errEl.classList.remove('show');
 
     const headers = { 'Content-Type': 'application/json' };
-    if (adminKey) headers['Authorization'] = `Bearer ${adminKey}`;
+    if (adminKey) headers['Authorization'] = 'Bearer ' + adminKey;
 
     fetch('/register', { method: 'POST', headers, body: JSON.stringify({ name }) })
       .then(r => r.json().then(d => ({ ok: r.ok, data: d })))
       .then(({ ok, data }) => {
-        if (!ok) { showError(data.error ?? 'Registration failed.'); return; }
+        if (!ok) { showError(data.error || 'Registration failed.'); return; }
         document.getElementById('resultName').textContent = data.name;
         document.getElementById('sseUrl').textContent     = data.sse_url;
-        document.getElementById('tokenDisplay').textContent = `Bearer ${data.token}`;
+        document.getElementById('tokenDisplay').textContent = 'Bearer ' + data.token;
         document.getElementById('formView').style.display  = 'none';
         document.getElementById('resultView').classList.add('show');
       })
       .catch(() => showError('Network error — is the server reachable?'))
-      .finally(() => { btn.disabled = false; btn.textContent = 'Generate my token →'; });
+      .finally(() => {
+        btn.disabled = false;
+        btn.innerHTML = 'Generate token <i class="ti ti-arrow-right" style="font-size:14px" aria-hidden="true"></i>';
+      });
   }
 
   function showError(msg) {
@@ -296,17 +605,19 @@
   }
 
   function copy(elId, btn) {
-    const text = document.getElementById(elId).textContent;
-    navigator.clipboard.writeText(text).then(() => {
-      btn.textContent = 'Copied!';
+    navigator.clipboard.writeText(document.getElementById(elId).textContent).then(() => {
+      const orig = btn.innerHTML;
+      btn.innerHTML = '<i class="ti ti-check" style="font-size:12px" aria-hidden="true"></i> Copied';
       btn.classList.add('copied');
-      setTimeout(() => { btn.textContent = 'Copy'; btn.classList.remove('copied'); }, 2000);
+      setTimeout(() => { btn.innerHTML = orig; btn.classList.remove('copied'); }, 2000);
     });
   }
 
-  document.getElementById('nameInput').addEventListener('keydown', e => {
-    if (e.key === 'Enter') register();
-  });
+  document.getElementById('nameInput').addEventListener('keydown', e => { if (e.key === 'Enter') register(); });
+
+  const style = document.createElement('style');
+  style.textContent = '@keyframes spin { to { transform: rotate(360deg); } }';
+  document.head.appendChild(style);
 </script>
 </body>
 </html>
