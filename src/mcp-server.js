@@ -17,8 +17,9 @@ import { fileURLToPath }        from 'node:url';
 import { dirname, join }        from 'node:path';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
-import { McpServer }            from '@modelcontextprotocol/sdk/server/mcp.js';
-import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
+import { McpServer }                    from '@modelcontextprotocol/sdk/server/mcp.js';
+import { StdioServerTransport }         from '@modelcontextprotocol/sdk/server/stdio.js';
+import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
 import { z }                    from 'zod';
 
 import { ServiceNowConnector }  from './connectors/servicenow.js';
@@ -7094,9 +7095,12 @@ if (process.env.MCP_MODE === 'http') {
   // Tokens are persisted in the `mcp_tokens` table so they survive redeploys.
   // Requires SUPABASE_URL + SUPABASE_SERVICE_ROLE_KEY env vars.
   // Falls back to in-memory only if Supabase is not configured.
-  const _supabase = (process.env.SUPABASE_URL && process.env.SUPABASE_SERVICE_ROLE_KEY)
-    ? createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_ROLE_KEY)
+  const _sbUrl = (process.env.SUPABASE_URL ?? '').trim();
+  const _sbKey = (process.env.SUPABASE_SERVICE_ROLE_KEY ?? '').trim();
+  const _supabase = (_sbUrl.startsWith('https://') && _sbKey)
+    ? createClient(_sbUrl, _sbKey)
     : null;
+  if (!_supabase) logger.info('Supabase not configured — tokens stored in-memory only');
 
   async function _loadPersistedTokens() {
     if (!_supabase) return [];
@@ -7266,14 +7270,40 @@ if (process.env.MCP_MODE === 'http') {
     res.json({ count: _runtimeKeys.size, tokens: [..._runtimeKeys].map(t => t.slice(0, 24) + '...') });
   });
 
-  // ── SSE endpoint — Claude.ai web connects here ────────────────────────────
-  // Rate-limited to 10 new connections/min per IP to prevent session flooding
-  app.get('/sse', rateLimit(10), checkApiKey, async (req, res) => {
-    const transport  = new SSEServerTransport('/messages', res);
-    const mcpServer  = createServer(); // fresh instance — McpServer is 1:1 with transport
+  // ── Streamable HTTP — Claude.ai web connector uses this ──────────────────
+  // Handles both GET (SSE stream) and POST (JSON-RPC) at /sse
+  // Each request gets its own transport + server instance (stateless-friendly)
+  app.all('/sse', rateLimit(60), checkApiKey, async (req, res) => {
+    const transport = new StreamableHTTPServerTransport({
+      sessionIdGenerator: () => randomUUID(),
+      onsessioninitialized: (sessionId) => {
+        clients.set(sessionId, transport);
+        _sessionContext.run(sessionId, () => {});
+        logger.info(`Streamable HTTP session started (${sessionId})`);
+      },
+    });
+
+    transport.onclose = () => {
+      if (transport.sessionId) {
+        clients.delete(transport.sessionId);
+        _sessions.delete(transport.sessionId);
+        logger.info(`Streamable HTTP session closed (${transport.sessionId})`);
+      }
+    };
+
+    const mcpServer = createServer();
+    await mcpServer.connect(transport);
+    await _sessionContext.run(transport.sessionId ?? randomUUID(), () =>
+      transport.handleRequest(req, res, req.body)
+    );
+  });
+
+  // ── Legacy SSE — keep for stdio / direct curl clients ─────────────────────
+  app.get('/sse-legacy', rateLimit(10), checkApiKey, async (req, res) => {
+    const transport = new SSEServerTransport('/messages', res);
+    const mcpServer = createServer();
     clients.set(transport.sessionId, transport);
 
-    // Heartbeat comment every 30 s — keeps connection alive through nginx/Cloudflare
     const heartbeat = setInterval(() => {
       if (!res.writableEnded) res.write(': heartbeat\n\n');
       else clearInterval(heartbeat);
@@ -7283,14 +7313,11 @@ if (process.env.MCP_MODE === 'http') {
       clearInterval(heartbeat);
       clients.delete(transport.sessionId);
       _sessions.delete(transport.sessionId);
-      logger.info(`SSE client disconnected (session: ${transport.sessionId})`);
     });
 
     await mcpServer.connect(transport);
-    logger.info(`SSE client connected (session: ${transport.sessionId})`);
   });
 
-  // ── Messages — tool calls from the client ─────────────────────────────────
   app.post('/messages', rateLimit(300), async (req, res) => {
     const sessionId = req.query.sessionId;
     const transport = clients.get(sessionId);
