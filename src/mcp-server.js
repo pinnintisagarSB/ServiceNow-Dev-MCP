@@ -7067,6 +7067,303 @@ Use this when:
   }
 );
 
+// ── Leave Request Assistant ───────────────────────────────────────────────
+// Tools: check_leave_balance, get_leave_types, check_holiday_calendar,
+//        get_my_leave_requests, check_leave_eligibility, submit_leave_request
+
+server.tool(
+  'check_leave_balance',
+  `Check an employee's available leave/time-off balance by type.
+
+Use this first when an employee asks about taking leave — shows how many
+days they have available for each leave type (vacation, sick, PTO, etc.).
+
+Returns available_balance, total_balance, used_pto for each leave type.`,
+  {
+    employee_id: z.string().optional().describe('SysID or email of the employee. Omit to use the currently authenticated user.'),
+  },
+  async ({ employee_id }) => {
+    try {
+      const sn = getSn();
+      let profileQuery = '';
+      if (employee_id) {
+        // Resolve hr_profile from user email or sys_id
+        const userRes = await sn.get(`/api/now/table/sys_user?sysparm_query=email=${employee_id}^ORsys_id=${employee_id}&sysparm_fields=sys_id,name,email&sysparm_limit=1`);
+        const user = userRes.data?.result?.[0];
+        if (!user) return fail(`User not found: ${employee_id}`);
+        const profileRes = await sn.get(`/api/now/table/sn_hr_core_profile?sysparm_query=user=${user.sys_id}&sysparm_fields=sys_id,user.name&sysparm_limit=1`);
+        const profile = profileRes.data?.result?.[0];
+        if (!profile) return fail(`HR profile not found for user: ${user.name}`);
+        profileQuery = `hr_profile=${profile.sys_id}`;
+      }
+
+      const query = profileQuery || '';
+      const res = await sn.get(`/api/now/table/sn_hr_core_emp_time_off_balance?${query ? 'sysparm_query=' + query + '&' : ''}sysparm_fields=type.name,available_balance,total_balance,used_pto&sysparm_limit=50`);
+      const balances = res.data?.result ?? [];
+
+      if (balances.length === 0) return ok({ message: 'No leave balance records found.', balances: [] });
+
+      return ok({
+        balances: balances.map(b => ({
+          type: b['type.name'] || b.type,
+          available_days: b.available_balance,
+          total_days: b.total_balance,
+          used_days: b.used_pto,
+        })),
+      });
+    } catch (e) { return fail(e.message); }
+  }
+);
+
+server.tool(
+  'get_leave_types',
+  `List all available leave/time-off types configured in ServiceNow.
+
+Use this to show the employee what types of leave they can request
+(e.g. Annual Leave, Sick Leave, Maternity, Paternity, Bereavement, etc.)`,
+  {},
+  async () => {
+    try {
+      const sn = getSn();
+      const res = await sn.get('/api/now/table/sn_hr_core_emp_time_off_type?sysparm_fields=sys_id,name,external_id&sysparm_limit=100');
+      const types = res.data?.result ?? [];
+      return ok({ leave_types: types.map(t => ({ id: t.sys_id, name: t.name, external_id: t.external_id })) });
+    } catch (e) { return fail(e.message); }
+  }
+);
+
+server.tool(
+  'check_holiday_calendar',
+  `Check if a date or date range contains public holidays.
+
+Use this when an employee asks about taking leave on specific dates —
+shows which days in that range are public holidays so they aren't
+counted against leave balance.`,
+  {
+    start_date: z.string().describe('Start date in YYYY-MM-DD format'),
+    end_date:   z.string().optional().describe('End date in YYYY-MM-DD format. Omit to check a single day.'),
+  },
+  async ({ start_date, end_date }) => {
+    try {
+      const sn = getSn();
+      const to = end_date ?? start_date;
+      const res = await sn.get(`/api/now/table/sys_holiday?sysparm_query=date>=${start_date}^date<=${to}&sysparm_fields=name,date&sysparm_limit=50&sysparm_orderby=date`);
+      const holidays = res.data?.result ?? [];
+      return ok({
+        range: { start: start_date, end: to },
+        holiday_count: holidays.length,
+        holidays: holidays.map(h => ({ name: h.name, date: h.date })),
+        message: holidays.length === 0
+          ? `No public holidays between ${start_date} and ${to}.`
+          : `Found ${holidays.length} holiday(s) in this range.`,
+      });
+    } catch (e) { return fail(e.message); }
+  }
+);
+
+server.tool(
+  'get_my_leave_requests',
+  `List an employee's existing time-off/leave requests.
+
+Use this to show pending, approved, and rejected requests so the employee
+can see what they've already submitted before making a new request.`,
+  {
+    employee_id: z.string().optional().describe('SysID or email of employee. Omit for current user.'),
+    status:      z.enum(['all', 'pending', 'approved', 'rejected']).optional().default('all').describe('Filter by status'),
+    limit:       z.number().optional().default(20).describe('Max number of records to return'),
+  },
+  async ({ employee_id, status, limit }) => {
+    try {
+      const sn = getSn();
+      let query = '';
+
+      if (employee_id) {
+        const userRes = await sn.get(`/api/now/table/sys_user?sysparm_query=email=${employee_id}^ORsys_id=${employee_id}&sysparm_fields=sys_id&sysparm_limit=1`);
+        const user = userRes.data?.result?.[0];
+        if (!user) return fail(`User not found: ${employee_id}`);
+        const profileRes = await sn.get(`/api/now/table/sn_hr_core_profile?sysparm_query=user=${user.sys_id}&sysparm_fields=sys_id&sysparm_limit=1`);
+        const profile = profileRes.data?.result?.[0];
+        if (profile) query += `hr_profile=${profile.sys_id}^`;
+      }
+
+      if (status && status !== 'all') query += `status=${status}^`;
+      query = query.replace(/\^$/, '');
+
+      const res = await sn.get(`/api/now/table/sn_hr_core_emp_time_off?${query ? 'sysparm_query=' + query + '&' : ''}sysparm_fields=sys_id,type.name,start_date,end_date,quantity,status&sysparm_limit=${limit}&sysparm_orderby=start_date`);
+      const requests = res.data?.result ?? [];
+
+      return ok({
+        count: requests.length,
+        requests: requests.map(r => ({
+          id: r.sys_id,
+          type: r['type.name'] || r.type,
+          start_date: r.start_date,
+          end_date: r.end_date,
+          days: r.quantity,
+          status: r.status,
+        })),
+      });
+    } catch (e) { return fail(e.message); }
+  }
+);
+
+server.tool(
+  'check_leave_eligibility',
+  `Full eligibility check for a leave request — combines balance, holidays, and conflicts.
+
+Use this before submitting a leave request to give the employee a clear
+picture: available balance, holidays in range, working days needed, and
+any overlapping existing requests.
+
+This is the main tool for answering "Can I take leave from X to Y?"`,
+  {
+    start_date:  z.string().describe('Start date in YYYY-MM-DD format'),
+    end_date:    z.string().describe('End date in YYYY-MM-DD format'),
+    leave_type_id: z.string().optional().describe('SysID of the leave type. Get from get_leave_types.'),
+    employee_id: z.string().optional().describe('SysID or email of employee. Omit for current user.'),
+  },
+  async ({ start_date, end_date, leave_type_id, employee_id }) => {
+    try {
+      const sn = getSn();
+
+      // 1. Count working days (Mon–Fri) in range
+      const s = new Date(start_date), e = new Date(end_date);
+      let working_days = 0;
+      for (let d = new Date(s); d <= e; d.setDate(d.getDate() + 1)) {
+        const dow = d.getDay();
+        if (dow !== 0 && dow !== 6) working_days++;
+      }
+
+      // 2. Check holidays in range
+      const holRes = await sn.get(`/api/now/table/sys_holiday?sysparm_query=date>=${start_date}^date<=${end_date}&sysparm_fields=name,date&sysparm_limit=50`);
+      const holidays = holRes.data?.result ?? [];
+      const working_days_needed = Math.max(0, working_days - holidays.length);
+
+      // 3. Check leave balance for the type
+      let balance_info = null;
+      let profile_id = null;
+      if (employee_id || leave_type_id) {
+        let profileQuery = '';
+        if (employee_id) {
+          const userRes = await sn.get(`/api/now/table/sys_user?sysparm_query=email=${employee_id}^ORsys_id=${employee_id}&sysparm_fields=sys_id&sysparm_limit=1`);
+          const user = userRes.data?.result?.[0];
+          if (user) {
+            const profRes = await sn.get(`/api/now/table/sn_hr_core_profile?sysparm_query=user=${user.sys_id}&sysparm_fields=sys_id&sysparm_limit=1`);
+            profile_id = profRes.data?.result?.[0]?.sys_id;
+            if (profile_id) profileQuery = `hr_profile=${profile_id}`;
+          }
+        }
+        if (leave_type_id) {
+          profileQuery += (profileQuery ? '^' : '') + `type=${leave_type_id}`;
+        }
+        const balRes = await sn.get(`/api/now/table/sn_hr_core_emp_time_off_balance?sysparm_query=${profileQuery}&sysparm_fields=type.name,available_balance&sysparm_limit=1`);
+        const bal = balRes.data?.result?.[0];
+        if (bal) balance_info = { type: bal['type.name'], available_days: bal.available_balance };
+      }
+
+      // 4. Check for overlapping existing requests
+      let overlap_query = `start_date<=${end_date}^end_date>=${start_date}^status!=rejected`;
+      if (profile_id) overlap_query += `^hr_profile=${profile_id}`;
+      const overlapRes = await sn.get(`/api/now/table/sn_hr_core_emp_time_off?sysparm_query=${overlap_query}&sysparm_fields=type.name,start_date,end_date,status&sysparm_limit=10`);
+      const overlaps = overlapRes.data?.result ?? [];
+
+      // 5. Verdict
+      const has_balance = !balance_info || parseFloat(balance_info.available_days) >= working_days_needed;
+      const has_conflicts = overlaps.length > 0;
+      const eligible = has_balance && !has_conflicts;
+
+      return ok({
+        eligible,
+        summary: {
+          start_date,
+          end_date,
+          calendar_days: Math.round((e - s) / 86400000) + 1,
+          working_days,
+          holidays: holidays.map(h => ({ name: h.name, date: h.date })),
+          working_days_needed,
+          balance: balance_info,
+          sufficient_balance: has_balance,
+          conflicting_requests: overlaps.map(o => ({
+            type: o['type.name'],
+            start: o.start_date,
+            end: o.end_date,
+            status: o.status,
+          })),
+        },
+        recommendation: eligible
+          ? `You are eligible. This request needs ${working_days_needed} working day(s) from your leave balance.`
+          : !has_balance
+            ? `Insufficient balance. You need ${working_days_needed} days but only have ${balance_info?.available_days ?? 0} available.`
+            : `You have ${overlaps.length} overlapping request(s) in this period.`,
+      });
+    } catch (e) { return fail(e.message); }
+  }
+);
+
+server.tool(
+  'submit_leave_request',
+  `Submit a time-off/leave request in ServiceNow.
+
+IMPORTANT: Always call check_leave_eligibility first and confirm with the
+employee before calling this tool. This creates a real record in ServiceNow.`,
+  {
+    leave_type_id: z.string().describe('SysID of the leave type. Get from get_leave_types.'),
+    start_date:    z.string().describe('Start date in YYYY-MM-DD format'),
+    end_date:      z.string().describe('End date in YYYY-MM-DD format'),
+    employee_id:   z.string().optional().describe('SysID or email of employee. Omit for current user.'),
+    comments:      z.string().optional().describe('Optional reason or comments for the request'),
+  },
+  async ({ leave_type_id, start_date, end_date, employee_id, comments }) => {
+    try {
+      const sn = getSn();
+
+      // Resolve hr_profile
+      let profile_id = null;
+      if (employee_id) {
+        const userRes = await sn.get(`/api/now/table/sys_user?sysparm_query=email=${employee_id}^ORsys_id=${employee_id}&sysparm_fields=sys_id,name&sysparm_limit=1`);
+        const user = userRes.data?.result?.[0];
+        if (!user) return fail(`User not found: ${employee_id}`);
+        const profRes = await sn.get(`/api/now/table/sn_hr_core_profile?sysparm_query=user=${user.sys_id}&sysparm_fields=sys_id&sysparm_limit=1`);
+        profile_id = profRes.data?.result?.[0]?.sys_id;
+        if (!profile_id) return fail(`HR profile not found for: ${user.name}`);
+      }
+
+      // Calculate quantity (working days minus holidays)
+      const s = new Date(start_date), e = new Date(end_date);
+      let working_days = 0;
+      for (let d = new Date(s); d <= e; d.setDate(d.getDate() + 1)) {
+        const dow = d.getDay();
+        if (dow !== 0 && dow !== 6) working_days++;
+      }
+      const holRes = await sn.get(`/api/now/table/sys_holiday?sysparm_query=date>=${start_date}^date<=${end_date}&sysparm_fields=date&sysparm_limit=50`);
+      const holiday_count = holRes.data?.result?.length ?? 0;
+      const quantity = Math.max(1, working_days - holiday_count);
+
+      const payload = {
+        type: leave_type_id,
+        start_date,
+        end_date,
+        quantity,
+        ...(profile_id ? { hr_profile: profile_id } : {}),
+        ...(comments ? { comments } : {}),
+      };
+
+      const res = await sn.post('/api/now/table/sn_hr_core_emp_time_off', payload);
+      const record = res.data?.result;
+
+      return ok({
+        success: true,
+        request_id: record?.sys_id,
+        status: record?.status ?? 'submitted',
+        start_date: record?.start_date ?? start_date,
+        end_date:   record?.end_date   ?? end_date,
+        days:       record?.quantity   ?? quantity,
+        message: `Leave request submitted successfully. ${quantity} working day(s) from ${start_date} to ${end_date}.`,
+      });
+    } catch (e) { return fail(e.message); }
+  }
+);
+
 } // end registerTools
 
 // ── Start: stdio (CLI) or HTTP/SSE (web Claude Code / remote) ────────────
