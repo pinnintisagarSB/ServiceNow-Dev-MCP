@@ -190,7 +190,7 @@ async function _loadPlatformCreds(platform) {
 }
 
 // ── Response helpers ───────────────────────────────────────────────────────
-const ok  = (data) => ({ content: [{ type: 'text', text: JSON.stringify(data, null, 2) }] });
+const ok  = (data) => ({ content: [{ type: 'text', text: JSON.stringify(data) }] });
 const fail = (msg) => ({ content: [{ type: 'text', text: `ERROR: ${msg}` }], isError: true });
 
 // ── Credential guards ──────────────────────────────────────────────────────
@@ -297,19 +297,10 @@ async function _requireSf() {
 // McpServer can only be connected to one transport at a time. For multi-user
 // SSE we create a fresh instance per connection via registerTools(server).
 const SERVER_INSTRUCTIONS = `
-## ServiceNow Dev MCP — Session Setup
-
-**IMPORTANT: At the very start of every conversation, before doing anything else:**
-
-1. Call \`get_config\` to check which platforms are configured.
-2. If a platform shows \`configured: false\`, call \`get_credential_setup_url\` and
-   tell the user to open the portal link to enter their credentials.
-3. NEVER ask the user for passwords, API tokens, or secrets in this chat.
-   Credentials are entered securely in the web portal — not through Claude.
-
-Once credentials are saved in the portal, they are loaded automatically at
-the start of each session. If a tool returns an auth error, call
-\`get_credential_setup_url\` and ask the user to update their credentials in the portal.
+ServiceNow Dev MCP — call get_config first every session.
+If any platform shows configured:false, call get_credential_setup_url and send the user the portal link.
+NEVER ask for passwords or tokens in chat — credentials are entered in the portal only.
+On auth errors, call get_credential_setup_url and ask the user to update credentials in the portal.
 `.trim();
 
 function createServer() {
@@ -328,21 +319,7 @@ function registerTools(server) {
 // ══════════════════════════════════════════════════════════════════════════
 server.tool(
   'get_config',
-  `CALL THIS FIRST — at the very start of every session, before ANY other tool.
-
-Returns which platforms are configured and ready to use.
-
-Credentials are loaded automatically from the MCP portal (Supabase-backed, AES-256 encrypted).
-Users enter credentials once in the portal — Claude never handles passwords or tokens.
-
-Decision tree:
-  • All platforms configured → proceed with the user's request.
-  • Any platform configured=false → call get_credential_setup_url and tell the user
-    to open the portal to enter their credentials. NEVER ask for passwords in chat.
-
-Credential sources checked in order:
-  1. Supabase (entered via portal — preferred, secure)
-  2. .env file on server (CLI / self-hosted)`,
+  `Call first every session. Returns which platforms are configured. If configured:false, call get_credential_setup_url — never ask for passwords in chat.`,
   {},
   async () => {
     const snCreds  = _sessionCreds.servicenow;
@@ -383,15 +360,6 @@ Credential sources checked in order:
     const notConfigured = ['servicenow', 'jira', 'salesforce'].filter(p => !cfg[p].configured);
 
     return ok({
-      instructions_for_claude: [
-        `The following platforms are configured and ready: ${ready.length ? ready.join(', ') : 'none'}.`,
-        notConfigured.length
-          ? `These platforms are NOT configured: ${notConfigured.join(', ')}. If the user needs one of them, call configure_credentials to collect their credentials for this session.`
-          : 'All three platforms are configured.',
-        ready.length === 0
-          ? 'No platforms are configured. Call configure_credentials first — ask the user which platform(s) they need and collect the credentials.'
-          : 'Call connect() next to verify the live connections, then proceed with the user\'s request.',
-      ],
       configured_platforms: ready,
       not_configured:       notConfigured,
       config:               cfg,
@@ -408,15 +376,7 @@ Credential sources checked in order:
 // ══════════════════════════════════════════════════════════════════════════
 server.tool(
   'get_credential_setup_url',
-  `Returns the URL where the user can securely enter their platform credentials.
-
-Use this whenever a platform is not configured (get_config shows configured=false).
-DO NOT ask the user for passwords, API tokens, or secrets — direct them to the
-portal URL instead. Credentials entered there are encrypted (AES-256-GCM) and
-stored server-side; Claude never sees them.
-
-After the user saves their credentials in the portal, they should start a new
-Claude conversation — credentials are loaded automatically at session start.`,
+  `Returns the portal URL for entering credentials. Use when get_config shows configured:false. Send the user this URL — never ask for passwords in chat. After saving, the user should start a new conversation.`,
   {},
   async () => {
     // Best-effort: derive the portal URL from the session token or env
