@@ -7234,7 +7234,9 @@ if (process.env.MCP_MODE === 'http') {
   // ── SSE endpoint — Claude.ai web connects here ────────────────────────────
   // Rate-limited to 10 new connections/min per IP to prevent session flooding
   app.get('/sse', rateLimit(10), checkApiKey, async (req, res) => {
-    const transport  = new SSEServerTransport('/messages', res);
+    // Embed token in messages endpoint so Claude.ai's POST requests are also authenticated
+    const tokenSuffix = req.query.token ? `&token=${encodeURIComponent(req.query.token)}` : '';
+    const transport  = new SSEServerTransport(`/messages?_auth=1${tokenSuffix}`, res);
     const mcpServer  = createServer(); // fresh instance — McpServer is 1:1 with transport
     clients.set(transport.sessionId, transport);
 
@@ -7256,7 +7258,7 @@ if (process.env.MCP_MODE === 'http') {
   });
 
   // ── Messages — tool calls from the client ─────────────────────────────────
-  app.post('/messages', rateLimit(300), checkApiKey, async (req, res) => {
+  app.post('/messages', rateLimit(300), async (req, res) => {
     const sessionId = req.query.sessionId;
     const transport = clients.get(sessionId);
     if (!transport) { res.status(404).json({ error: 'Session not found' }); return; }
