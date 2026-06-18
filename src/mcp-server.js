@@ -11,7 +11,8 @@
 import 'dotenv/config';
 import { AsyncLocalStorage }    from 'node:async_hooks';
 import { randomUUID }           from 'node:crypto';
-import { readFileSync, writeFileSync, mkdirSync } from 'node:fs';
+import { readFileSync } from 'node:fs';
+import { createClient } from '@supabase/supabase-js';
 import { fileURLToPath }        from 'node:url';
 import { dirname, join }        from 'node:path';
 
@@ -7089,32 +7090,45 @@ if (process.env.MCP_MODE === 'http') {
 
   const adminKey = process.env.ADMIN_KEY;
 
-  // ── Persistent token store ─────────────────────────────────────────────────
-  // Tokens are written to TOKEN_STORE_PATH (default /data/tokens.json) so they
-  // survive container restarts and redeploys. Falls back to in-memory silently
-  // if the path is not writable (e.g. no persistent disk mounted).
-  const _tokenStorePath = process.env.TOKEN_STORE_PATH ?? '/data/tokens.json';
+  // ── Supabase token store ───────────────────────────────────────────────────
+  // Tokens are persisted in the `mcp_tokens` table so they survive redeploys.
+  // Requires SUPABASE_URL + SUPABASE_SERVICE_ROLE_KEY env vars.
+  // Falls back to in-memory only if Supabase is not configured.
+  const _supabase = (process.env.SUPABASE_URL && process.env.SUPABASE_SERVICE_ROLE_KEY)
+    ? createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_ROLE_KEY)
+    : null;
 
-  function _loadPersistedTokens() {
+  async function _loadPersistedTokens() {
+    if (!_supabase) return [];
     try {
-      const raw = readFileSync(_tokenStorePath, 'utf8');
-      return new Set(JSON.parse(raw));
-    } catch { return new Set(); }
+      const { data, error } = await _supabase.from('mcp_tokens').select('token');
+      if (error) { logger.error(`Token load error: ${error.message}`); return []; }
+      return data.map(r => r.token);
+    } catch (e) { logger.error(`Token load error: ${e.message}`); return []; }
   }
 
-  function _persistTokens(keys) {
+  async function _saveToken(token, name) {
+    if (!_supabase) return;
     try {
-      mkdirSync(_tokenStorePath.replace(/\/[^/]+$/, ''), { recursive: true });
-      writeFileSync(_tokenStorePath, JSON.stringify([...keys]), 'utf8');
-    } catch { /* no persistent disk — in-memory only */ }
+      await _supabase.from('mcp_tokens').upsert({ token, name });
+    } catch (e) { logger.error(`Token save error: ${e.message}`); }
   }
 
-  // Seed from env vars + persisted file
-  const _runtimeKeys = new Set([
+  async function _deleteToken(token) {
+    if (!_supabase) return;
+    try {
+      await _supabase.from('mcp_tokens').delete().eq('token', token);
+    } catch (e) { logger.error(`Token delete error: ${e.message}`); }
+  }
+
+  // Seed from env vars + Supabase (async — load before server starts)
+  const _envKeys = [
     ...(process.env.ALLOWED_KEYS ?? '').split(',').map(k => k.trim()).filter(Boolean),
     ...(process.env.MCP_API_KEY ? [process.env.MCP_API_KEY] : []),
-    ..._loadPersistedTokens(),
-  ]);
+  ];
+  const _persistedKeys = await _loadPersistedTokens();
+  const _runtimeKeys = new Set([..._envKeys, ..._persistedKeys]);
+  if (_persistedKeys.length > 0) logger.info(`Loaded ${_persistedKeys.length} token(s) from Supabase`);
 
   function isValidToken(authHeader, queryToken) {
     if (_runtimeKeys.size === 0) return true; // open if no keys configured
@@ -7195,7 +7209,7 @@ if (process.env.MCP_MODE === 'http') {
   //
   // Response: { "token": "sn-mcp-xxxx...", "name": "alice",
   //             "sse_url": "https://...", "instructions": "..." }
-  app.post('/register', rateLimit(20), (req, res) => {
+  app.post('/register', rateLimit(20), async (req, res) => {
     if (adminKey && req.headers['authorization'] !== `Bearer ${adminKey}`) {
       res.status(401).json({ error: 'ADMIN_KEY required to register new tokens' });
       return;
@@ -7205,7 +7219,7 @@ if (process.env.MCP_MODE === 'http') {
     // crypto.randomUUID is available in Node 22
     const token = `sn-mcp-${name}-${randomUUID().replace(/-/g, '').slice(0, 16)}`;
     _runtimeKeys.add(token);
-    _persistTokens(_runtimeKeys);
+    await _saveToken(token, name);
 
     const host    = req.headers['x-forwarded-host'] ?? req.headers['host'] ?? `localhost:${port}`;
     const proto   = req.headers['x-forwarded-proto'] ?? (port === 443 ? 'https' : 'http');
@@ -7228,14 +7242,14 @@ if (process.env.MCP_MODE === 'http') {
 
   // ── Token revocation — DELETE /register/:token ─────────────────────────────
   // Requires ADMIN_KEY. Revoked tokens are removed from the live set immediately.
-  app.delete('/register/:token', (req, res) => {
+  app.delete('/register/:token', async (req, res) => {
     if (!adminKey || req.headers['authorization'] !== `Bearer ${adminKey}`) {
       res.status(401).json({ error: 'ADMIN_KEY required to revoke tokens' });
       return;
     }
     const { token } = req.params;
     if (_runtimeKeys.delete(token)) {
-      _persistTokens(_runtimeKeys);
+      await _deleteToken(token);
       logger.info(`Token revoked: ${token.slice(0, 20)}...`);
       res.json({ revoked: true, token });
     } else {
