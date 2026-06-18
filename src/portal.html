@@ -3,879 +3,732 @@
 <head>
 <meta charset="UTF-8"/>
 <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
-<title>ServiceNow Dev MCP — Get access</title>
+<title>ServiceNow Dev MCP</title>
 <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@tabler/icons-webfont@3.19.0/dist/tabler-icons.min.css"/>
 <style>
-  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+*,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
 
-  :root {
-    --bg: #fafaf9;
-    --surface: #ffffff;
-    --border: rgba(0,0,0,0.08);
-    --border-md: rgba(0,0,0,0.14);
-    --text-primary: #1a1a18;
-    --text-secondary: #6b6b66;
-    --text-tertiary: #9b9b96;
-    --accent: #cc785c;
-    --accent-bg: #fdf3ef;
-    --accent-border: rgba(204,120,92,0.25);
-    --success: #16a34a;
-    --success-bg: #f0fdf4;
-    --success-border: rgba(22,163,74,0.2);
-    --mono: 'SF Mono', 'Fira Code', 'Cascadia Code', monospace;
-    --r-sm: 6px;
-    --r-md: 10px;
-    --r-lg: 16px;
+:root{
+  --bg:#f4f4f2;
+  --surface:#ffffff;
+  --surface-raised:#ffffff;
+  --border:rgba(0,0,0,0.08);
+  --border-strong:rgba(0,0,0,0.15);
+  --text-1:#111110;
+  --text-2:#52524e;
+  --text-3:#a8a8a3;
+  --accent:#0066ff;
+  --accent-hover:#0052cc;
+  --accent-muted:rgba(0,102,255,0.08);
+  --accent-border:rgba(0,102,255,0.2);
+  --green:#16a34a;
+  --green-bg:#f0fdf4;
+  --green-border:rgba(22,163,74,0.18);
+  --red:#dc2626;
+  --red-bg:#fef2f2;
+  --red-border:rgba(220,38,38,0.18);
+  --mono:'SF Mono','Fira Code','Cascadia Code',ui-monospace,monospace;
+  --r:8px;
+  --r-lg:12px;
+  --r-xl:16px;
+}
+
+@media(prefers-color-scheme:dark){
+  :root{
+    --bg:#0e0e0d;
+    --surface:#1a1a18;
+    --surface-raised:#242422;
+    --border:rgba(255,255,255,0.07);
+    --border-strong:rgba(255,255,255,0.13);
+    --text-1:#f0efec;
+    --text-2:#8c8c87;
+    --text-3:#4e4e4a;
+    --accent:#4d94ff;
+    --accent-hover:#70aaff;
+    --accent-muted:rgba(77,148,255,0.1);
+    --accent-border:rgba(77,148,255,0.25);
+    --green:#4ade80;
+    --green-bg:rgba(22,163,74,0.08);
+    --green-border:rgba(74,222,128,0.18);
+    --red:#f87171;
+    --red-bg:rgba(220,38,38,0.08);
+    --red-border:rgba(248,113,113,0.2);
   }
+}
 
-  @media (prefers-color-scheme: dark) {
-    :root {
-      --bg: #111110;
-      --surface: #1c1c1a;
-      --border: rgba(255,255,255,0.08);
-      --border-md: rgba(255,255,255,0.14);
-      --text-primary: #f0efec;
-      --text-secondary: #9b9b96;
-      --text-tertiary: #6b6b66;
-      --accent: #e8956d;
-      --accent-bg: rgba(204,120,92,0.1);
-      --accent-border: rgba(204,120,92,0.3);
-      --success: #4ade80;
-      --success-bg: rgba(22,163,74,0.08);
-      --success-border: rgba(74,222,128,0.2);
-    }
-  }
+body{
+  font-family:-apple-system,BlinkMacSystemFont,'Inter','Segoe UI',sans-serif;
+  background:var(--bg);
+  color:var(--text-1);
+  min-height:100vh;
+  display:flex;
+  flex-direction:column;
+  align-items:center;
+  padding:48px 20px 80px;
+  font-size:14px;
+  line-height:1.6;
+  -webkit-font-smoothing:antialiased;
+}
 
-  body {
-    font-family: -apple-system, BlinkMacSystemFont, 'Inter', 'Segoe UI', sans-serif;
-    background: var(--bg);
-    color: var(--text-primary);
-    min-height: 100vh;
-    display: flex;
-    flex-direction: column;
-    align-items: center;
-    justify-content: center;
-    padding: 40px 20px;
-    font-size: 14px;
-    line-height: 1.6;
-    -webkit-font-smoothing: antialiased;
-  }
+.page{width:100%;max-width:520px;display:flex;flex-direction:column;gap:12px}
 
-  .wrapper {
-    width: 100%;
-    max-width: 460px;
-    display: flex;
-    flex-direction: column;
-    gap: 0;
-  }
+/* ── Top nav bar ─────────────────────────────────────────────────────────── */
+.topbar{
+  display:flex;align-items:center;justify-content:space-between;
+  margin-bottom:20px;
+}
+.brand{display:flex;align-items:center;gap:10px}
+.brand-icon{
+  width:32px;height:32px;background:var(--text-1);
+  border-radius:var(--r);display:flex;align-items:center;justify-content:center;
+  flex-shrink:0;
+}
+.brand-icon svg{width:18px;height:18px;fill:var(--bg)}
+.brand-name{font-size:14px;font-weight:600;letter-spacing:-0.01em;color:var(--text-1)}
+.brand-tag{font-size:11px;color:var(--text-3);font-weight:400;margin-top:-2px}
+.status-pill{
+  display:flex;align-items:center;gap:6px;
+  padding:5px 11px;border-radius:20px;
+  border:1px solid var(--border-strong);
+  background:var(--surface);
+  font-size:12px;color:var(--text-2);
+  font-weight:500;
+}
+.status-dot{
+  width:7px;height:7px;border-radius:50%;
+  background:#16a34a;
+  box-shadow:0 0 0 2px rgba(22,163,74,0.2);
+}
 
-  .header {
-    display: flex;
-    align-items: center;
-    gap: 14px;
-    margin-bottom: 32px;
-  }
+/* ── Card ────────────────────────────────────────────────────────────────── */
+.card{
+  background:var(--surface);
+  border:1px solid var(--border);
+  border-radius:var(--r-xl);
+  overflow:hidden;
+}
 
-  .logo-mark {
-    width: 40px;
-    height: 40px;
-    background: var(--text-primary);
-    border-radius: var(--r-md);
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    flex-shrink: 0;
-  }
+/* ── Card section header ──────────────────────────────────────────────────── */
+.card-header{
+  padding:20px 24px 0;
+  display:flex;align-items:flex-start;gap:12px;
+}
+.card-icon{
+  width:36px;height:36px;flex-shrink:0;
+  background:var(--accent-muted);border:1px solid var(--accent-border);
+  border-radius:var(--r);
+  display:flex;align-items:center;justify-content:center;
+  color:var(--accent);font-size:17px;margin-top:2px;
+}
+.card-title{font-size:15px;font-weight:600;color:var(--text-1);letter-spacing:-0.01em}
+.card-sub{font-size:13px;color:var(--text-2);margin-top:2px;line-height:1.5}
 
-  .logo-mark svg {
-    width: 22px;
-    height: 22px;
-    fill: var(--bg);
-  }
+.card-body{padding:20px 24px 24px}
 
-  .header-text h1 {
-    font-size: 15px;
-    font-weight: 600;
-    color: var(--text-primary);
-    letter-spacing: -0.01em;
-  }
+/* ── Divider ─────────────────────────────────────────────────────────────── */
+.divider{height:1px;background:var(--border);margin:0 24px}
 
-  .header-text p {
-    font-size: 12px;
-    color: var(--text-tertiary);
-    margin-top: 1px;
-  }
+/* ── Form controls ───────────────────────────────────────────────────────── */
+.field{margin-bottom:14px}
+.field:last-of-type{margin-bottom:0}
+.field label{
+  display:block;font-size:12px;font-weight:500;
+  color:var(--text-2);margin-bottom:6px;letter-spacing:0.01em;
+}
+.field label .opt{font-weight:400;color:var(--text-3)}
+.field input{
+  width:100%;padding:9px 12px;
+  background:var(--bg);border:1px solid var(--border-strong);
+  border-radius:var(--r);
+  font-size:13.5px;color:var(--text-1);
+  font-family:inherit;
+  transition:border-color 0.15s,box-shadow 0.15s;
+  outline:none;
+}
+.field input::placeholder{color:var(--text-3)}
+.field input:focus{
+  border-color:var(--accent);
+  box-shadow:0 0 0 3px var(--accent-muted);
+}
+.field .hint{font-size:11.5px;color:var(--text-3);margin-top:5px;line-height:1.4}
 
-  .card {
-    background: var(--surface);
-    border: 1px solid var(--border);
-    border-radius: var(--r-lg);
-    overflow: hidden;
-  }
+/* ── Buttons ─────────────────────────────────────────────────────────────── */
+.btn-primary{
+  width:100%;padding:10px 16px;
+  background:var(--accent);border:none;border-radius:var(--r);
+  color:#fff;font-size:13.5px;font-weight:500;
+  cursor:pointer;font-family:inherit;
+  display:flex;align-items:center;justify-content:center;gap:7px;
+  transition:background 0.15s,opacity 0.15s;
+  margin-top:18px;
+}
+.btn-primary:hover:not(:disabled){background:var(--accent-hover)}
+.btn-primary:disabled{opacity:0.5;cursor:not-allowed}
 
-  .card-body {
-    padding: 28px;
-  }
+.btn-secondary{
+  padding:8px 14px;
+  background:transparent;border:1px solid var(--border-strong);border-radius:var(--r);
+  color:var(--text-2);font-size:13px;font-weight:500;
+  cursor:pointer;font-family:inherit;
+  display:inline-flex;align-items:center;gap:6px;
+  transition:background 0.12s,color 0.12s;
+}
+.btn-secondary:hover{background:var(--bg);color:var(--text-1)}
 
-  .pill-row {
-    display: flex;
-    flex-wrap: wrap;
-    gap: 6px;
-    margin-bottom: 24px;
-  }
+.btn-icon{
+  width:34px;height:34px;flex-shrink:0;
+  background:transparent;border:1px solid var(--border-strong);border-radius:var(--r);
+  color:var(--text-2);font-size:15px;
+  cursor:pointer;font-family:inherit;
+  display:inline-flex;align-items:center;justify-content:center;
+  transition:background 0.12s,color 0.12s;
+}
+.btn-icon:hover{background:var(--bg);color:var(--text-1)}
+.btn-icon-danger:hover{background:var(--red-bg);border-color:var(--red-border);color:var(--red)}
 
-  .pill {
-    display: inline-flex;
-    align-items: center;
-    gap: 5px;
-    font-size: 11px;
-    font-weight: 500;
-    color: var(--text-secondary);
-    background: var(--bg);
-    border: 1px solid var(--border);
-    border-radius: 20px;
-    padding: 3px 9px;
-    letter-spacing: 0.01em;
-  }
+/* ── Tabs ────────────────────────────────────────────────────────────────── */
+.tabs{
+  display:flex;gap:2px;
+  background:var(--bg);border-radius:var(--r);
+  padding:3px;margin-bottom:16px;
+}
+.tab{
+  flex:1;padding:7px 10px;
+  background:transparent;border:none;border-radius:6px;
+  font-size:12.5px;font-weight:500;color:var(--text-2);
+  cursor:pointer;font-family:inherit;
+  transition:background 0.12s,color 0.12s;
+  white-space:nowrap;text-align:center;
+}
+.tab:hover{color:var(--text-1)}
+.tab.active{background:var(--surface);color:var(--text-1);border:1px solid var(--border)}
 
-  .pill.live {
-    color: var(--success);
-    background: var(--success-bg);
-    border-color: var(--success-border);
-  }
+/* ── Alert / error ───────────────────────────────────────────────────────── */
+.alert{
+  display:none;padding:11px 14px;border-radius:var(--r);
+  font-size:13px;margin-top:14px;line-height:1.4;
+}
+.alert.error{background:var(--red-bg);border:1px solid var(--red-border);color:var(--red)}
+.alert.success{background:var(--green-bg);border:1px solid var(--green-border);color:var(--green)}
+.alert.show{display:flex;align-items:flex-start;gap:8px}
 
-  .pill .dot {
-    width: 5px;
-    height: 5px;
-    border-radius: 50%;
-    background: currentColor;
-    flex-shrink: 0;
-  }
+/* ── Result / token view ─────────────────────────────────────────────────── */
+.result{display:none}
+.result.show{display:block}
 
-  .section-title {
-    font-size: 17px;
-    font-weight: 600;
-    color: var(--text-primary);
-    letter-spacing: -0.02em;
-    margin-bottom: 6px;
-  }
+.token-block{
+  background:var(--bg);border:1px solid var(--border-strong);
+  border-radius:var(--r);padding:12px 14px;
+  display:flex;align-items:center;gap:10px;margin:4px 0;
+}
+.token-value{
+  flex:1;font-family:var(--mono);font-size:12px;
+  color:var(--text-1);word-break:break-all;line-height:1.5;
+}
+.copy-btn{
+  flex-shrink:0;padding:5px 10px;
+  background:var(--surface);border:1px solid var(--border-strong);
+  border-radius:6px;font-size:11.5px;font-weight:500;
+  color:var(--text-2);cursor:pointer;
+  display:flex;align-items:center;gap:4px;
+  transition:all 0.12s;font-family:inherit;white-space:nowrap;
+}
+.copy-btn:hover{color:var(--text-1)}
+.copy-btn.copied{background:var(--green-bg);border-color:var(--green-border);color:var(--green)}
 
-  .section-sub {
-    font-size: 13px;
-    color: var(--text-secondary);
-    line-height: 1.55;
-    margin-bottom: 24px;
-  }
+/* ── Step list ───────────────────────────────────────────────────────────── */
+.steps{display:flex;flex-direction:column;gap:10px;margin-top:16px}
+.step{display:flex;gap:11px;align-items:flex-start}
+.step-n{
+  width:20px;height:20px;flex-shrink:0;margin-top:1px;
+  border-radius:50%;border:1px solid var(--border-strong);
+  background:var(--surface);
+  display:flex;align-items:center;justify-content:center;
+  font-size:10.5px;font-weight:600;color:var(--text-3);
+}
+.step-text{font-size:13px;color:var(--text-2);line-height:1.5}
+.step-text strong{color:var(--text-1);font-weight:500}
 
-  .form-group {
-    margin-bottom: 16px;
-  }
+/* ── Info rows ───────────────────────────────────────────────────────────── */
+.info-row{
+  display:flex;align-items:center;justify-content:space-between;
+  padding:10px 0;border-bottom:1px solid var(--border);
+  font-size:13px;
+}
+.info-row:last-child{border-bottom:none;padding-bottom:0}
+.info-label{color:var(--text-2);display:flex;align-items:center;gap:7px}
+.info-value{color:var(--text-1);font-weight:500}
 
-  label {
-    display: block;
-    font-size: 12px;
-    font-weight: 500;
-    color: var(--text-secondary);
-    margin-bottom: 6px;
-    letter-spacing: 0.01em;
-  }
+/* ── Badge ───────────────────────────────────────────────────────────────── */
+.badge{
+  display:inline-flex;align-items:center;gap:5px;
+  padding:4px 9px;border-radius:20px;
+  font-size:12px;font-weight:500;border:1px solid;
+}
+.badge.configured{background:var(--green-bg);border-color:var(--green-border);color:var(--green)}
+.badge.unconfigured{background:var(--bg);border-color:var(--border-strong);color:var(--text-3)}
+.badge-dot{width:6px;height:6px;border-radius:50%;background:currentColor}
 
-  input[type="text"],
-  input[type="password"] {
-    width: 100%;
-    padding: 9px 12px;
-    background: var(--bg);
-    border: 1px solid var(--border-md);
-    border-radius: var(--r-sm);
-    color: var(--text-primary);
-    font-size: 14px;
-    font-family: inherit;
-    outline: none;
-    transition: border-color 0.15s, box-shadow 0.15s;
-    appearance: none;
-  }
+/* ── Section label ───────────────────────────────────────────────────────── */
+.section-label{
+  font-size:10.5px;font-weight:600;text-transform:uppercase;
+  letter-spacing:0.07em;color:var(--text-3);margin-bottom:10px;
+}
 
-  input[type="text"]:focus,
-  input[type="password"]:focus {
-    border-color: var(--accent);
-    box-shadow: 0 0 0 3px var(--accent-border);
-  }
+/* ── Footer ──────────────────────────────────────────────────────────────── */
+.footer{
+  display:flex;align-items:center;justify-content:center;gap:20px;
+  margin-top:8px;font-size:12px;color:var(--text-3);
+}
+.footer a{color:var(--text-3);text-decoration:none;display:flex;align-items:center;gap:5px}
+.footer a:hover{color:var(--text-2)}
 
-  input::placeholder { color: var(--text-tertiary); }
-
-  .btn-primary {
-    width: 100%;
-    padding: 10px 16px;
-    background: var(--text-primary);
-    color: var(--bg);
-    border: none;
-    border-radius: var(--r-sm);
-    font-size: 14px;
-    font-weight: 500;
-    font-family: inherit;
-    cursor: pointer;
-    transition: opacity 0.12s;
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    gap: 6px;
-    letter-spacing: -0.01em;
-  }
-
-  .btn-primary:hover:not(:disabled) { opacity: 0.82; }
-  .btn-primary:disabled { opacity: 0.4; cursor: not-allowed; }
-
-  .btn-secondary {
-    width: 100%;
-    padding: 9px 16px;
-    background: transparent;
-    color: var(--text-secondary);
-    border: 1px solid var(--border-md);
-    border-radius: var(--r-sm);
-    font-size: 13px;
-    font-weight: 500;
-    font-family: inherit;
-    cursor: pointer;
-    transition: background 0.12s, color 0.12s;
-    margin-top: 12px;
-  }
-
-  .btn-secondary:hover { background: var(--bg); color: var(--text-primary); }
-
-  .error-box {
-    background: #fef2f2;
-    border: 1px solid rgba(220,38,38,0.2);
-    border-radius: var(--r-sm);
-    padding: 10px 12px;
-    font-size: 13px;
-    color: #dc2626;
-    margin-top: 12px;
-    display: none;
-  }
-
-  @media (prefers-color-scheme: dark) {
-    .error-box {
-      background: rgba(220,38,38,0.08);
-      border-color: rgba(220,38,38,0.25);
-      color: #f87171;
-    }
-  }
-
-  .error-box.show { display: block; }
-
-  .divider {
-    height: 1px;
-    background: var(--border);
-    margin: 0 28px;
-  }
-
-  .result { display: none; }
-  .result.show { display: block; }
-
-  .result-header {
-    padding: 20px 28px;
-    display: flex;
-    align-items: center;
-    gap: 12px;
-    background: var(--success-bg);
-    border-bottom: 1px solid var(--success-border);
-  }
-
-  .check-circle {
-    width: 32px;
-    height: 32px;
-    border-radius: 50%;
-    background: var(--success);
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    flex-shrink: 0;
-  }
-
-  .check-circle i { font-size: 16px; color: #fff; }
-
-  .result-header-text .title {
-    font-size: 14px;
-    font-weight: 600;
-    color: var(--text-primary);
-  }
-
-  .result-header-text .sub {
-    font-size: 12px;
-    color: var(--text-secondary);
-  }
-
-  .result-body {
-    padding: 20px 28px;
-    display: flex;
-    flex-direction: column;
-    gap: 10px;
-  }
-
-  .field-row {
-    background: var(--bg);
-    border: 1px solid var(--border);
-    border-radius: var(--r-sm);
-    overflow: hidden;
-  }
-
-  .field-label {
-    font-size: 10px;
-    font-weight: 600;
-    color: var(--text-tertiary);
-    text-transform: uppercase;
-    letter-spacing: 0.08em;
-    padding: 8px 12px 4px;
-  }
-
-  .field-value-row {
-    display: flex;
-    align-items: center;
-    gap: 8px;
-    padding: 0 8px 8px 12px;
-  }
-
-  .field-value {
-    flex: 1;
-    font-family: var(--mono);
-    font-size: 12px;
-    color: var(--text-primary);
-    word-break: break-all;
-    line-height: 1.5;
-  }
-
-  .copy-btn {
-    flex-shrink: 0;
-    padding: 4px 8px;
-    font-size: 11px;
-    font-weight: 500;
-    background: var(--surface);
-    border: 1px solid var(--border-md);
-    border-radius: var(--r-sm);
-    color: var(--text-secondary);
-    cursor: pointer;
-    transition: all 0.12s;
-    display: flex;
-    align-items: center;
-    gap: 4px;
-    white-space: nowrap;
-    font-family: inherit;
-  }
-
-  .copy-btn:hover { border-color: var(--border-md); color: var(--text-primary); background: var(--bg); }
-  .copy-btn.copied { background: var(--success-bg); border-color: var(--success-border); color: var(--success); }
-
-  .steps-section {
-    margin: 4px 0 0;
-    padding: 16px;
-    background: var(--bg);
-    border: 1px solid var(--border);
-    border-radius: var(--r-sm);
-  }
-
-  .steps-label {
-    font-size: 10px;
-    font-weight: 600;
-    text-transform: uppercase;
-    letter-spacing: 0.08em;
-    color: var(--text-tertiary);
-    margin-bottom: 12px;
-  }
-
-  .step-item {
-    display: flex;
-    gap: 10px;
-    align-items: flex-start;
-    margin-bottom: 10px;
-  }
-
-  .step-item:last-child { margin-bottom: 0; }
-
-  .step-num {
-    width: 18px;
-    height: 18px;
-    border-radius: 50%;
-    border: 1px solid var(--border-md);
-    background: var(--surface);
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    font-size: 10px;
-    font-weight: 600;
-    color: var(--text-secondary);
-    flex-shrink: 0;
-    margin-top: 1px;
-  }
-
-  .step-text {
-    font-size: 12.5px;
-    color: var(--text-secondary);
-    line-height: 1.5;
-  }
-
-  .step-text strong { color: var(--text-primary); font-weight: 500; }
-
-  .tab-btn {
-    padding: 5px 12px;
-    font-size: 12px;
-    font-weight: 500;
-    border: 1px solid var(--border-md);
-    border-radius: var(--r-sm);
-    background: var(--surface);
-    color: var(--text-secondary);
-    cursor: pointer;
-    font-family: inherit;
-    transition: all 0.12s;
-  }
-  .tab-btn:hover { color: var(--text-primary); }
-  .tab-btn.active {
-    background: var(--accent);
-    border-color: var(--accent);
-    color: #fff;
-  }
-
-  .footer {
-    text-align: center;
-    margin-top: 20px;
-    font-size: 11px;
-    color: var(--text-tertiary);
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    gap: 16px;
-  }
-
-  .footer a {
-    color: var(--text-tertiary);
-    text-decoration: none;
-    display: inline-flex;
-    align-items: center;
-    gap: 4px;
-  }
-
-  .footer a:hover { color: var(--text-secondary); }
+@keyframes spin{to{transform:rotate(360deg)}}
+.spin{animation:spin 0.8s linear infinite}
 </style>
 </head>
 <body>
 
-<div class="wrapper">
-  <div class="header">
-    <div class="logo-mark">
-      <svg viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg">
-        <path d="M12 2L2 7v10l10 5 10-5V7L12 2zm0 2.18L20 8.5v7L12 19.82 4 15.5v-7l8-4.32zM12 8a4 4 0 100 8 4 4 0 000-8zm0 2a2 2 0 110 4 2 2 0 010-4z"/>
-      </svg>
+<div class="page">
+
+  <!-- ── Top bar ──────────────────────────────────────────────────────────── -->
+  <div class="topbar">
+    <div class="brand">
+      <div class="brand-icon">
+        <svg viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg">
+          <path d="M12 2L2 7v10l10 5 10-5V7L12 2zm0 2.18L20 8.5v7L12 19.82 4 15.5v-7l8-4.32zM12 8a4 4 0 100 8 4 4 0 000-8zm0 2a2 2 0 110 4 2 2 0 010-4z"/>
+        </svg>
+      </div>
+      <div>
+        <div class="brand-name">ServiceNow Dev MCP</div>
+        <div class="brand-tag">Model Context Protocol</div>
+      </div>
     </div>
-    <div class="header-text">
-      <h1>ServiceNow Dev MCP</h1>
-      <p>Model Context Protocol server</p>
+    <div class="status-pill">
+      <span class="status-dot"></span>
+      <span id="statusText">Live</span>
     </div>
   </div>
 
-  <div class="card" id="mainCard">
-
-    <div class="card-body" id="formView">
-      <div class="pill-row">
-        <span class="pill live"><span class="dot"></span>Live</span>
-        <span class="pill" id="toolCountPill"><i class="ti ti-tool" style="font-size:11px"></i> <span id="toolCountText">loading</span></span>
-        <span class="pill"><i class="ti ti-broadcast" style="font-size:11px"></i> SSE transport</span>
+  <!-- ── Step 1: Get access token ─────────────────────────────────────────── -->
+  <div class="card">
+    <div class="card-header">
+      <div class="card-icon"><i class="ti ti-key" aria-hidden="true"></i></div>
+      <div>
+        <div class="card-title">Get access token</div>
+        <div class="card-sub">Generate a personal token to connect this MCP to Claude.ai</div>
       </div>
-
-      <div class="section-title">Get your access token</div>
-      <p class="section-sub">Generate a personal token, then enter your ServiceNow / Jira / Salesforce credentials securely below. Credentials are AES-256 encrypted and never visible to Claude.</p>
-
-      <div class="form-group">
-        <label for="nameInput">Your name</label>
-        <input type="text" id="nameInput" placeholder="e.g. Alice" autocomplete="off" maxlength="32"/>
-      </div>
-
-      <div id="adminSection" style="display:none">
-        <div class="form-group">
-          <label for="adminKeyInput">Admin key <span style="font-weight:400;opacity:0.7">(required by server)</span></label>
-          <input type="password" id="adminKeyInput" placeholder="Ask your server administrator"/>
-        </div>
-      </div>
-
-      <button class="btn-primary" id="registerBtn" onclick="register()">
-        Generate token
-        <i class="ti ti-arrow-right" style="font-size:14px" aria-hidden="true"></i>
-      </button>
-
-      <div class="error-box" id="errorMsg"></div>
     </div>
 
-    <div class="result" id="resultView">
-      <div class="result-header">
-        <div class="check-circle">
-          <i class="ti ti-check" aria-hidden="true"></i>
+    <div class="card-body">
+
+      <!-- Token form -->
+      <div id="tokenForm">
+        <div class="field">
+          <label for="nameInput">Your name</label>
+          <input type="text" id="nameInput" placeholder="e.g. Alice" autocomplete="off" maxlength="32"/>
         </div>
-        <div class="result-header-text">
-          <div class="title">Token generated for <span id="resultName"></span></div>
-          <div class="sub">Add this connector to Claude.ai using the values below</div>
+        <div class="field" id="adminSection" style="display:none">
+          <label for="adminKeyInput">Admin key</label>
+          <input type="password" id="adminKeyInput" placeholder="Required by your administrator"/>
         </div>
+        <button class="btn-primary" id="registerBtn" onclick="register()">
+          Generate token <i class="ti ti-arrow-right" aria-hidden="true"></i>
+        </button>
+        <div class="alert error" id="regError"></div>
       </div>
 
-      <div class="result-body">
-        <div class="field-row">
-          <div class="field-label">Connector URL — paste this into Claude.ai</div>
-          <div class="field-value-row">
-            <div class="field-value" id="connectorUrl"></div>
-            <button class="copy-btn" onclick="copy('connectorUrl', this)">
-              <i class="ti ti-copy" style="font-size:12px" aria-hidden="true"></i> Copy
-            </button>
+      <!-- Token result -->
+      <div class="result" id="tokenResult">
+        <div class="section-label">Your connector URL</div>
+        <div class="token-block">
+          <div class="token-value" id="connectorUrl"></div>
+          <button class="copy-btn" id="copyUrlBtn" onclick="copyEl('connectorUrl','copyUrlBtn')">
+            <i class="ti ti-copy" style="font-size:12px" aria-hidden="true"></i> Copy
+          </button>
+        </div>
+
+        <div class="steps" style="margin-bottom:16px">
+          <div class="step">
+            <div class="step-n">1</div>
+            <div class="step-text">Open <strong>Claude.ai → Settings → Connectors → Add custom connector</strong></div>
+          </div>
+          <div class="step">
+            <div class="step-n">2</div>
+            <div class="step-text">Paste the connector URL above and save</div>
+          </div>
+          <div class="step">
+            <div class="step-n">3</div>
+            <div class="step-text">Scroll down to <strong>Configure credentials</strong> and enter your platform details — credentials are encrypted and never shared with Claude</div>
           </div>
         </div>
 
-        <div class="steps-section">
-          <div class="steps-label">Setup in Claude.ai</div>
-          <div class="step-item">
-            <div class="step-num">1</div>
-            <div class="step-text">Go to <strong>Claude.ai → Settings → Connectors → Add custom connector</strong></div>
-          </div>
-          <div class="step-item">
-            <div class="step-num">2</div>
-            <div class="step-text">Set <strong>Name</strong> to anything (e.g. ServiceNow Dev MCP) and paste the <strong>Connector URL</strong> above</div>
-          </div>
-          <div class="step-item">
-            <div class="step-num">3</div>
-            <div class="step-text">Click <strong>Save</strong> — then scroll down to <strong>Configure Credentials</strong> to enter your platform credentials securely</div>
-          </div>
-        </div>
-
-        <button class="btn-secondary" onclick="reset()">
+        <button class="btn-secondary" onclick="resetToken()">
           <i class="ti ti-arrow-left" style="font-size:13px" aria-hidden="true"></i>
-          Generate another token
+          Generate another
         </button>
       </div>
-    </div>
 
+    </div>
   </div>
 
-  <!-- ── Credential configuration card ─────────────────────────────────── -->
-  <div class="card" id="credCard" style="margin-top:16px">
-    <div class="card-body">
-      <div class="section-title" style="display:flex;align-items:center;gap:8px">
-        <i class="ti ti-lock" style="font-size:15px;color:var(--accent)"></i>
-        Configure Credentials
+  <!-- ── Step 2: Configure credentials ────────────────────────────────────── -->
+  <div class="card" id="credCard">
+    <div class="card-header">
+      <div class="card-icon"><i class="ti ti-shield-lock" aria-hidden="true"></i></div>
+      <div>
+        <div class="card-title">Configure credentials</div>
+        <div class="card-sub">Encrypted with AES-256-GCM — Claude never sees your passwords</div>
       </div>
-      <p class="section-sub" style="margin-top:6px">
-        Enter your platform credentials here — they are <strong>AES-256-GCM encrypted</strong>
-        and stored server-side. Claude never sees your passwords or tokens.
-      </p>
+    </div>
 
-      <div class="form-group" style="margin-top:16px">
-        <label for="credToken">Your MCP token</label>
+    <div class="card-body">
+
+      <div class="field">
+        <label for="credToken">MCP token</label>
         <input type="password" id="credToken" placeholder="sn-mcp-…" autocomplete="off"/>
-        <div style="font-size:11px;color:var(--text-tertiary);margin-top:4px">The token you received above</div>
+        <div class="hint">The token you generated above. Auto-filled after registration.</div>
       </div>
 
       <!-- Platform tabs -->
-      <div style="display:flex;gap:6px;margin:16px 0 12px">
-        <button class="tab-btn active" data-tab="servicenow" onclick="switchTab('servicenow',this)">ServiceNow</button>
-        <button class="tab-btn" data-tab="jira" onclick="switchTab('jira',this)">Jira</button>
-        <button class="tab-btn" data-tab="salesforce" onclick="switchTab('salesforce',this)">Salesforce</button>
+      <div class="tabs" style="margin-top:6px">
+        <button class="tab active" onclick="switchTab('servicenow',this)">
+          <i class="ti ti-brand-azure" style="font-size:13px;vertical-align:-1px" aria-hidden="true"></i>
+          ServiceNow
+        </button>
+        <button class="tab" onclick="switchTab('jira',this)">
+          <i class="ti ti-brand-jira" style="font-size:13px;vertical-align:-1px" aria-hidden="true"></i>
+          Jira
+        </button>
+        <button class="tab" onclick="switchTab('salesforce',this)">
+          <i class="ti ti-cloud" style="font-size:13px;vertical-align:-1px" aria-hidden="true"></i>
+          Salesforce
+        </button>
       </div>
 
-      <!-- ServiceNow -->
-      <div class="tab-panel" id="tab-servicenow">
-        <div class="form-group">
-          <label>Instance URL</label>
+      <!-- ServiceNow fields -->
+      <div id="tab-servicenow">
+        <div class="field">
+          <label for="sn-instance_url">Instance URL</label>
           <input type="url" id="sn-instance_url" placeholder="https://yourcompany.service-now.com" autocomplete="off"/>
         </div>
-        <div class="form-group">
-          <label>Username</label>
+        <div class="field">
+          <label for="sn-username">Username</label>
           <input type="text" id="sn-username" placeholder="admin" autocomplete="off"/>
         </div>
-        <div class="form-group">
-          <label>Password</label>
+        <div class="field">
+          <label for="sn-password">Password</label>
           <input type="password" id="sn-password" placeholder="••••••••" autocomplete="new-password"/>
         </div>
       </div>
 
-      <!-- Jira -->
-      <div class="tab-panel" id="tab-jira" style="display:none">
-        <div class="form-group">
-          <label>Base URL</label>
+      <!-- Jira fields -->
+      <div id="tab-jira" style="display:none">
+        <div class="field">
+          <label for="jira-base_url">Base URL</label>
           <input type="url" id="jira-base_url" placeholder="https://yourcompany.atlassian.net" autocomplete="off"/>
         </div>
-        <div class="form-group">
-          <label>Email</label>
+        <div class="field">
+          <label for="jira-email">Email</label>
           <input type="email" id="jira-email" placeholder="you@company.com" autocomplete="off"/>
         </div>
-        <div class="form-group">
-          <label>API Token</label>
+        <div class="field">
+          <label for="jira-api_token">API token</label>
           <input type="password" id="jira-api_token" placeholder="••••••••" autocomplete="new-password"/>
-          <div style="font-size:11px;color:var(--text-tertiary);margin-top:4px">Generate at id.atlassian.com → Security → API tokens</div>
+          <div class="hint">Generate at id.atlassian.com → Security → API tokens</div>
         </div>
       </div>
 
-      <!-- Salesforce -->
-      <div class="tab-panel" id="tab-salesforce" style="display:none">
-        <div class="form-group">
-          <label>Login URL</label>
-          <input type="url" id="sf-login_url" placeholder="https://login.salesforce.com" value="https://login.salesforce.com" autocomplete="off"/>
-          <div style="font-size:11px;color:var(--text-tertiary);margin-top:4px">Use https://test.salesforce.com for sandboxes</div>
+      <!-- Salesforce fields -->
+      <div id="tab-salesforce" style="display:none">
+        <div class="field">
+          <label for="sf-login_url">Login URL</label>
+          <input type="url" id="sf-login_url" value="https://login.salesforce.com" autocomplete="off"/>
+          <div class="hint">Use https://test.salesforce.com for sandboxes</div>
         </div>
-        <div class="form-group">
-          <label>Client ID</label>
+        <div class="field">
+          <label for="sf-client_id">Client ID</label>
           <input type="text" id="sf-client_id" placeholder="Connected App consumer key" autocomplete="off"/>
         </div>
-        <div class="form-group">
-          <label>Client Secret</label>
+        <div class="field">
+          <label for="sf-client_secret">Client secret</label>
           <input type="password" id="sf-client_secret" placeholder="••••••••" autocomplete="new-password"/>
         </div>
-        <div class="form-group">
-          <label>Username</label>
+        <div class="field">
+          <label for="sf-username">Username</label>
           <input type="email" id="sf-username" placeholder="you@company.com" autocomplete="off"/>
         </div>
-        <div class="form-group">
-          <label>Password</label>
+        <div class="field">
+          <label for="sf-password">Password</label>
           <input type="password" id="sf-password" placeholder="••••••••" autocomplete="new-password"/>
         </div>
-        <div class="form-group">
-          <label>Security Token <span style="font-weight:400;opacity:0.7">(optional)</span></label>
+        <div class="field">
+          <label for="sf-security_token">Security token <span class="opt">(optional)</span></label>
           <input type="password" id="sf-security_token" placeholder="Leave blank if IP is allowlisted" autocomplete="new-password"/>
         </div>
       </div>
 
-      <div style="display:flex;gap:8px;margin-top:4px;align-items:center">
-        <button class="btn-primary" id="saveCredBtn" onclick="saveCredentials()" style="flex:1">
-          <i class="ti ti-lock" style="font-size:14px" aria-hidden="true"></i>
-          Save credentials securely
+      <div style="display:flex;gap:8px;margin-top:18px">
+        <button class="btn-primary" id="saveBtn" onclick="saveCredentials()" style="flex:1;margin-top:0">
+          <i class="ti ti-lock" aria-hidden="true"></i>
+          Save credentials
         </button>
-        <button class="btn-secondary" id="checkStatusBtn" onclick="checkCredStatus()" title="Check which platforms are configured">
-          <i class="ti ti-refresh" style="font-size:13px" aria-hidden="true"></i>
+        <button class="btn-icon btn-icon-danger" onclick="deleteCredentials()" title="Delete credentials for this platform" id="deleteBtn">
+          <i class="ti ti-trash" aria-hidden="true"></i>
+        </button>
+        <button class="btn-icon" onclick="checkStatus()" title="Check configured platforms" id="checkBtn">
+          <i class="ti ti-refresh" aria-hidden="true"></i>
         </button>
       </div>
 
-      <div class="error-box" id="credErrorMsg"></div>
-      <div id="credSuccess" style="display:none;margin-top:12px;padding:12px 14px;background:var(--success-bg);border:1px solid var(--success-border);border-radius:var(--r-sm);font-size:13px;color:var(--success)"></div>
+      <div class="alert error" id="credError"></div>
+      <div class="alert success" id="credSuccess"></div>
 
-      <!-- Status badges -->
-      <div id="credStatus" style="display:none;margin-top:14px">
-        <div style="font-size:10px;font-weight:600;text-transform:uppercase;letter-spacing:0.08em;color:var(--text-tertiary);margin-bottom:8px">Configured platforms</div>
-        <div style="display:flex;gap:6px;flex-wrap:wrap" id="credStatusBadges"></div>
+      <!-- Platform status -->
+      <div id="statusSection" style="display:none;margin-top:18px">
+        <div class="divider" style="margin:0 0 16px"></div>
+        <div class="section-label">Configured platforms</div>
+        <div id="statusBadges" style="display:flex;gap:6px;flex-wrap:wrap"></div>
+      </div>
+
+    </div>
+  </div>
+
+  <!-- ── Server info card ──────────────────────────────────────────────────── -->
+  <div class="card">
+    <div class="card-body">
+      <div class="section-label">Server</div>
+      <div class="info-row">
+        <span class="info-label"><i class="ti ti-tool" style="font-size:14px" aria-hidden="true"></i> Available tools</span>
+        <span class="info-value" id="toolCount">—</span>
+      </div>
+      <div class="info-row">
+        <span class="info-label"><i class="ti ti-broadcast" style="font-size:14px" aria-hidden="true"></i> Transport</span>
+        <span class="info-value">Streamable HTTP</span>
+      </div>
+      <div class="info-row">
+        <span class="info-label"><i class="ti ti-database" style="font-size:14px" aria-hidden="true"></i> Credential storage</span>
+        <span class="info-value">Supabase (encrypted)</span>
+      </div>
+      <div class="info-row">
+        <span class="info-label"><i class="ti ti-shield-check" style="font-size:14px" aria-hidden="true"></i> Encryption</span>
+        <span class="info-value">AES-256-GCM</span>
       </div>
     </div>
   </div>
 
+  <!-- ── Footer ────────────────────────────────────────────────────────────── -->
   <div class="footer">
-    <a href="/health" target="_blank"><i class="ti ti-activity" style="font-size:12px" aria-hidden="true"></i> Health</a>
-    <a href="https://modelcontextprotocol.io" target="_blank"><i class="ti ti-external-link" style="font-size:12px" aria-hidden="true"></i> MCP docs</a>
+    <a href="/health" target="_blank"><i class="ti ti-activity" aria-hidden="true"></i> Health check</a>
+    <a href="https://modelcontextprotocol.io" target="_blank"><i class="ti ti-external-link" aria-hidden="true"></i> MCP docs</a>
   </div>
+
 </div>
 
 <script>
-  fetch('/health')
-    .then(r => r.json())
-    .then(d => { document.getElementById('toolCountText').textContent = d.tools + ' tools'; })
-    .catch(() => { document.getElementById('toolCountText').textContent = '116 tools'; });
+const $ = id => document.getElementById(id);
 
-  fetch('/register-info')
-    .then(r => r.json())
-    .then(d => { if (d.requires_admin_key) document.getElementById('adminSection').style.display = 'block'; })
-    .catch(() => {});
+// ── Server info ────────────────────────────────────────────────────────────
+fetch('/health').then(r=>r.json()).then(d=>{
+  $('toolCount').textContent = d.tools + ' tools';
+  $('statusText').textContent = 'Live · ' + d.tools + ' tools';
+}).catch(()=>{});
 
-  function register() {
-    const name     = document.getElementById('nameInput').value.trim();
-    const adminKey = document.getElementById('adminKeyInput').value.trim();
-    const btn      = document.getElementById('registerBtn');
-    const errEl    = document.getElementById('errorMsg');
+fetch('/register-info').then(r=>r.json()).then(d=>{
+  if(d.requires_admin_key) $('adminSection').style.display='block';
+}).catch(()=>{});
 
-    if (!name) { showError('Please enter your name.'); return; }
+// ── Token registration ─────────────────────────────────────────────────────
+function register(){
+  const name = $('nameInput').value.trim();
+  const key  = $('adminKeyInput').value.trim();
+  const btn  = $('registerBtn');
+  const err  = $('regError');
 
-    btn.disabled = true;
-    btn.innerHTML = '<i class="ti ti-loader-2" style="font-size:14px;animation:spin 0.8s linear infinite" aria-hidden="true"></i> Generating…';
-    errEl.classList.remove('show');
+  err.classList.remove('show');
+  if(!name){ showAlert(err,'Please enter your name.'); return; }
 
-    const headers = { 'Content-Type': 'application/json' };
-    if (adminKey) headers['Authorization'] = 'Bearer ' + adminKey;
+  btn.disabled = true;
+  btn.innerHTML = '<i class="ti ti-loader-2 spin" aria-hidden="true"></i> Generating…';
 
-    fetch('/register', { method: 'POST', headers, body: JSON.stringify({ name }) })
-      .then(r => r.json().then(d => ({ ok: r.ok, data: d })))
-      .then(({ ok, data }) => {
-        if (!ok) { showError(data.error || 'Registration failed.'); return; }
-        document.getElementById('resultName').textContent = data.name;
-        document.getElementById('connectorUrl').textContent = data.sse_url + '?token=' + data.token;
-        document.getElementById('formView').style.display  = 'none';
-        document.getElementById('resultView').classList.add('show');
-      })
-      .catch(() => showError('Network error — is the server reachable?'))
-      .finally(() => {
-        btn.disabled = false;
-        btn.innerHTML = 'Generate token <i class="ti ti-arrow-right" style="font-size:14px" aria-hidden="true"></i>';
-      });
-  }
+  const headers = {'Content-Type':'application/json'};
+  if(key) headers['Authorization'] = 'Bearer ' + key;
 
-  function showError(msg) {
-    const el = document.getElementById('errorMsg');
-    el.textContent = msg;
-    el.classList.add('show');
-  }
-
-  function reset() {
-    document.getElementById('nameInput').value = '';
-    document.getElementById('adminKeyInput').value = '';
-    document.getElementById('formView').style.display = 'block';
-    document.getElementById('resultView').classList.remove('show');
-    document.getElementById('errorMsg').classList.remove('show');
-  }
-
-  function copy(elId, btn) {
-    navigator.clipboard.writeText(document.getElementById(elId).textContent).then(() => {
-      const orig = btn.innerHTML;
-      btn.innerHTML = '<i class="ti ti-check" style="font-size:12px" aria-hidden="true"></i> Copied';
-      btn.classList.add('copied');
-      setTimeout(() => { btn.innerHTML = orig; btn.classList.remove('copied'); }, 2000);
-    });
-  }
-
-  document.getElementById('nameInput').addEventListener('keydown', e => { if (e.key === 'Enter') register(); });
-
-  const style = document.createElement('style');
-  style.textContent = '@keyframes spin { to { transform: rotate(360deg); } }';
-  document.head.appendChild(style);
-
-  // ── Credential configuration ─────────────────────────────────────────────
-
-  let _activeTab = 'servicenow';
-
-  function switchTab(tab, btn) {
-    _activeTab = tab;
-    document.querySelectorAll('.tab-panel').forEach(p => p.style.display = 'none');
-    document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
-    document.getElementById('tab-' + tab).style.display = 'block';
-    btn.classList.add('active');
-  }
-
-  // After token is generated, pre-fill it into the credential section
-  const _origShowResult = window.showResult;
-  function afterRegister(token) {
-    document.getElementById('credToken').value = token;
-    document.getElementById('credCard').scrollIntoView({ behavior: 'smooth', block: 'start' });
-  }
-
-  // Patch register() to pre-fill token
-  const _origFetch = window.fetch;
-  const _origRegister = register;
-  function register() {
-    const name     = document.getElementById('nameInput').value.trim();
-    const adminKey = document.getElementById('adminKeyInput').value.trim();
-    const btn      = document.getElementById('registerBtn');
-    const errEl    = document.getElementById('errorMsg');
-
-    if (!name) { showError('Please enter your name.'); return; }
-
-    btn.disabled = true;
-    btn.innerHTML = '<i class="ti ti-loader-2" style="font-size:14px;animation:spin 0.8s linear infinite" aria-hidden="true"></i> Generating…';
-    errEl.classList.remove('show');
-
-    const headers = { 'Content-Type': 'application/json' };
-    if (adminKey) headers['Authorization'] = 'Bearer ' + adminKey;
-
-    fetch('/register', { method: 'POST', headers, body: JSON.stringify({ name }) })
-      .then(r => r.json().then(d => ({ ok: r.ok, data: d })))
-      .then(({ ok, data }) => {
-        if (!ok) { showError(data.error || 'Registration failed.'); return; }
-        document.getElementById('resultName').textContent = data.name;
-        document.getElementById('connectorUrl').textContent = data.sse_url + '?token=' + data.token;
-        document.getElementById('formView').style.display  = 'none';
-        document.getElementById('resultView').classList.add('show');
-        // Pre-fill credential section
-        afterRegister(data.token);
-      })
-      .catch(() => showError('Network error — is the server reachable?'))
-      .finally(() => {
-        btn.disabled = false;
-        btn.innerHTML = 'Generate token <i class="ti ti-arrow-right" style="font-size:14px" aria-hidden="true"></i>';
-      });
-  }
-
-  function saveCredentials() {
-    const token    = document.getElementById('credToken').value.trim();
-    const platform = _activeTab;
-    const btn      = document.getElementById('saveCredBtn');
-    const errEl    = document.getElementById('credErrorMsg');
-    const succEl   = document.getElementById('credSuccess');
-
-    errEl.classList.remove('show');
-    succEl.style.display = 'none';
-
-    if (!token) { showCredError('Please enter your MCP token above.'); return; }
-
-    // Collect fields for active platform
-    const fields = {
-      servicenow: ['instance_url','username','password'],
-      jira:       ['base_url','email','api_token'],
-      salesforce: ['login_url','client_id','client_secret','username','password','security_token'],
-    }[platform];
-
-    const prefix = platform === 'servicenow' ? 'sn' : platform === 'jira' ? 'jira' : 'sf';
-    const credentials = {};
-    for (const f of fields) {
-      credentials[f] = document.getElementById(prefix + '-' + f)?.value.trim() ?? '';
-    }
-
-    const required = {
-      servicenow: ['instance_url','username','password'],
-      jira:       ['base_url','email','api_token'],
-      salesforce: ['login_url','client_id','client_secret','username','password'],
-    }[platform];
-
-    const missing = required.filter(f => !credentials[f]);
-    if (missing.length) {
-      showCredError('Please fill in: ' + missing.map(f => f.replace(/_/g,' ')).join(', '));
-      return;
-    }
-
-    btn.disabled = true;
-    btn.innerHTML = '<i class="ti ti-loader-2" style="font-size:14px;animation:spin 0.8s linear infinite"></i> Saving…';
-
-    fetch('/configure-credentials', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + token },
-      body: JSON.stringify({ platform, credentials }),
+  fetch('/register',{method:'POST',headers,body:JSON.stringify({name})})
+    .then(r=>r.json().then(d=>({ok:r.ok,d})))
+    .then(({ok,d})=>{
+      if(!ok){ showAlert(err, d.error||'Registration failed.'); return; }
+      $('connectorUrl').textContent = d.sse_url + '?token=' + d.token;
+      $('tokenForm').style.display = 'none';
+      $('tokenResult').classList.add('show');
+      // Pre-fill token in credential section
+      $('credToken').value = d.token;
+      $('credCard').scrollIntoView({behavior:'smooth',block:'start'});
     })
-      .then(r => r.json().then(d => ({ ok: r.ok, data: d })))
-      .then(({ ok, data }) => {
-        if (!ok) { showCredError(data.error || 'Save failed.'); return; }
-        succEl.innerHTML = '<i class="ti ti-lock-check" style="font-size:14px;vertical-align:-2px"></i> '
-          + (platform.charAt(0).toUpperCase() + platform.slice(1))
-          + ' credentials saved and encrypted. Start a new Claude conversation to use them.';
-        succEl.style.display = 'block';
-        checkCredStatus();
-      })
-      .catch(() => showCredError('Network error.'))
-      .finally(() => {
-        btn.disabled = false;
-        btn.innerHTML = '<i class="ti ti-lock" style="font-size:14px"></i> Save credentials securely';
-      });
+    .catch(()=>showAlert(err,'Network error — is the server reachable?'))
+    .finally(()=>{
+      btn.disabled=false;
+      btn.innerHTML='Generate token <i class="ti ti-arrow-right" aria-hidden="true"></i>';
+    });
+}
+
+function resetToken(){
+  $('nameInput').value='';
+  $('adminKeyInput').value='';
+  $('regError').classList.remove('show');
+  $('tokenForm').style.display='block';
+  $('tokenResult').classList.remove('show');
+}
+
+// ── Credentials ────────────────────────────────────────────────────────────
+let activeTab = 'servicenow';
+
+function switchTab(tab, btn){
+  activeTab = tab;
+  ['servicenow','jira','salesforce'].forEach(p=>{
+    $('tab-'+p).style.display = p===tab ? 'block' : 'none';
+  });
+  document.querySelectorAll('.tab').forEach(b=>b.classList.remove('active'));
+  btn.classList.add('active');
+}
+
+function saveCredentials(){
+  const token = $('credToken').value.trim();
+  const btn   = $('saveBtn');
+  const err   = $('credError');
+  const succ  = $('credSuccess');
+
+  err.classList.remove('show');
+  succ.classList.remove('show');
+
+  if(!token){ showAlert(err,'Please enter your MCP token.'); return; }
+
+  const map = {
+    servicenow: {prefix:'sn',  required:['instance_url','username','password'],
+                 all:['instance_url','username','password']},
+    jira:       {prefix:'jira',required:['base_url','email','api_token'],
+                 all:['base_url','email','api_token']},
+    salesforce: {prefix:'sf',  required:['login_url','client_id','client_secret','username','password'],
+                 all:['login_url','client_id','client_secret','username','password','security_token']},
+  };
+
+  const {prefix,required,all} = map[activeTab];
+  const credentials = {};
+  for(const f of all){
+    const el = $(prefix+'-'+f);
+    if(el) credentials[f] = el.value.trim();
   }
 
-  function checkCredStatus() {
-    const token = document.getElementById('credToken').value.trim();
-    if (!token) return;
-
-    fetch('/credential-status', { headers: { 'Authorization': 'Bearer ' + token } })
-      .then(r => r.json())
-      .then(data => {
-        const el = document.getElementById('credStatus');
-        const badges = document.getElementById('credStatusBadges');
-        el.style.display = 'block';
-        badges.innerHTML = Object.entries(data.configured).map(([p, on]) =>
-          `<span style="display:inline-flex;align-items:center;gap:5px;padding:4px 10px;font-size:12px;font-weight:500;border-radius:20px;border:1px solid ${on ? 'var(--success-border)' : 'var(--border-md)'};background:${on ? 'var(--success-bg)' : 'var(--bg)'};color:${on ? 'var(--success)' : 'var(--text-tertiary)'}">
-            <span style="width:6px;height:6px;border-radius:50%;background:${on ? 'var(--success)' : 'var(--text-tertiary)'}"></span>
-            ${p}
-          </span>`
-        ).join('');
-      })
-      .catch(() => {});
+  const missing = required.filter(f=>!credentials[f]);
+  if(missing.length){
+    showAlert(err,'Missing: '+missing.map(f=>f.replace(/_/g,' ')).join(', '));
+    return;
   }
 
-  function showCredError(msg) {
-    const el = document.getElementById('credErrorMsg');
-    el.textContent = msg;
-    el.classList.add('show');
-  }
+  btn.disabled=true;
+  btn.innerHTML='<i class="ti ti-loader-2 spin" aria-hidden="true"></i> Saving…';
+
+  fetch('/configure-credentials',{
+    method:'POST',
+    headers:{'Content-Type':'application/json','Authorization':'Bearer '+token},
+    body:JSON.stringify({platform:activeTab, credentials}),
+  })
+    .then(r=>r.json().then(d=>({ok:r.ok,d})))
+    .then(({ok,d})=>{
+      if(!ok){ showAlert(err, d.error||'Save failed.'); return; }
+      showAlert(succ,
+        '<i class="ti ti-lock-check" style="font-size:14px;vertical-align:-2px" aria-hidden="true"></i> '
+        + cap(activeTab) + ' credentials saved. Start a new Claude conversation to use them.'
+      );
+      checkStatus();
+    })
+    .catch(()=>showAlert(err,'Network error.'))
+    .finally(()=>{
+      btn.disabled=false;
+      btn.innerHTML='<i class="ti ti-lock" aria-hidden="true"></i> Save credentials';
+    });
+}
+
+function deleteCredentials(){
+  const token = $('credToken').value.trim();
+  const err   = $('credError');
+  const succ  = $('credSuccess');
+
+  err.classList.remove('show');
+  succ.classList.remove('show');
+
+  if(!token){ showAlert(err,'Please enter your MCP token.'); return; }
+
+  if(!confirm(`Remove ${cap(activeTab)} credentials? This cannot be undone.`)) return;
+
+  const btn = $('deleteBtn');
+  btn.innerHTML = '<i class="ti ti-loader-2 spin" aria-hidden="true"></i>';
+  btn.disabled = true;
+
+  fetch('/configure-credentials',{
+    method:'DELETE',
+    headers:{'Content-Type':'application/json','Authorization':'Bearer '+token},
+    body:JSON.stringify({platform:activeTab}),
+  })
+    .then(r=>r.json().then(d=>({ok:r.ok,d})))
+    .then(({ok,d})=>{
+      if(!ok){ showAlert(err, d.error||'Delete failed.'); return; }
+      showAlert(succ,
+        '<i class="ti ti-trash" style="font-size:14px;vertical-align:-2px" aria-hidden="true"></i> '
+        + cap(activeTab) + ' credentials removed.'
+      );
+      checkStatus();
+    })
+    .catch(()=>showAlert(err,'Network error.'))
+    .finally(()=>{
+      btn.innerHTML='<i class="ti ti-trash" aria-hidden="true"></i>';
+      btn.disabled=false;
+    });
+}
+
+function checkStatus(){
+  const token = $('credToken').value.trim();
+  if(!token) return;
+  const btn = $('checkBtn');
+  btn.innerHTML = '<i class="ti ti-loader-2 spin" aria-hidden="true"></i>';
+  fetch('/credential-status',{headers:{'Authorization':'Bearer '+token}})
+    .then(r=>r.json())
+    .then(data=>{
+      const section = $('statusSection');
+      const badges  = $('statusBadges');
+      section.style.display='block';
+      badges.innerHTML = Object.entries(data.configured).map(([p,on])=>
+        `<span class="badge ${on?'configured':'unconfigured'}">
+          <span class="badge-dot"></span>${cap(p)}
+        </span>`
+      ).join('');
+    })
+    .catch(()=>{})
+    .finally(()=>{
+      btn.innerHTML='<i class="ti ti-refresh" aria-hidden="true"></i>';
+    });
+}
+
+// ── Utilities ──────────────────────────────────────────────────────────────
+function showAlert(el, msg){
+  el.innerHTML = msg;
+  el.classList.add('show');
+}
+
+function copyEl(id, btnId){
+  const text = $(id).textContent;
+  const btn  = $(btnId);
+  navigator.clipboard.writeText(text).then(()=>{
+    const orig = btn.innerHTML;
+    btn.innerHTML = '<i class="ti ti-check" style="font-size:12px" aria-hidden="true"></i> Copied';
+    btn.classList.add('copied');
+    setTimeout(()=>{ btn.innerHTML=orig; btn.classList.remove('copied'); }, 2000);
+  });
+}
+
+function cap(s){ return s.charAt(0).toUpperCase()+s.slice(1); }
+
+$('nameInput').addEventListener('keydown', e=>{ if(e.key==='Enter') register(); });
 </script>
 </body>
 </html>
