@@ -7087,8 +7087,10 @@ if (process.env.MCP_MODE === 'http') {
   );
   if (process.env.MCP_API_KEY) _runtimeKeys.add(process.env.MCP_API_KEY);
 
-  function isValidToken(authHeader) {
+  function isValidToken(authHeader, queryToken) {
     if (_runtimeKeys.size === 0) return true; // open if no keys configured
+    // Accept token from query param (?token=xxx) for Claude.ai connector URL
+    if (queryToken && _runtimeKeys.has(queryToken)) return true;
     if (!authHeader?.startsWith('Bearer ')) return false;
     return _runtimeKeys.has(authHeader.slice(7));
   }
@@ -7136,7 +7138,7 @@ if (process.env.MCP_MODE === 'http') {
   }
 
   function checkApiKey(req, res, next) {
-    if (isValidToken(req.headers['authorization'])) { next(); return; }
+    if (isValidToken(req.headers['authorization'], req.query.token)) { next(); return; }
     res.status(401).json({ error: 'Unauthorized — provide a valid Bearer token' });
   }
 

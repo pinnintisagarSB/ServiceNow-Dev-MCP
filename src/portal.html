@@ -497,20 +497,10 @@
 
       <div class="result-body">
         <div class="field-row">
-          <div class="field-label">Connector URL</div>
+          <div class="field-label">Connector URL — paste this into Claude.ai</div>
           <div class="field-value-row">
-            <div class="field-value" id="sseUrl"></div>
-            <button class="copy-btn" onclick="copy('sseUrl', this)">
-              <i class="ti ti-copy" style="font-size:12px" aria-hidden="true"></i> Copy
-            </button>
-          </div>
-        </div>
-
-        <div class="field-row">
-          <div class="field-label">Authorization header</div>
-          <div class="field-value-row">
-            <div class="field-value" id="tokenDisplay"></div>
-            <button class="copy-btn" onclick="copy('tokenDisplay', this)">
+            <div class="field-value" id="connectorUrl"></div>
+            <button class="copy-btn" onclick="copy('connectorUrl', this)">
               <i class="ti ti-copy" style="font-size:12px" aria-hidden="true"></i> Copy
             </button>
           </div>
@@ -524,11 +514,11 @@
           </div>
           <div class="step-item">
             <div class="step-num">2</div>
-            <div class="step-text">Paste the <strong>Connector URL</strong>, then add an <strong>Authorization</strong> header with the value above</div>
+            <div class="step-text">Set <strong>Name</strong> to anything (e.g. ServiceNow Dev MCP) and paste the <strong>Connector URL</strong> above</div>
           </div>
           <div class="step-item">
             <div class="step-num">3</div>
-            <div class="step-text">Save — Claude will prompt for your <strong>ServiceNow, Jira, or Salesforce</strong> credentials on first use</div>
+            <div class="step-text">Click <strong>Save</strong> — Claude will prompt for your <strong>ServiceNow, Jira, or Salesforce</strong> credentials on first use</div>
           </div>
         </div>
 
@@ -578,8 +568,7 @@
       .then(({ ok, data }) => {
         if (!ok) { showError(data.error || 'Registration failed.'); return; }
         document.getElementById('resultName').textContent = data.name;
-        document.getElementById('sseUrl').textContent     = data.sse_url;
-        document.getElementById('tokenDisplay').textContent = 'Bearer ' + data.token;
+        document.getElementById('connectorUrl').textContent = data.sse_url + '?token=' + data.token;
         document.getElementById('formView').style.display  = 'none';
         document.getElementById('resultView').classList.add('show');
       })
