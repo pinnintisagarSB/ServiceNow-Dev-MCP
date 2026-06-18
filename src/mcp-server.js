@@ -9,6 +9,7 @@
  */
 
 import 'dotenv/config';
+import { AsyncLocalStorage }    from 'node:async_hooks';
 import { McpServer }            from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { z }                    from 'zod';
@@ -59,39 +60,58 @@ const _issueGuide      = new IssueGuide();
 const _expertTester    = new ExpertTester();
 const _migrationTester = new MigrationTester();
 
-// ── Connector cache (reuse within a session) ───────────────────────────────
-// In HTTP mode each request is stateless, so connectors are reset per-session
-// via configure_credentials. In stdio mode they are process-scoped singletons.
-let _sn   = null;
-let _sf   = null;
-let _jira = null;
+// ── Per-session state (credentials + cached connectors) ───────────────────
+// Each SSE connection gets its own isolated state so concurrent users never
+// share credentials. AsyncLocalStorage propagates the sessionId through the
+// entire async call stack without any changes to tool handlers.
+//
+// stdio mode (CLI): falls back to a single global session keyed '_stdio'.
 
-// Session-level credential overrides (set via configure_credentials tool).
-// These override whatever is in .env, so each web session can use its own instance.
-const _sessionCreds = {
-  servicenow:  null,   // { instanceUrl, username, password }
-  jira:        null,   // { baseUrl, email, apiToken }
-  salesforce:  null,   // { loginUrl, clientId, clientSecret, username, password, securityToken }
-};
+const _sessionContext = new AsyncLocalStorage();
+const _sessions       = new Map(); // sessionId → { creds, connectors }
+
+function _getSession() {
+  const id = _sessionContext.getStore() ?? '_stdio';
+  if (!_sessions.has(id)) {
+    _sessions.set(id, {
+      creds:      { servicenow: null, jira: null, salesforce: null },
+      connectors: { sn: null, sf: null, jira: null },
+    });
+  }
+  return _sessions.get(id);
+}
+
+// Expose for configure_credentials and resetConnectors
+const _sessionCreds = new Proxy({}, {
+  get: (_, key) => _getSession().creds[key],
+  set: (_, key, val) => { _getSession().creds[key] = val; return true; },
+});
 
 async function getSn() {
-  if (!_sn) {
-    if (_sessionCreds.servicenow) {
-      // Override env with session credentials
-      const c = _sessionCreds.servicenow;
+  const s = _getSession();
+  if (!s.connectors.sn) {
+    const c = s.creds.servicenow;
+    const env = { ...process.env };
+    if (c) {
       process.env.SN_INSTANCE_URL = c.instanceUrl;
       process.env.SN_USERNAME     = c.username;
       process.env.SN_PASSWORD     = c.password;
     }
-    _sn = await new ServiceNowConnector().init();
+    s.connectors.sn = await new ServiceNowConnector().init();
+    // Restore env so other sessions are unaffected
+    process.env.SN_INSTANCE_URL = env.SN_INSTANCE_URL ?? '';
+    process.env.SN_USERNAME     = env.SN_USERNAME     ?? '';
+    process.env.SN_PASSWORD     = env.SN_PASSWORD     ?? '';
   }
-  return _sn;
+  return s.connectors.sn;
 }
 
 async function getSf() {
-  if (!_sf) {
-    if (_sessionCreds.salesforce) {
-      const c = _sessionCreds.salesforce;
+  const s = _getSession();
+  if (!s.connectors.sf) {
+    const c = s.creds.salesforce;
+    const env = { ...process.env };
+    if (c) {
       process.env.SF_LOGIN_URL      = c.loginUrl     ?? 'https://login.salesforce.com';
       process.env.SF_CLIENT_ID      = c.clientId;
       process.env.SF_CLIENT_SECRET  = c.clientSecret;
@@ -99,26 +119,38 @@ async function getSf() {
       process.env.SF_PASSWORD       = c.password;
       process.env.SF_SECURITY_TOKEN = c.securityToken ?? '';
     }
-    _sf = await new SalesforceConnector().connect();
+    s.connectors.sf = await new SalesforceConnector().connect();
+    process.env.SF_LOGIN_URL      = env.SF_LOGIN_URL      ?? '';
+    process.env.SF_CLIENT_ID      = env.SF_CLIENT_ID      ?? '';
+    process.env.SF_CLIENT_SECRET  = env.SF_CLIENT_SECRET  ?? '';
+    process.env.SF_USERNAME       = env.SF_USERNAME       ?? '';
+    process.env.SF_PASSWORD       = env.SF_PASSWORD       ?? '';
+    process.env.SF_SECURITY_TOKEN = env.SF_SECURITY_TOKEN ?? '';
   }
-  return _sf;
+  return s.connectors.sf;
 }
 
 async function getJira() {
-  if (!_jira) {
-    if (_sessionCreds.jira) {
-      const c = _sessionCreds.jira;
+  const s = _getSession();
+  if (!s.connectors.jira) {
+    const c = s.creds.jira;
+    const env = { ...process.env };
+    if (c) {
       process.env.JIRA_BASE_URL  = c.baseUrl;
       process.env.JIRA_EMAIL     = c.email;
       process.env.JIRA_API_TOKEN = c.apiToken;
     }
-    _jira = await new JiraConnector().connect();
+    s.connectors.jira = await new JiraConnector().connect();
+    process.env.JIRA_BASE_URL  = env.JIRA_BASE_URL  ?? '';
+    process.env.JIRA_EMAIL     = env.JIRA_EMAIL     ?? '';
+    process.env.JIRA_API_TOKEN = env.JIRA_API_TOKEN ?? '';
   }
-  return _jira;
+  return s.connectors.jira;
 }
 
 function resetConnectors() {
-  _sn = null; _sf = null; _jira = null;
+  const s = _getSession();
+  s.connectors.sn = null; s.connectors.sf = null; s.connectors.jira = null;
 }
 
 // ── Response helpers ───────────────────────────────────────────────────────
@@ -6861,17 +6893,23 @@ if (process.env.MCP_MODE === 'http') {
   app.get('/sse', checkApiKey, async (req, res) => {
     const transport = new SSEServerTransport('/messages', res);
     clients.set(transport.sessionId, transport);
-    res.on('close', () => clients.delete(transport.sessionId));
+    res.on('close', () => {
+      clients.delete(transport.sessionId);
+      _sessions.delete(transport.sessionId);   // free per-session credential memory
+      logger.info(`SSE client disconnected (session: ${transport.sessionId})`);
+    });
     await server.connect(transport);
     logger.info(`SSE client connected (session: ${transport.sessionId})`);
   });
 
-  // Message endpoint — receives tool calls from the client
+  // Message endpoint — receives tool calls from the client.
+  // Each request runs inside its sessionId context so tool handlers get
+  // the right credentials without any changes to their own code.
   app.post('/messages', checkApiKey, async (req, res) => {
     const sessionId = req.query.sessionId;
     const transport = clients.get(sessionId);
     if (!transport) { res.status(404).json({ error: 'Session not found' }); return; }
-    await transport.handlePostMessage(req, res);
+    await _sessionContext.run(sessionId, () => transport.handlePostMessage(req, res));
   });
 
   app.listen(port, () => {
