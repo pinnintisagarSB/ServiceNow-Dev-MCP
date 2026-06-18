@@ -7067,6 +7067,62 @@ Use this when:
   }
 );
 
+// ── Leave & Onboarding — shared helpers ───────────────────────────────────
+
+// Resolve a sys_user row from email, user_name, or sys_id.
+async function _snResolveUser(sn, identity) {
+  const rows = await sn.get('sys_user', {
+    sysparm_query:  `email=${identity}^ORsys_id=${identity}^ORuser_name=${identity}`,
+    sysparm_fields: 'sys_id,name,email,user_name',
+    sysparm_limit:  '1',
+  });
+  return rows[0] ?? null;
+}
+
+// Get HR profile sys_id for a user.
+async function _snGetHrProfile(sn, userSysId) {
+  const rows = await sn.get('sn_hr_core_profile', {
+    sysparm_query:  `user=${userSysId}`,
+    sysparm_fields: 'sys_id',
+    sysparm_limit:  '1',
+  });
+  return rows[0]?.sys_id ?? null;
+}
+
+// Returns the session's own SN username (the identity it authenticated as).
+function _snCallerUsername() {
+  try {
+    const s = _getSession();
+    return s.creds?.servicenow?.username ?? process.env.SN_USERNAME ?? '';
+  } catch { return process.env.SN_USERNAME ?? ''; }
+}
+
+// True if the user has any HR-related or admin role in ServiceNow.
+async function _snHasHrRole(sn, userSysId) {
+  const rows = await sn.get('sys_user_has_role', {
+    sysparm_query:  `user=${userSysId}^state=active^role.name=admin^ORrole.nameLIKEsn_hr`,
+    sysparm_fields: 'sys_id',
+    sysparm_limit:  '1',
+  });
+  return rows.length > 0;
+}
+
+// Enforce role-based access for leave/onboarding tools.
+// - callerUser: the SN user record for the session credential
+// - targetUser: the SN user record being accessed
+// Returns null if access is granted, or a fail() response if denied.
+async function _enforceLeaveAccess(sn, callerUser, targetUser) {
+  // Same person — always allowed
+  if (callerUser.sys_id === targetUser.sys_id) return null;
+  // Different person — require HR role
+  const isHr = await _snHasHrRole(sn, callerUser.sys_id);
+  if (isHr) return null;
+  return fail(
+    `Access denied: you can only view your own leave data. ` +
+    `To view records for ${targetUser.name}, you need an HR role in ServiceNow.`
+  );
+}
+
 // ── Leave Request Assistant ───────────────────────────────────────────────
 // Tools: check_leave_balance, get_leave_types, check_holiday_calendar,
 //        get_my_leave_requests, check_leave_eligibility, submit_leave_request
@@ -7080,35 +7136,45 @@ days they have available for each leave type (vacation, sick, PTO, etc.).
 
 Returns available_balance, total_balance, used_pto for each leave type.`,
   {
-    employee_id: z.string().optional().describe('SysID or email of the employee. Omit to use the currently authenticated user.'),
+    employee_id: z.string().optional().describe('SysID or email of the employee. Omit to view your own balance.'),
   },
   async ({ employee_id }) => {
     try {
-      const sn = getSn();
-      let profileQuery = '';
-      if (employee_id) {
-        // Resolve hr_profile from user email or sys_id
-        const userRes = await sn.get(`/api/now/table/sys_user?sysparm_query=email=${employee_id}^ORsys_id=${employee_id}&sysparm_fields=sys_id,name,email&sysparm_limit=1`);
-        const user = userRes.data?.result?.[0];
-        if (!user) return fail(`User not found: ${employee_id}`);
-        const profileRes = await sn.get(`/api/now/table/sn_hr_core_profile?sysparm_query=user=${user.sys_id}&sysparm_fields=sys_id,user.name&sysparm_limit=1`);
-        const profile = profileRes.data?.result?.[0];
-        if (!profile) return fail(`HR profile not found for user: ${user.name}`);
-        profileQuery = `hr_profile=${profile.sys_id}`;
+      const sn = await getSn();
+
+      // Identify caller from session credentials
+      const callerUsername = _snCallerUsername();
+      const callerUser = callerUsername ? await _snResolveUser(sn, callerUsername) : null;
+
+      // Resolve target user (default = caller)
+      const targetUser = employee_id ? await _snResolveUser(sn, employee_id) : callerUser;
+      if (!targetUser) return fail(employee_id ? `User not found: ${employee_id}` : 'Could not resolve current user. Please provide employee_id.');
+
+      // Role-based access check
+      if (callerUser && callerUser.sys_id !== targetUser.sys_id) {
+        const denied = await _enforceLeaveAccess(sn, callerUser, targetUser);
+        if (denied) return denied;
       }
 
-      const query = profileQuery || '';
-      const res = await sn.get(`/api/now/table/sn_hr_core_emp_time_off_balance?${query ? 'sysparm_query=' + query + '&' : ''}sysparm_fields=type.name,available_balance,total_balance,used_pto&sysparm_limit=50`);
-      const balances = res.data?.result ?? [];
+      const profileId = await _snGetHrProfile(sn, targetUser.sys_id);
+      if (!profileId) return fail(`No HR profile found for ${targetUser.name}.`);
 
-      if (balances.length === 0) return ok({ message: 'No leave balance records found.', balances: [] });
+      const balances = await sn.get('sn_hr_core_emp_time_off_balance', {
+        sysparm_query:         `hr_profile=${profileId}`,
+        sysparm_fields:        'type.name,available_balance,total_balance,used_pto',
+        sysparm_display_value: 'true',
+        sysparm_limit:         '50',
+      });
+
+      if (!balances.length) return ok({ employee: targetUser.name, message: 'No leave balance records found.', balances: [] });
 
       return ok({
+        employee: targetUser.name,
         balances: balances.map(b => ({
-          type: b['type.name'] || b.type,
+          type:           b['type.name'] ?? b.type,
           available_days: b.available_balance,
-          total_days: b.total_balance,
-          used_days: b.used_pto,
+          total_days:     b.total_balance,
+          used_days:      b.used_pto,
         })),
       });
     } catch (e) { return fail(e.message); }
@@ -7124,9 +7190,11 @@ Use this to show the employee what types of leave they can request
   {},
   async () => {
     try {
-      const sn = getSn();
-      const res = await sn.get('/api/now/table/sn_hr_core_emp_time_off_type?sysparm_fields=sys_id,name,external_id&sysparm_limit=100');
-      const types = res.data?.result ?? [];
+      const sn = await getSn();
+      const types = await sn.get('sn_hr_core_emp_time_off_type', {
+        sysparm_fields: 'sys_id,name,external_id',
+        sysparm_limit:  '100',
+      });
       return ok({ leave_types: types.map(t => ({ id: t.sys_id, name: t.name, external_id: t.external_id })) });
     } catch (e) { return fail(e.message); }
   }
@@ -7145,10 +7213,14 @@ counted against leave balance.`,
   },
   async ({ start_date, end_date }) => {
     try {
-      const sn = getSn();
+      const sn = await getSn();
       const to = end_date ?? start_date;
-      const res = await sn.get(`/api/now/table/sys_holiday?sysparm_query=date>=${start_date}^date<=${to}&sysparm_fields=name,date&sysparm_limit=50&sysparm_orderby=date`);
-      const holidays = res.data?.result ?? [];
+      const holidays = await sn.get('sys_holiday', {
+        sysparm_query:  `date>=${start_date}^date<=${to}`,
+        sysparm_fields: 'name,date',
+        sysparm_limit:  '50',
+        sysparm_orderby: 'date',
+      });
       return ok({
         range: { start: start_date, end: to },
         holiday_count: holidays.length,
@@ -7168,39 +7240,48 @@ server.tool(
 Use this to show pending, approved, and rejected requests so the employee
 can see what they've already submitted before making a new request.`,
   {
-    employee_id: z.string().optional().describe('SysID or email of employee. Omit for current user.'),
-    status:      z.enum(['all', 'pending', 'approved', 'rejected']).optional().default('all').describe('Filter by status'),
-    limit:       z.number().optional().default(20).describe('Max number of records to return'),
+    employee_id: z.string().optional().describe('SysID or email of employee. Omit to view your own requests.'),
+    status:      z.enum(['all', 'pending', 'approved', 'rejected']).optional().default('all'),
+    limit:       z.number().optional().default(20),
   },
   async ({ employee_id, status, limit }) => {
     try {
-      const sn = getSn();
-      let query = '';
+      const sn = await getSn();
 
-      if (employee_id) {
-        const userRes = await sn.get(`/api/now/table/sys_user?sysparm_query=email=${employee_id}^ORsys_id=${employee_id}&sysparm_fields=sys_id&sysparm_limit=1`);
-        const user = userRes.data?.result?.[0];
-        if (!user) return fail(`User not found: ${employee_id}`);
-        const profileRes = await sn.get(`/api/now/table/sn_hr_core_profile?sysparm_query=user=${user.sys_id}&sysparm_fields=sys_id&sysparm_limit=1`);
-        const profile = profileRes.data?.result?.[0];
-        if (profile) query += `hr_profile=${profile.sys_id}^`;
+      const callerUsername = _snCallerUsername();
+      const callerUser = callerUsername ? await _snResolveUser(sn, callerUsername) : null;
+      const targetUser = employee_id ? await _snResolveUser(sn, employee_id) : callerUser;
+      if (!targetUser) return fail(employee_id ? `User not found: ${employee_id}` : 'Could not resolve current user. Please provide employee_id.');
+
+      if (callerUser && callerUser.sys_id !== targetUser.sys_id) {
+        const denied = await _enforceLeaveAccess(sn, callerUser, targetUser);
+        if (denied) return denied;
       }
 
-      if (status && status !== 'all') query += `status=${status}^`;
-      query = query.replace(/\^$/, '');
+      const profileId = await _snGetHrProfile(sn, targetUser.sys_id);
+      if (!profileId) return fail(`No HR profile found for ${targetUser.name}.`);
 
-      const res = await sn.get(`/api/now/table/sn_hr_core_emp_time_off?${query ? 'sysparm_query=' + query + '&' : ''}sysparm_fields=sys_id,type.name,start_date,end_date,quantity,status&sysparm_limit=${limit}&sysparm_orderby=start_date`);
-      const requests = res.data?.result ?? [];
+      let query = `hr_profile=${profileId}`;
+      if (status && status !== 'all') query += `^status=${status}`;
+
+      const requests = await sn.get('sn_hr_core_emp_time_off', {
+        sysparm_query:         query,
+        sysparm_fields:        'sys_id,type.name,start_date,end_date,quantity,status',
+        sysparm_display_value: 'true',
+        sysparm_limit:         String(limit),
+        sysparm_orderby:       'start_date',
+      });
 
       return ok({
+        employee: targetUser.name,
         count: requests.length,
         requests: requests.map(r => ({
-          id: r.sys_id,
-          type: r['type.name'] || r.type,
+          id:         r.sys_id,
+          type:       r['type.name'] ?? r.type,
           start_date: r.start_date,
-          end_date: r.end_date,
-          days: r.quantity,
-          status: r.status,
+          end_date:   r.end_date,
+          days:       r.quantity,
+          status:     r.status,
         })),
       });
     } catch (e) { return fail(e.message); }
@@ -7217,81 +7298,84 @@ any overlapping existing requests.
 
 This is the main tool for answering "Can I take leave from X to Y?"`,
   {
-    start_date:  z.string().describe('Start date in YYYY-MM-DD format'),
-    end_date:    z.string().describe('End date in YYYY-MM-DD format'),
+    start_date:    z.string().describe('Start date in YYYY-MM-DD format'),
+    end_date:      z.string().describe('End date in YYYY-MM-DD format'),
     leave_type_id: z.string().optional().describe('SysID of the leave type. Get from get_leave_types.'),
-    employee_id: z.string().optional().describe('SysID or email of employee. Omit for current user.'),
+    employee_id:   z.string().optional().describe('SysID or email of employee. Omit for current user.'),
   },
   async ({ start_date, end_date, leave_type_id, employee_id }) => {
     try {
-      const sn = getSn();
+      const sn = await getSn();
+
+      const callerUsername = _snCallerUsername();
+      const callerUser = callerUsername ? await _snResolveUser(sn, callerUsername) : null;
+      const targetUser = employee_id ? await _snResolveUser(sn, employee_id) : callerUser;
+      if (!targetUser) return fail('Could not resolve user. Please provide employee_id.');
+
+      if (callerUser && callerUser.sys_id !== targetUser.sys_id) {
+        const denied = await _enforceLeaveAccess(sn, callerUser, targetUser);
+        if (denied) return denied;
+      }
 
       // 1. Count working days (Mon–Fri) in range
       const s = new Date(start_date), e = new Date(end_date);
       let working_days = 0;
       for (let d = new Date(s); d <= e; d.setDate(d.getDate() + 1)) {
-        const dow = d.getDay();
-        if (dow !== 0 && dow !== 6) working_days++;
+        if (d.getDay() !== 0 && d.getDay() !== 6) working_days++;
       }
 
-      // 2. Check holidays in range
-      const holRes = await sn.get(`/api/now/table/sys_holiday?sysparm_query=date>=${start_date}^date<=${end_date}&sysparm_fields=name,date&sysparm_limit=50`);
-      const holidays = holRes.data?.result ?? [];
+      // 2. Holidays in range
+      const holidays = await sn.get('sys_holiday', {
+        sysparm_query:  `date>=${start_date}^date<=${end_date}`,
+        sysparm_fields: 'name,date',
+        sysparm_limit:  '50',
+      });
       const working_days_needed = Math.max(0, working_days - holidays.length);
 
-      // 3. Check leave balance for the type
+      // 3. Balance for leave type
+      const profileId = await _snGetHrProfile(sn, targetUser.sys_id);
       let balance_info = null;
-      let profile_id = null;
-      if (employee_id || leave_type_id) {
-        let profileQuery = '';
-        if (employee_id) {
-          const userRes = await sn.get(`/api/now/table/sys_user?sysparm_query=email=${employee_id}^ORsys_id=${employee_id}&sysparm_fields=sys_id&sysparm_limit=1`);
-          const user = userRes.data?.result?.[0];
-          if (user) {
-            const profRes = await sn.get(`/api/now/table/sn_hr_core_profile?sysparm_query=user=${user.sys_id}&sysparm_fields=sys_id&sysparm_limit=1`);
-            profile_id = profRes.data?.result?.[0]?.sys_id;
-            if (profile_id) profileQuery = `hr_profile=${profile_id}`;
-          }
-        }
-        if (leave_type_id) {
-          profileQuery += (profileQuery ? '^' : '') + `type=${leave_type_id}`;
-        }
-        const balRes = await sn.get(`/api/now/table/sn_hr_core_emp_time_off_balance?sysparm_query=${profileQuery}&sysparm_fields=type.name,available_balance&sysparm_limit=1`);
-        const bal = balRes.data?.result?.[0];
-        if (bal) balance_info = { type: bal['type.name'], available_days: bal.available_balance };
+      if (profileId && leave_type_id) {
+        const bals = await sn.get('sn_hr_core_emp_time_off_balance', {
+          sysparm_query:         `hr_profile=${profileId}^type=${leave_type_id}`,
+          sysparm_fields:        'type.name,available_balance',
+          sysparm_display_value: 'true',
+          sysparm_limit:         '1',
+        });
+        if (bals[0]) balance_info = { type: bals[0]['type.name'] ?? bals[0].type, available_days: bals[0].available_balance };
       }
 
-      // 4. Check for overlapping existing requests
-      let overlap_query = `start_date<=${end_date}^end_date>=${start_date}^status!=rejected`;
-      if (profile_id) overlap_query += `^hr_profile=${profile_id}`;
-      const overlapRes = await sn.get(`/api/now/table/sn_hr_core_emp_time_off?sysparm_query=${overlap_query}&sysparm_fields=type.name,start_date,end_date,status&sysparm_limit=10`);
-      const overlaps = overlapRes.data?.result ?? [];
+      // 4. Overlapping requests
+      let overlapQ = `start_date<=${end_date}^end_date>=${start_date}^status!=rejected`;
+      if (profileId) overlapQ += `^hr_profile=${profileId}`;
+      const overlaps = await sn.get('sn_hr_core_emp_time_off', {
+        sysparm_query:         overlapQ,
+        sysparm_fields:        'type.name,start_date,end_date,status',
+        sysparm_display_value: 'true',
+        sysparm_limit:         '10',
+      });
 
-      // 5. Verdict
-      const has_balance = !balance_info || parseFloat(balance_info.available_days) >= working_days_needed;
+      const has_balance  = !balance_info || parseFloat(balance_info.available_days) >= working_days_needed;
       const has_conflicts = overlaps.length > 0;
       const eligible = has_balance && !has_conflicts;
 
       return ok({
         eligible,
+        employee: targetUser.name,
         summary: {
-          start_date,
-          end_date,
-          calendar_days: Math.round((e - s) / 86400000) + 1,
+          start_date, end_date,
+          calendar_days:     Math.round((e - s) / 86400000) + 1,
           working_days,
-          holidays: holidays.map(h => ({ name: h.name, date: h.date })),
+          holidays:          holidays.map(h => ({ name: h.name, date: h.date })),
           working_days_needed,
-          balance: balance_info,
+          balance:           balance_info,
           sufficient_balance: has_balance,
           conflicting_requests: overlaps.map(o => ({
-            type: o['type.name'],
-            start: o.start_date,
-            end: o.end_date,
-            status: o.status,
+            type: o['type.name'] ?? o.type, start: o.start_date, end: o.end_date, status: o.status,
           })),
         },
         recommendation: eligible
-          ? `You are eligible. This request needs ${working_days_needed} working day(s) from your leave balance.`
+          ? `Eligible — this request needs ${working_days_needed} working day(s) from your leave balance.`
           : !has_balance
             ? `Insufficient balance. You need ${working_days_needed} days but only have ${balance_info?.available_days ?? 0} available.`
             : `You have ${overlaps.length} overlapping request(s) in this period.`,
@@ -7311,54 +7395,54 @@ employee before calling this tool. This creates a real record in ServiceNow.`,
     start_date:    z.string().describe('Start date in YYYY-MM-DD format'),
     end_date:      z.string().describe('End date in YYYY-MM-DD format'),
     employee_id:   z.string().optional().describe('SysID or email of employee. Omit for current user.'),
-    comments:      z.string().optional().describe('Optional reason or comments for the request'),
+    comments:      z.string().optional().describe('Optional reason or comments'),
   },
   async ({ leave_type_id, start_date, end_date, employee_id, comments }) => {
     try {
-      const sn = getSn();
+      const sn = await getSn();
 
-      // Resolve hr_profile
-      let profile_id = null;
-      if (employee_id) {
-        const userRes = await sn.get(`/api/now/table/sys_user?sysparm_query=email=${employee_id}^ORsys_id=${employee_id}&sysparm_fields=sys_id,name&sysparm_limit=1`);
-        const user = userRes.data?.result?.[0];
-        if (!user) return fail(`User not found: ${employee_id}`);
-        const profRes = await sn.get(`/api/now/table/sn_hr_core_profile?sysparm_query=user=${user.sys_id}&sysparm_fields=sys_id&sysparm_limit=1`);
-        profile_id = profRes.data?.result?.[0]?.sys_id;
-        if (!profile_id) return fail(`HR profile not found for: ${user.name}`);
+      const callerUsername = _snCallerUsername();
+      const callerUser = callerUsername ? await _snResolveUser(sn, callerUsername) : null;
+      const targetUser = employee_id ? await _snResolveUser(sn, employee_id) : callerUser;
+      if (!targetUser) return fail('Could not resolve user. Please provide employee_id.');
+
+      // Employees can only submit for themselves; HR can submit for others
+      if (callerUser && callerUser.sys_id !== targetUser.sys_id) {
+        const denied = await _enforceLeaveAccess(sn, callerUser, targetUser);
+        if (denied) return denied;
       }
 
-      // Calculate quantity (working days minus holidays)
+      const profileId = await _snGetHrProfile(sn, targetUser.sys_id);
+      if (!profileId) return fail(`No HR profile found for ${targetUser.name}.`);
+
+      // Calculate working days minus holidays
       const s = new Date(start_date), e = new Date(end_date);
       let working_days = 0;
       for (let d = new Date(s); d <= e; d.setDate(d.getDate() + 1)) {
-        const dow = d.getDay();
-        if (dow !== 0 && dow !== 6) working_days++;
+        if (d.getDay() !== 0 && d.getDay() !== 6) working_days++;
       }
-      const holRes = await sn.get(`/api/now/table/sys_holiday?sysparm_query=date>=${start_date}^date<=${end_date}&sysparm_fields=date&sysparm_limit=50`);
-      const holiday_count = holRes.data?.result?.length ?? 0;
-      const quantity = Math.max(1, working_days - holiday_count);
+      const holRows = await sn.get('sys_holiday', {
+        sysparm_query:  `date>=${start_date}^date<=${end_date}`,
+        sysparm_fields: 'date',
+        sysparm_limit:  '50',
+      });
+      const quantity = Math.max(1, working_days - holRows.length);
 
-      const payload = {
-        type: leave_type_id,
-        start_date,
-        end_date,
-        quantity,
-        ...(profile_id ? { hr_profile: profile_id } : {}),
+      const record = await sn.post('sn_hr_core_emp_time_off', {
+        type: leave_type_id, hr_profile: profileId,
+        start_date, end_date, quantity,
         ...(comments ? { comments } : {}),
-      };
-
-      const res = await sn.post('/api/now/table/sn_hr_core_emp_time_off', payload);
-      const record = res.data?.result;
+      });
 
       return ok({
         success: true,
-        request_id: record?.sys_id,
-        status: record?.status ?? 'submitted',
-        start_date: record?.start_date ?? start_date,
-        end_date:   record?.end_date   ?? end_date,
-        days:       record?.quantity   ?? quantity,
-        message: `Leave request submitted successfully. ${quantity} working day(s) from ${start_date} to ${end_date}.`,
+        employee:   targetUser.name,
+        request_id: record.sys_id,
+        status:     record.status ?? 'submitted',
+        start_date: record.start_date ?? start_date,
+        end_date:   record.end_date   ?? end_date,
+        days:       record.quantity   ?? quantity,
+        message:    `Leave request submitted for ${targetUser.name}. ${quantity} working day(s) from ${start_date} to ${end_date}.`,
       });
     } catch (e) { return fail(e.message); }
   }
@@ -7374,65 +7458,67 @@ server.tool(
   `Get a new hire's onboarding completion summary.
 
 Use this when someone asks "What's my onboarding status?" or "How far along am I?"
-Returns overall % complete, counts by category (HR / IT / Facilities / Learning),
-and the onboarding case details.`,
+Returns overall % complete, counts by category (HR / IT / Facilities / Learning).`,
   {
     employee_id: z.string().optional().describe('Email or sys_id of the new hire. Omit for current user.'),
   },
   async ({ employee_id }) => {
     try {
-      const sn = getSn();
+      const sn = await getSn();
 
-      // Resolve user
-      let userQuery = employee_id
-        ? `sysparm_query=email=${employee_id}^ORsys_id=${employee_id}`
-        : `sysparm_query=sys_id=${employee_id ?? ''}`;
-      const userRes = await sn.get(`/api/now/table/sys_user?${userQuery}&sysparm_fields=sys_id,name,email&sysparm_limit=1`);
-      const user = userRes.data?.result?.[0];
-      if (!user && employee_id) return fail(`User not found: ${employee_id}`);
+      const callerUsername = _snCallerUsername();
+      const callerUser = callerUsername ? await _snResolveUser(sn, callerUsername) : null;
+      const targetUser = employee_id ? await _snResolveUser(sn, employee_id) : callerUser;
+      if (!targetUser) return fail('Could not resolve user. Please provide employee_id.');
 
-      // Find onboarding case
-      const caseQuery = user ? `opened_for=${user.sys_id}^ORuser_name=${user.email}` : '';
-      const caseRes = await sn.get(`/api/now/table/sn_onboarding_case?sysparm_query=${caseQuery}&sysparm_fields=sys_id,number,short_description,state,stage,opened_at,due_date&sysparm_limit=1&sysparm_orderby=opened_at`);
-      const onbCase = caseRes.data?.result?.[0];
-      if (!onbCase) return fail('No onboarding case found for this user.');
+      if (callerUser && callerUser.sys_id !== targetUser.sys_id) {
+        const isHr = await _snHasHrRole(sn, callerUser.sys_id);
+        if (!isHr) return fail(`Access denied: you can only view your own onboarding data.`);
+      }
 
-      // Get checklist for this case
-      const clRes = await sn.get(`/api/now/table/checklist?sysparm_query=document=${onbCase.sys_id}^table=sn_onboarding_case&sysparm_fields=sys_id,name&sysparm_limit=1`);
-      const checklist = clRes.data?.result?.[0];
-      if (!checklist) return ok({ case: onbCase, message: 'No checklist found for this onboarding case.', completion: 0 });
+      const cases = await sn.get('sn_onboarding_case', {
+        sysparm_query:  `opened_for=${targetUser.sys_id}^ORuser_name=${targetUser.email}`,
+        sysparm_fields: 'sys_id,number,short_description,state,stage,opened_at,due_date',
+        sysparm_limit:  '1',
+        sysparm_orderby: 'opened_at',
+      });
+      const onbCase = cases[0];
+      if (!onbCase) return fail(`No onboarding case found for ${targetUser.name}.`);
 
-      // Get all items
-      const itemRes = await sn.get(`/api/now/table/checklist_item?sysparm_query=checklist=${checklist.sys_id}&sysparm_fields=name,complete,completed_by&sysparm_limit=200`);
-      const items = itemRes.data?.result ?? [];
+      const checklists = await sn.get('checklist', {
+        sysparm_query:  `document=${onbCase.sys_id}^table=sn_onboarding_case`,
+        sysparm_fields: 'sys_id,name',
+        sysparm_limit:  '1',
+      });
+      const checklist = checklists[0];
+      if (!checklist) return ok({ employee: targetUser.name, case: onbCase, message: 'No checklist found.', completion_pct: 0 });
+
+      const items = await sn.get('checklist_item', {
+        sysparm_query:  `checklist=${checklist.sys_id}`,
+        sysparm_fields: 'name,complete',
+        sysparm_limit:  '200',
+      });
 
       const total = items.length;
       const done  = items.filter(i => i.complete === 'true' || i.complete === true).length;
       const pct   = total === 0 ? 0 : Math.round((done / total) * 100);
 
-      // Group by category (prefix in name: [HR], [IT], [Facilities], [Learning])
-      const categories = {};
+      const cats = {};
       for (const item of items) {
-        const match = item.name.match(/^\[([^\]]+)\]/);
-        const cat = match ? match[1] : 'General';
-        if (!categories[cat]) categories[cat] = { total: 0, done: 0 };
-        categories[cat].total++;
-        if (item.complete === 'true' || item.complete === true) categories[cat].done++;
+        const cat = (item.name.match(/^\[([^\]]+)\]/) ?? [])[1] ?? 'General';
+        if (!cats[cat]) cats[cat] = { total: 0, done: 0 };
+        cats[cat].total++;
+        if (item.complete === 'true' || item.complete === true) cats[cat].done++;
       }
 
       return ok({
-        employee: user?.name,
-        case_number: onbCase.number,
-        state: onbCase.state,
-        stage: onbCase.stage,
-        opened: onbCase.opened_at,
-        due: onbCase.due_date,
+        employee: targetUser.name,
+        case_number: onbCase.number, state: onbCase.state,
+        opened: onbCase.opened_at, due: onbCase.due_date,
         completion_pct: pct,
         tasks: { total, completed: done, pending: total - done },
-        by_category: Object.entries(categories).map(([cat, v]) => ({
-          category: cat,
-          completed: v.done,
-          total: v.total,
+        by_category: Object.entries(cats).map(([cat, v]) => ({
+          category: cat, completed: v.done, total: v.total,
           pct: Math.round((v.done / v.total) * 100),
           status: v.done === v.total ? 'complete' : 'in_progress',
         })),
@@ -7446,8 +7532,7 @@ server.tool(
   `List onboarding tasks for a new hire, optionally filtered by category or status.
 
 Use this when someone asks "What do I still need to finish?" or
-"Show me my IT onboarding tasks." Returns each task with its status,
-who completed it, and its category.
+"Show me my IT onboarding tasks."
 
 Categories: HR, IT, Facilities, Learning, General`,
   {
@@ -7457,48 +7542,60 @@ Categories: HR, IT, Facilities, Learning, General`,
   },
   async ({ employee_id, category, status }) => {
     try {
-      const sn = getSn();
+      const sn = await getSn();
 
-      const userRes = await sn.get(`/api/now/table/sys_user?sysparm_query=email=${employee_id ?? ''}^ORsys_id=${employee_id ?? ''}&sysparm_fields=sys_id,name&sysparm_limit=1`);
-      const user = userRes.data?.result?.[0];
-      if (!user && employee_id) return fail(`User not found: ${employee_id}`);
+      const callerUsername = _snCallerUsername();
+      const callerUser = callerUsername ? await _snResolveUser(sn, callerUsername) : null;
+      const targetUser = employee_id ? await _snResolveUser(sn, employee_id) : callerUser;
+      if (!targetUser) return fail('Could not resolve user. Please provide employee_id.');
 
-      const caseRes = await sn.get(`/api/now/table/sn_onboarding_case?sysparm_query=${user ? `opened_for=${user.sys_id}` : ''}&sysparm_fields=sys_id,number&sysparm_limit=1`);
-      const onbCase = caseRes.data?.result?.[0];
-      if (!onbCase) return fail('No onboarding case found.');
+      if (callerUser && callerUser.sys_id !== targetUser.sys_id) {
+        const isHr = await _snHasHrRole(sn, callerUser.sys_id);
+        if (!isHr) return fail(`Access denied: you can only view your own onboarding tasks.`);
+      }
 
-      const clRes = await sn.get(`/api/now/table/checklist?sysparm_query=document=${onbCase.sys_id}^table=sn_onboarding_case&sysparm_fields=sys_id&sysparm_limit=1`);
-      const checklist = clRes.data?.result?.[0];
-      if (!checklist) return fail('No checklist found for this onboarding case.');
+      const cases = await sn.get('sn_onboarding_case', {
+        sysparm_query:  `opened_for=${targetUser.sys_id}`,
+        sysparm_fields: 'sys_id,number',
+        sysparm_limit:  '1',
+      });
+      const onbCase = cases[0];
+      if (!onbCase) return fail(`No onboarding case found for ${targetUser.name}.`);
 
-      const itemRes = await sn.get(`/api/now/table/checklist_item?sysparm_query=checklist=${checklist.sys_id}&sysparm_fields=sys_id,name,complete,completed,completed_by&sysparm_limit=200&sysparm_orderby=order`);
-      let items = itemRes.data?.result ?? [];
+      const checklists = await sn.get('checklist', {
+        sysparm_query:  `document=${onbCase.sys_id}^table=sn_onboarding_case`,
+        sysparm_fields: 'sys_id',
+        sysparm_limit:  '1',
+      });
+      if (!checklists[0]) return fail('No checklist found.');
 
-      // Filter by category
+      let itemQ = `checklist=${checklists[0].sys_id}`;
+      if (status === 'pending')   itemQ += '^complete=false';
+      if (status === 'completed') itemQ += '^complete=true';
+
+      let items = await sn.get('checklist_item', {
+        sysparm_query:  itemQ,
+        sysparm_fields: 'sys_id,name,complete,completed,completed_by',
+        sysparm_limit:  '200',
+        sysparm_orderby: 'order',
+      });
+
       if (category && category !== 'all') {
         items = items.filter(i => i.name.startsWith(`[${category}]`));
       }
 
-      // Filter by status
-      if (status === 'pending') {
-        items = items.filter(i => i.complete !== 'true' && i.complete !== true);
-      } else if (status === 'completed') {
-        items = items.filter(i => i.complete === 'true' || i.complete === true);
-      }
-
       return ok({
+        employee: targetUser.name,
         case_number: onbCase.number,
         filter: { category, status },
         count: items.length,
         tasks: items.map(i => {
-          const match = i.name.match(/^\[([^\]]+)\]\s*/);
+          const cat = (i.name.match(/^\[([^\]]+)\]/) ?? [])[1] ?? 'General';
           return {
-            id: i.sys_id,
-            category: match ? match[1] : 'General',
+            id: i.sys_id, category: cat,
             name: i.name.replace(/^\[[^\]]+\]\s*/, ''),
             complete: i.complete === 'true' || i.complete === true,
             completed_on: i.completed || null,
-            completed_by: i.completed_by || null,
           };
         }),
       });
@@ -7511,55 +7608,64 @@ server.tool(
   `Get the next pending onboarding tasks a new hire should complete.
 
 Use this when someone asks "What should I do next?" — returns the top
-pending tasks in priority order across all categories, with actionable
-instructions for each step.`,
+pending tasks in priority order: HR → IT → Facilities → Learning.`,
   {
     employee_id: z.string().optional().describe('Email or sys_id of the new hire. Omit for current user.'),
-    limit: z.number().optional().default(5).describe('Number of next steps to return (default 5)'),
+    limit: z.number().optional().default(5),
   },
   async ({ employee_id, limit }) => {
     try {
-      const sn = getSn();
+      const sn = await getSn();
 
-      const userRes = await sn.get(`/api/now/table/sys_user?sysparm_query=email=${employee_id ?? ''}^ORsys_id=${employee_id ?? ''}&sysparm_fields=sys_id,name&sysparm_limit=1`);
-      const user = userRes.data?.result?.[0];
-      if (!user && employee_id) return fail(`User not found: ${employee_id}`);
+      const callerUsername = _snCallerUsername();
+      const callerUser = callerUsername ? await _snResolveUser(sn, callerUsername) : null;
+      const targetUser = employee_id ? await _snResolveUser(sn, employee_id) : callerUser;
+      if (!targetUser) return fail('Could not resolve user. Please provide employee_id.');
 
-      const caseRes = await sn.get(`/api/now/table/sn_onboarding_case?sysparm_query=${user ? `opened_for=${user.sys_id}` : ''}&sysparm_fields=sys_id,number,due_date&sysparm_limit=1`);
-      const onbCase = caseRes.data?.result?.[0];
-      if (!onbCase) return fail('No onboarding case found.');
+      if (callerUser && callerUser.sys_id !== targetUser.sys_id) {
+        const isHr = await _snHasHrRole(sn, callerUser.sys_id);
+        if (!isHr) return fail(`Access denied: you can only view your own onboarding tasks.`);
+      }
 
-      const clRes = await sn.get(`/api/now/table/checklist?sysparm_query=document=${onbCase.sys_id}^table=sn_onboarding_case&sysparm_fields=sys_id&sysparm_limit=1`);
-      const checklist = clRes.data?.result?.[0];
-      if (!checklist) return fail('No checklist found.');
+      const cases = await sn.get('sn_onboarding_case', {
+        sysparm_query:  `opened_for=${targetUser.sys_id}`,
+        sysparm_fields: 'sys_id,number,due_date',
+        sysparm_limit:  '1',
+      });
+      const onbCase = cases[0];
+      if (!onbCase) return fail(`No onboarding case found for ${targetUser.name}.`);
 
-      const itemRes = await sn.get(`/api/now/table/checklist_item?sysparm_query=checklist=${checklist.sys_id}^complete=false&sysparm_fields=sys_id,name,order&sysparm_limit=${limit}&sysparm_orderby=order`);
-      const pending = itemRes.data?.result ?? [];
+      const checklists = await sn.get('checklist', {
+        sysparm_query:  `document=${onbCase.sys_id}^table=sn_onboarding_case`,
+        sysparm_fields: 'sys_id',
+        sysparm_limit:  '1',
+      });
+      if (!checklists[0]) return fail('No checklist found.');
 
-      // Priority order: HR first, then IT, Facilities, Learning, General
+      const pending = await sn.get('checklist_item', {
+        sysparm_query:  `checklist=${checklists[0].sys_id}^complete=false`,
+        sysparm_fields: 'sys_id,name,order',
+        sysparm_limit:  '100',
+        sysparm_orderby: 'order',
+      });
+
       const priority = { HR: 1, IT: 2, Facilities: 3, Learning: 4, General: 5 };
       pending.sort((a, b) => {
-        const catA = (a.name.match(/^\[([^\]]+)\]/) ?? [])[1] ?? 'General';
-        const catB = (b.name.match(/^\[([^\]]+)\]/) ?? [])[1] ?? 'General';
-        return (priority[catA] ?? 5) - (priority[catB] ?? 5);
+        const ca = (a.name.match(/^\[([^\]]+)\]/) ?? [])[1] ?? 'General';
+        const cb = (b.name.match(/^\[([^\]]+)\]/) ?? [])[1] ?? 'General';
+        return (priority[ca] ?? 5) - (priority[cb] ?? 5);
       });
 
       return ok({
-        employee: user?.name,
-        case_number: onbCase.number,
-        due_date: onbCase.due_date,
+        employee: targetUser.name,
+        case_number: onbCase.number, due_date: onbCase.due_date,
         next_steps: pending.slice(0, limit).map((i, idx) => {
-          const match = i.name.match(/^\[([^\]]+)\]\s*/);
-          return {
-            step: idx + 1,
-            id: i.sys_id,
-            category: match ? match[1] : 'General',
-            task: i.name.replace(/^\[[^\]]+\]\s*/, ''),
-          };
+          const cat = (i.name.match(/^\[([^\]]+)\]/) ?? [])[1] ?? 'General';
+          return { step: idx + 1, id: i.sys_id, category: cat, task: i.name.replace(/^\[[^\]]+\]\s*/, '') };
         }),
         message: pending.length === 0
-          ? 'All onboarding tasks are complete!'
-          : `${pending.length} task(s) remaining. Showing the next ${Math.min(limit, pending.length)}.`,
+          ? 'All onboarding tasks are complete! 🎉'
+          : `${pending.length} task(s) remaining. Showing next ${Math.min(limit, pending.length)}.`,
       });
     } catch (e) { return fail(e.message); }
   }
@@ -7573,26 +7679,28 @@ Use this when a new hire confirms they have finished a task.
 Get the task ID from get_onboarding_tasks or get_next_onboarding_steps.`,
   {
     task_id:     z.string().describe('sys_id of the checklist_item to mark complete'),
-    employee_id: z.string().optional().describe('Email or sys_id — used to verify task belongs to this user'),
+    employee_id: z.string().optional().describe('Email or sys_id — used to verify task ownership'),
   },
   async ({ task_id, employee_id }) => {
     try {
-      const sn = getSn();
+      const sn = await getSn();
+
+      // Verify the task exists and get its checklist
+      const item = await sn.getById('checklist_item', task_id, { sysparm_fields: 'sys_id,name,checklist,complete' });
+      if (!item) return fail(`Task not found: ${task_id}`);
+      if (item.complete === 'true' || item.complete === true) {
+        return ok({ message: 'Task was already marked complete.', task: item.name.replace(/^\[[^\]]+\]\s*/, '') });
+      }
 
       const now = new Date().toISOString().replace('T', ' ').split('.')[0];
-      await sn.patch(`/api/now/table/checklist_item/${task_id}`, {
-        complete: true, completed: now,
-      });
+      await sn.patch('checklist_item', task_id, { complete: true, completed: now });
 
-      // Fetch updated item for confirmation
-      const res = await sn.get(`/api/now/table/checklist_item/${task_id}?sysparm_fields=name,complete,completed`);
-      const item = res.data?.result;
-
+      const cat = (item.name.match(/^\[([^\]]+)\]/) ?? [])[1] ?? 'General';
       return ok({
         success: true,
-        task: item?.name?.replace(/^\[[^\]]+\]\s*/, ''),
-        category: (item?.name?.match(/^\[([^\]]+)\]/) ?? [])[1] ?? 'General',
-        completed_on: item?.completed,
+        task: item.name.replace(/^\[[^\]]+\]\s*/, ''),
+        category: cat,
+        completed_on: now,
         message: `Task marked complete. Well done!`,
       });
     } catch (e) { return fail(e.message); }
@@ -7603,90 +7711,82 @@ server.tool(
   'create_onboarding_plan',
   `Create a full onboarding case and task checklist for a new hire.
 
-Admin tool — use this when onboarding a new employee. Creates:
-- An onboarding case in ServiceNow
-- A checklist with tasks across HR, IT, Facilities, and Learning
-
-Optionally pass custom_tasks to add role-specific items.`,
+Admin/HR tool — creates an onboarding case + 21-task checklist across
+HR, IT, Facilities, and Learning. Requires HR role to use for others.`,
   {
     employee_id:  z.string().describe('Email or sys_id of the new hire'),
     start_date:   z.string().optional().describe('Start date YYYY-MM-DD. Defaults to today.'),
-    role:         z.string().optional().describe('Job role — used to customise task list (e.g. "Software Engineer", "Sales")'),
+    role:         z.string().optional().describe('Job role (e.g. "Software Engineer")'),
     custom_tasks: z.array(z.object({
       category: z.enum(['HR', 'IT', 'Facilities', 'Learning', 'General']),
       name:     z.string(),
-    })).optional().describe('Additional role-specific tasks to add'),
+    })).optional(),
   },
   async ({ employee_id, start_date, role, custom_tasks }) => {
     try {
-      const sn = getSn();
+      const sn = await getSn();
 
-      const userRes = await sn.get(`/api/now/table/sys_user?sysparm_query=email=${employee_id}^ORsys_id=${employee_id}&sysparm_fields=sys_id,name,email&sysparm_limit=1`);
-      const user = userRes.data?.result?.[0];
-      if (!user) return fail(`User not found: ${employee_id}`);
+      const callerUsername = _snCallerUsername();
+      const callerUser = callerUsername ? await _snResolveUser(sn, callerUsername) : null;
+      const targetUser = await _snResolveUser(sn, employee_id);
+      if (!targetUser) return fail(`User not found: ${employee_id}`);
 
-      // Default onboarding task list
+      // Creating a plan for someone else requires HR access
+      if (callerUser && callerUser.sys_id !== targetUser.sys_id) {
+        const isHr = await _snHasHrRole(sn, callerUser.sys_id);
+        if (!isHr) return fail(`Access denied: only HR can create onboarding plans for other employees.`);
+      }
+
       const DEFAULT_TASKS = [
-        // HR
-        { category: 'HR', name: 'Complete personal information form' },
-        { category: 'HR', name: 'Submit government ID and address proof' },
-        { category: 'HR', name: 'Sign employment contract and NDA' },
-        { category: 'HR', name: 'Enroll in health insurance and benefits' },
-        { category: 'HR', name: 'Set up direct deposit / payroll details' },
-        { category: 'HR', name: 'Complete emergency contact form' },
-        // IT
-        { category: 'IT', name: 'Receive and set up laptop / workstation' },
-        { category: 'IT', name: 'Activate corporate email account' },
-        { category: 'IT', name: 'Set up multi-factor authentication (MFA)' },
-        { category: 'IT', name: 'Join company Slack / Teams workspace' },
-        { category: 'IT', name: 'Request access to required systems and tools' },
-        { category: 'IT', name: 'Complete IT security orientation' },
-        // Facilities
+        { category: 'HR',         name: 'Complete personal information form' },
+        { category: 'HR',         name: 'Submit government ID and address proof' },
+        { category: 'HR',         name: 'Sign employment contract and NDA' },
+        { category: 'HR',         name: 'Enroll in health insurance and benefits' },
+        { category: 'HR',         name: 'Set up direct deposit / payroll details' },
+        { category: 'HR',         name: 'Complete emergency contact form' },
+        { category: 'IT',         name: 'Receive and set up laptop / workstation' },
+        { category: 'IT',         name: 'Activate corporate email account' },
+        { category: 'IT',         name: 'Set up multi-factor authentication (MFA)' },
+        { category: 'IT',         name: 'Join company Slack / Teams workspace' },
+        { category: 'IT',         name: 'Request access to required systems and tools' },
+        { category: 'IT',         name: 'Complete IT security orientation' },
         { category: 'Facilities', name: 'Collect building access card / badge' },
         { category: 'Facilities', name: 'Complete office safety and emergency training' },
         { category: 'Facilities', name: 'Set up desk / workstation' },
         { category: 'Facilities', name: 'Register vehicle for parking (if applicable)' },
-        // Learning
-        { category: 'Learning', name: 'Complete mandatory compliance training' },
-        { category: 'Learning', name: 'Complete data privacy and GDPR training' },
-        { category: 'Learning', name: 'Attend company culture and values session' },
-        { category: 'Learning', name: 'Meet with manager for 30-day goal setting' },
-        { category: 'Learning', name: 'Complete role-specific onboarding course' },
+        { category: 'Learning',   name: 'Complete mandatory compliance training' },
+        { category: 'Learning',   name: 'Complete data privacy and GDPR training' },
+        { category: 'Learning',   name: 'Attend company culture and values session' },
+        { category: 'Learning',   name: 'Meet with manager for 30-day goal setting' },
+        { category: 'Learning',   name: 'Complete role-specific onboarding course' },
       ];
 
       const allTasks = [...DEFAULT_TASKS, ...(custom_tasks ?? [])];
-
-      // Create onboarding case
-      const today = start_date ?? new Date().toISOString().split('T')[0];
-      const dueDate = new Date(today);
+      const today    = start_date ?? new Date().toISOString().split('T')[0];
+      const dueDate  = new Date(today);
       dueDate.setDate(dueDate.getDate() + 30);
 
-      const caseRecord = await sn.post('/api/now/table/sn_onboarding_case', {
-        short_description: `Onboarding - ${user.name}${role ? ` (${role})` : ''}`,
-        opened_for: user.sys_id,
-        user_name: user.email,
-        state: 'open',
-        due_date: dueDate.toISOString().split('T')[0],
+      const onbCase = await sn.post('sn_onboarding_case', {
+        short_description: `Onboarding - ${targetUser.name}${role ? ` (${role})` : ''}`,
+        opened_for: targetUser.sys_id,
+        user_name:  targetUser.email,
+        state:      'open',
+        due_date:   dueDate.toISOString().split('T')[0],
       });
-      const caseId = caseRecord.data?.result?.sys_id;
-      const caseNumber = caseRecord.data?.result?.number;
 
-      // Create checklist
-      const checklistRecord = await sn.post('/api/now/table/checklist', {
-        name: `Onboarding Checklist - ${user.name}`,
-        document: caseId,
-        table: 'sn_onboarding_case',
-        owner: user.sys_id,
+      const checklist = await sn.post('checklist', {
+        name:     `Onboarding Checklist - ${targetUser.name}`,
+        document: onbCase.sys_id,
+        table:    'sn_onboarding_case',
+        owner:    targetUser.sys_id,
       });
-      const checklistId = checklistRecord.data?.result?.sys_id;
 
-      // Create checklist items
       let order = 100;
       for (const task of allTasks) {
-        await sn.post('/api/now/table/checklist_item', {
-          checklist: checklistId,
-          name: `[${task.category}] ${task.name}`,
-          complete: false,
+        await sn.post('checklist_item', {
+          checklist: checklist.sys_id,
+          name:      `[${task.category}] ${task.name}`,
+          complete:  false,
           order,
         });
         order += 100;
@@ -7694,18 +7794,16 @@ Optionally pass custom_tasks to add role-specific items.`,
 
       return ok({
         success: true,
-        employee: user.name,
-        case_number: caseNumber,
-        case_id: caseId,
-        checklist_id: checklistId,
-        start_date: today,
-        due_date: dueDate.toISOString().split('T')[0],
+        employee:     targetUser.name,
+        case_number:  onbCase.number,
+        checklist_id: checklist.sys_id,
+        start_date:   today,
+        due_date:     dueDate.toISOString().split('T')[0],
         tasks_created: allTasks.length,
         by_category: ['HR', 'IT', 'Facilities', 'Learning'].map(cat => ({
-          category: cat,
-          count: allTasks.filter(t => t.category === cat).length,
+          category: cat, count: allTasks.filter(t => t.category === cat).length,
         })),
-        message: `Onboarding plan created for ${user.name} with ${allTasks.length} tasks. Due by ${dueDate.toISOString().split('T')[0]}.`,
+        message: `Onboarding plan created for ${targetUser.name} with ${allTasks.length} tasks. Due by ${dueDate.toISOString().split('T')[0]}.`,
       });
     } catch (e) { return fail(e.message); }
   }
