@@ -1,0 +1,19 @@
+services:
+  - type: web
+    name: servicenow-dev-mcp
+    runtime: docker
+    plan: starter
+    healthCheckPath: /health
+    envVars:
+      - key: MCP_MODE
+        value: http
+      - key: MCP_PORT
+        value: 3000
+      - key: NODE_ENV
+        value: production
+      - key: ADMIN_KEY
+        generateValue: true
+      - key: ALLOWED_KEYS
+        value: ""
+      - key: MCP_API_KEY
+        value: ""

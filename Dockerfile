@@ -13,7 +13,7 @@ USER node
 EXPOSE 3000
 
 ENV MCP_MODE=http
-ENV MCP_PORT=3000
+ENV MCP_PORT=${PORT:-3000}
 ENV NODE_ENV=production
 
 CMD ["node", "src/mcp-server.js"]
