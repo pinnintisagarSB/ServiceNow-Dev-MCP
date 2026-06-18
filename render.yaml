@@ -1,17 +1,59 @@
 services:
   - type: web
     name: servicenow-dev-mcp
-    runtime: docker
-    plan: starter
+    runtime: node
+    plan: free
+    buildCommand: npm install
+    startCommand: MCP_MODE=http node src/mcp-server.js
     healthCheckPath: /health
     envVars:
-      - key: MCP_MODE
-        value: http
-      - key: MCP_PORT
-        value: 3000
+      - key: NODE_VERSION
+        value: 22
       - key: NODE_ENV
         value: production
-      - key: ALLOWED_KEYS
-        value: ""
-      - key: MCP_API_KEY
-        value: ""
+      - key: MCP_MODE
+        value: http
+
+      # ── Required: credential encryption + Supabase ────────────────────────
+      - key: CREDENTIAL_ENCRYPTION_KEY
+        sync: false   # set manually in Render dashboard (64-char hex)
+
+      - key: SUPABASE_URL
+        sync: false
+
+      - key: SUPABASE_ANON_KEY
+        sync: false
+
+      # ── Optional: fallback env-based credentials ──────────────────────────
+      - key: SN_INSTANCE_URL
+        sync: false
+
+      - key: SN_USERNAME
+        sync: false
+
+      - key: SN_PASSWORD
+        sync: false
+
+      - key: JIRA_BASE_URL
+        sync: false
+
+      - key: JIRA_EMAIL
+        sync: false
+
+      - key: JIRA_API_TOKEN
+        sync: false
+
+      - key: SF_LOGIN_URL
+        sync: false
+
+      - key: SF_CLIENT_ID
+        sync: false
+
+      - key: SF_CLIENT_SECRET
+        sync: false
+
+      - key: SF_USERNAME
+        sync: false
+
+      - key: SF_PASSWORD
+        sync: false
