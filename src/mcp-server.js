@@ -7364,6 +7364,353 @@ employee before calling this tool. This creates a real record in ServiceNow.`,
   }
 );
 
+// ── Onboarding Task Guide ─────────────────────────────────────────────────
+// Tools: get_onboarding_summary, get_onboarding_tasks,
+//        get_next_onboarding_steps, complete_onboarding_task,
+//        create_onboarding_plan
+
+server.tool(
+  'get_onboarding_summary',
+  `Get a new hire's onboarding completion summary.
+
+Use this when someone asks "What's my onboarding status?" or "How far along am I?"
+Returns overall % complete, counts by category (HR / IT / Facilities / Learning),
+and the onboarding case details.`,
+  {
+    employee_id: z.string().optional().describe('Email or sys_id of the new hire. Omit for current user.'),
+  },
+  async ({ employee_id }) => {
+    try {
+      const sn = getSn();
+
+      // Resolve user
+      let userQuery = employee_id
+        ? `sysparm_query=email=${employee_id}^ORsys_id=${employee_id}`
+        : `sysparm_query=sys_id=${employee_id ?? ''}`;
+      const userRes = await sn.get(`/api/now/table/sys_user?${userQuery}&sysparm_fields=sys_id,name,email&sysparm_limit=1`);
+      const user = userRes.data?.result?.[0];
+      if (!user && employee_id) return fail(`User not found: ${employee_id}`);
+
+      // Find onboarding case
+      const caseQuery = user ? `opened_for=${user.sys_id}^ORuser_name=${user.email}` : '';
+      const caseRes = await sn.get(`/api/now/table/sn_onboarding_case?sysparm_query=${caseQuery}&sysparm_fields=sys_id,number,short_description,state,stage,opened_at,due_date&sysparm_limit=1&sysparm_orderby=opened_at`);
+      const onbCase = caseRes.data?.result?.[0];
+      if (!onbCase) return fail('No onboarding case found for this user.');
+
+      // Get checklist for this case
+      const clRes = await sn.get(`/api/now/table/checklist?sysparm_query=document=${onbCase.sys_id}^table=sn_onboarding_case&sysparm_fields=sys_id,name&sysparm_limit=1`);
+      const checklist = clRes.data?.result?.[0];
+      if (!checklist) return ok({ case: onbCase, message: 'No checklist found for this onboarding case.', completion: 0 });
+
+      // Get all items
+      const itemRes = await sn.get(`/api/now/table/checklist_item?sysparm_query=checklist=${checklist.sys_id}&sysparm_fields=name,complete,completed_by&sysparm_limit=200`);
+      const items = itemRes.data?.result ?? [];
+
+      const total = items.length;
+      const done  = items.filter(i => i.complete === 'true' || i.complete === true).length;
+      const pct   = total === 0 ? 0 : Math.round((done / total) * 100);
+
+      // Group by category (prefix in name: [HR], [IT], [Facilities], [Learning])
+      const categories = {};
+      for (const item of items) {
+        const match = item.name.match(/^\[([^\]]+)\]/);
+        const cat = match ? match[1] : 'General';
+        if (!categories[cat]) categories[cat] = { total: 0, done: 0 };
+        categories[cat].total++;
+        if (item.complete === 'true' || item.complete === true) categories[cat].done++;
+      }
+
+      return ok({
+        employee: user?.name,
+        case_number: onbCase.number,
+        state: onbCase.state,
+        stage: onbCase.stage,
+        opened: onbCase.opened_at,
+        due: onbCase.due_date,
+        completion_pct: pct,
+        tasks: { total, completed: done, pending: total - done },
+        by_category: Object.entries(categories).map(([cat, v]) => ({
+          category: cat,
+          completed: v.done,
+          total: v.total,
+          pct: Math.round((v.done / v.total) * 100),
+          status: v.done === v.total ? 'complete' : 'in_progress',
+        })),
+      });
+    } catch (e) { return fail(e.message); }
+  }
+);
+
+server.tool(
+  'get_onboarding_tasks',
+  `List onboarding tasks for a new hire, optionally filtered by category or status.
+
+Use this when someone asks "What do I still need to finish?" or
+"Show me my IT onboarding tasks." Returns each task with its status,
+who completed it, and its category.
+
+Categories: HR, IT, Facilities, Learning, General`,
+  {
+    employee_id: z.string().optional().describe('Email or sys_id of the new hire. Omit for current user.'),
+    category:    z.enum(['HR', 'IT', 'Facilities', 'Learning', 'General', 'all']).optional().default('all'),
+    status:      z.enum(['all', 'pending', 'completed']).optional().default('all'),
+  },
+  async ({ employee_id, category, status }) => {
+    try {
+      const sn = getSn();
+
+      const userRes = await sn.get(`/api/now/table/sys_user?sysparm_query=email=${employee_id ?? ''}^ORsys_id=${employee_id ?? ''}&sysparm_fields=sys_id,name&sysparm_limit=1`);
+      const user = userRes.data?.result?.[0];
+      if (!user && employee_id) return fail(`User not found: ${employee_id}`);
+
+      const caseRes = await sn.get(`/api/now/table/sn_onboarding_case?sysparm_query=${user ? `opened_for=${user.sys_id}` : ''}&sysparm_fields=sys_id,number&sysparm_limit=1`);
+      const onbCase = caseRes.data?.result?.[0];
+      if (!onbCase) return fail('No onboarding case found.');
+
+      const clRes = await sn.get(`/api/now/table/checklist?sysparm_query=document=${onbCase.sys_id}^table=sn_onboarding_case&sysparm_fields=sys_id&sysparm_limit=1`);
+      const checklist = clRes.data?.result?.[0];
+      if (!checklist) return fail('No checklist found for this onboarding case.');
+
+      const itemRes = await sn.get(`/api/now/table/checklist_item?sysparm_query=checklist=${checklist.sys_id}&sysparm_fields=sys_id,name,complete,completed,completed_by&sysparm_limit=200&sysparm_orderby=order`);
+      let items = itemRes.data?.result ?? [];
+
+      // Filter by category
+      if (category && category !== 'all') {
+        items = items.filter(i => i.name.startsWith(`[${category}]`));
+      }
+
+      // Filter by status
+      if (status === 'pending') {
+        items = items.filter(i => i.complete !== 'true' && i.complete !== true);
+      } else if (status === 'completed') {
+        items = items.filter(i => i.complete === 'true' || i.complete === true);
+      }
+
+      return ok({
+        case_number: onbCase.number,
+        filter: { category, status },
+        count: items.length,
+        tasks: items.map(i => {
+          const match = i.name.match(/^\[([^\]]+)\]\s*/);
+          return {
+            id: i.sys_id,
+            category: match ? match[1] : 'General',
+            name: i.name.replace(/^\[[^\]]+\]\s*/, ''),
+            complete: i.complete === 'true' || i.complete === true,
+            completed_on: i.completed || null,
+            completed_by: i.completed_by || null,
+          };
+        }),
+      });
+    } catch (e) { return fail(e.message); }
+  }
+);
+
+server.tool(
+  'get_next_onboarding_steps',
+  `Get the next pending onboarding tasks a new hire should complete.
+
+Use this when someone asks "What should I do next?" — returns the top
+pending tasks in priority order across all categories, with actionable
+instructions for each step.`,
+  {
+    employee_id: z.string().optional().describe('Email or sys_id of the new hire. Omit for current user.'),
+    limit: z.number().optional().default(5).describe('Number of next steps to return (default 5)'),
+  },
+  async ({ employee_id, limit }) => {
+    try {
+      const sn = getSn();
+
+      const userRes = await sn.get(`/api/now/table/sys_user?sysparm_query=email=${employee_id ?? ''}^ORsys_id=${employee_id ?? ''}&sysparm_fields=sys_id,name&sysparm_limit=1`);
+      const user = userRes.data?.result?.[0];
+      if (!user && employee_id) return fail(`User not found: ${employee_id}`);
+
+      const caseRes = await sn.get(`/api/now/table/sn_onboarding_case?sysparm_query=${user ? `opened_for=${user.sys_id}` : ''}&sysparm_fields=sys_id,number,due_date&sysparm_limit=1`);
+      const onbCase = caseRes.data?.result?.[0];
+      if (!onbCase) return fail('No onboarding case found.');
+
+      const clRes = await sn.get(`/api/now/table/checklist?sysparm_query=document=${onbCase.sys_id}^table=sn_onboarding_case&sysparm_fields=sys_id&sysparm_limit=1`);
+      const checklist = clRes.data?.result?.[0];
+      if (!checklist) return fail('No checklist found.');
+
+      const itemRes = await sn.get(`/api/now/table/checklist_item?sysparm_query=checklist=${checklist.sys_id}^complete=false&sysparm_fields=sys_id,name,order&sysparm_limit=${limit}&sysparm_orderby=order`);
+      const pending = itemRes.data?.result ?? [];
+
+      // Priority order: HR first, then IT, Facilities, Learning, General
+      const priority = { HR: 1, IT: 2, Facilities: 3, Learning: 4, General: 5 };
+      pending.sort((a, b) => {
+        const catA = (a.name.match(/^\[([^\]]+)\]/) ?? [])[1] ?? 'General';
+        const catB = (b.name.match(/^\[([^\]]+)\]/) ?? [])[1] ?? 'General';
+        return (priority[catA] ?? 5) - (priority[catB] ?? 5);
+      });
+
+      return ok({
+        employee: user?.name,
+        case_number: onbCase.number,
+        due_date: onbCase.due_date,
+        next_steps: pending.slice(0, limit).map((i, idx) => {
+          const match = i.name.match(/^\[([^\]]+)\]\s*/);
+          return {
+            step: idx + 1,
+            id: i.sys_id,
+            category: match ? match[1] : 'General',
+            task: i.name.replace(/^\[[^\]]+\]\s*/, ''),
+          };
+        }),
+        message: pending.length === 0
+          ? 'All onboarding tasks are complete!'
+          : `${pending.length} task(s) remaining. Showing the next ${Math.min(limit, pending.length)}.`,
+      });
+    } catch (e) { return fail(e.message); }
+  }
+);
+
+server.tool(
+  'complete_onboarding_task',
+  `Mark an onboarding task as complete.
+
+Use this when a new hire confirms they have finished a task.
+Get the task ID from get_onboarding_tasks or get_next_onboarding_steps.`,
+  {
+    task_id:     z.string().describe('sys_id of the checklist_item to mark complete'),
+    employee_id: z.string().optional().describe('Email or sys_id — used to verify task belongs to this user'),
+  },
+  async ({ task_id, employee_id }) => {
+    try {
+      const sn = getSn();
+
+      const now = new Date().toISOString().replace('T', ' ').split('.')[0];
+      await sn.patch(`/api/now/table/checklist_item/${task_id}`, {
+        complete: true, completed: now,
+      });
+
+      // Fetch updated item for confirmation
+      const res = await sn.get(`/api/now/table/checklist_item/${task_id}?sysparm_fields=name,complete,completed`);
+      const item = res.data?.result;
+
+      return ok({
+        success: true,
+        task: item?.name?.replace(/^\[[^\]]+\]\s*/, ''),
+        category: (item?.name?.match(/^\[([^\]]+)\]/) ?? [])[1] ?? 'General',
+        completed_on: item?.completed,
+        message: `Task marked complete. Well done!`,
+      });
+    } catch (e) { return fail(e.message); }
+  }
+);
+
+server.tool(
+  'create_onboarding_plan',
+  `Create a full onboarding case and task checklist for a new hire.
+
+Admin tool — use this when onboarding a new employee. Creates:
+- An onboarding case in ServiceNow
+- A checklist with tasks across HR, IT, Facilities, and Learning
+
+Optionally pass custom_tasks to add role-specific items.`,
+  {
+    employee_id:  z.string().describe('Email or sys_id of the new hire'),
+    start_date:   z.string().optional().describe('Start date YYYY-MM-DD. Defaults to today.'),
+    role:         z.string().optional().describe('Job role — used to customise task list (e.g. "Software Engineer", "Sales")'),
+    custom_tasks: z.array(z.object({
+      category: z.enum(['HR', 'IT', 'Facilities', 'Learning', 'General']),
+      name:     z.string(),
+    })).optional().describe('Additional role-specific tasks to add'),
+  },
+  async ({ employee_id, start_date, role, custom_tasks }) => {
+    try {
+      const sn = getSn();
+
+      const userRes = await sn.get(`/api/now/table/sys_user?sysparm_query=email=${employee_id}^ORsys_id=${employee_id}&sysparm_fields=sys_id,name,email&sysparm_limit=1`);
+      const user = userRes.data?.result?.[0];
+      if (!user) return fail(`User not found: ${employee_id}`);
+
+      // Default onboarding task list
+      const DEFAULT_TASKS = [
+        // HR
+        { category: 'HR', name: 'Complete personal information form' },
+        { category: 'HR', name: 'Submit government ID and address proof' },
+        { category: 'HR', name: 'Sign employment contract and NDA' },
+        { category: 'HR', name: 'Enroll in health insurance and benefits' },
+        { category: 'HR', name: 'Set up direct deposit / payroll details' },
+        { category: 'HR', name: 'Complete emergency contact form' },
+        // IT
+        { category: 'IT', name: 'Receive and set up laptop / workstation' },
+        { category: 'IT', name: 'Activate corporate email account' },
+        { category: 'IT', name: 'Set up multi-factor authentication (MFA)' },
+        { category: 'IT', name: 'Join company Slack / Teams workspace' },
+        { category: 'IT', name: 'Request access to required systems and tools' },
+        { category: 'IT', name: 'Complete IT security orientation' },
+        // Facilities
+        { category: 'Facilities', name: 'Collect building access card / badge' },
+        { category: 'Facilities', name: 'Complete office safety and emergency training' },
+        { category: 'Facilities', name: 'Set up desk / workstation' },
+        { category: 'Facilities', name: 'Register vehicle for parking (if applicable)' },
+        // Learning
+        { category: 'Learning', name: 'Complete mandatory compliance training' },
+        { category: 'Learning', name: 'Complete data privacy and GDPR training' },
+        { category: 'Learning', name: 'Attend company culture and values session' },
+        { category: 'Learning', name: 'Meet with manager for 30-day goal setting' },
+        { category: 'Learning', name: 'Complete role-specific onboarding course' },
+      ];
+
+      const allTasks = [...DEFAULT_TASKS, ...(custom_tasks ?? [])];
+
+      // Create onboarding case
+      const today = start_date ?? new Date().toISOString().split('T')[0];
+      const dueDate = new Date(today);
+      dueDate.setDate(dueDate.getDate() + 30);
+
+      const caseRecord = await sn.post('/api/now/table/sn_onboarding_case', {
+        short_description: `Onboarding - ${user.name}${role ? ` (${role})` : ''}`,
+        opened_for: user.sys_id,
+        user_name: user.email,
+        state: 'open',
+        due_date: dueDate.toISOString().split('T')[0],
+      });
+      const caseId = caseRecord.data?.result?.sys_id;
+      const caseNumber = caseRecord.data?.result?.number;
+
+      // Create checklist
+      const checklistRecord = await sn.post('/api/now/table/checklist', {
+        name: `Onboarding Checklist - ${user.name}`,
+        document: caseId,
+        table: 'sn_onboarding_case',
+        owner: user.sys_id,
+      });
+      const checklistId = checklistRecord.data?.result?.sys_id;
+
+      // Create checklist items
+      let order = 100;
+      for (const task of allTasks) {
+        await sn.post('/api/now/table/checklist_item', {
+          checklist: checklistId,
+          name: `[${task.category}] ${task.name}`,
+          complete: false,
+          order,
+        });
+        order += 100;
+      }
+
+      return ok({
+        success: true,
+        employee: user.name,
+        case_number: caseNumber,
+        case_id: caseId,
+        checklist_id: checklistId,
+        start_date: today,
+        due_date: dueDate.toISOString().split('T')[0],
+        tasks_created: allTasks.length,
+        by_category: ['HR', 'IT', 'Facilities', 'Learning'].map(cat => ({
+          category: cat,
+          count: allTasks.filter(t => t.category === cat).length,
+        })),
+        message: `Onboarding plan created for ${user.name} with ${allTasks.length} tasks. Due by ${dueDate.toISOString().split('T')[0]}.`,
+      });
+    } catch (e) { return fail(e.message); }
+  }
+);
+
 } // end registerTools
 
 // ── Start: stdio (CLI) or HTTP/SSE (web Claude Code / remote) ────────────
