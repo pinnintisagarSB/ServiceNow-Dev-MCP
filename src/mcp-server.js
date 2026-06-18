@@ -202,13 +202,14 @@ async function _requireSn() {
   // Load from Supabase / session memory / env vars
   const stored = await _loadPlatformCreds('servicenow');
   if (stored) {
-    // Inject into session so getSn() picks them up
-    _getSession().creds.servicenow = {
-      instanceUrl: stored.instance_url,
-      username:    stored.username,
-      password:    stored.password,
-    };
-    _getSession().connectors.sn = null; // force re-init with new creds
+    // Normalize: Supabase returns snake_case, session memory returns camelCase
+    const instanceUrl = stored.instance_url ?? stored.instanceUrl;
+    const sess = _getSession();
+    // Only overwrite + force re-init if credentials differ from what's already in session
+    if (sess.creds.servicenow?.instanceUrl !== instanceUrl) {
+      sess.creds.servicenow = { instanceUrl, username: stored.username, password: stored.password };
+      sess.connectors.sn = null;
+    }
   }
   const hasEnv = !!(process.env.SN_INSTANCE_URL && (process.env.SN_USERNAME || process.env.SN_USE_SDK_AUTH === 'true'));
   if (!stored && !_sessionCreds.servicenow && !hasEnv) {
@@ -233,12 +234,13 @@ async function _requireSn() {
 async function _requireJira() {
   const stored = await _loadPlatformCreds('jira');
   if (stored) {
-    _getSession().creds.jira = {
-      baseUrl:  stored.base_url,
-      email:    stored.email,
-      apiToken: stored.api_token,
-    };
-    _getSession().connectors.jira = null;
+    const baseUrl = stored.base_url ?? stored.baseUrl;
+    const apiToken = stored.api_token ?? stored.apiToken;
+    const sess = _getSession();
+    if (sess.creds.jira?.baseUrl !== baseUrl) {
+      sess.creds.jira = { baseUrl, email: stored.email, apiToken };
+      sess.connectors.jira = null;
+    }
   }
   const hasEnv = !!(process.env.JIRA_BASE_URL && process.env.JIRA_EMAIL && process.env.JIRA_API_TOKEN);
   if (!stored && !_sessionCreds.jira && !hasEnv) {
@@ -262,15 +264,15 @@ async function _requireJira() {
 async function _requireSf() {
   const stored = await _loadPlatformCreds('salesforce');
   if (stored) {
-    _getSession().creds.salesforce = {
-      loginUrl:      stored.login_url ?? 'https://login.salesforce.com',
-      clientId:      stored.client_id,
-      clientSecret:  stored.client_secret,
-      username:      stored.username,
-      password:      stored.password,
-      securityToken: stored.security_token ?? '',
-    };
-    _getSession().connectors.sf = null;
+    const loginUrl     = stored.login_url     ?? stored.loginUrl     ?? 'https://login.salesforce.com';
+    const clientId     = stored.client_id     ?? stored.clientId;
+    const clientSecret = stored.client_secret ?? stored.clientSecret;
+    const securityToken = stored.security_token ?? stored.securityToken ?? '';
+    const sess = _getSession();
+    if (sess.creds.salesforce?.clientId !== clientId) {
+      sess.creds.salesforce = { loginUrl, clientId, clientSecret, username: stored.username, password: stored.password, securityToken };
+      sess.connectors.sf = null;
+    }
   }
   const hasEnv = !!(process.env.SF_CLIENT_ID && process.env.SF_USERNAME);
   if (!stored && !_sessionCreds.salesforce && !hasEnv) {
