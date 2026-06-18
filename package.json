@@ -1,9 +1,12 @@
 {
   "name": "servicenow-dev-mcp",
-  "version": "2.0.0",
-  "description": "ServiceNow Developer MCP — AI-powered developer toolkit for Claude Code (90 tools: script generation, code review, portal, catalog, notifications, migration, integrations, and more)",
+  "version": "2.1.0",
+  "description": "ServiceNow Developer MCP — AI-powered toolkit for Claude (116 tools: script generation, code review, portal, catalog, notifications, migration, integrations, and more)",
   "type": "module",
   "main": "src/mcp-server.js",
+  "engines": {
+    "node": ">=22"
+  },
   "scripts": {
     "start": "node src/mcp-server.js",
     "start:http": "MCP_MODE=http node src/mcp-server.js",

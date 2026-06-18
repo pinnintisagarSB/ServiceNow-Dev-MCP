@@ -7,6 +7,9 @@ RUN npm ci --omit=optional
 
 COPY src ./src
 
+# Run as non-root for security
+USER node
+
 EXPOSE 3000
 
 ENV MCP_MODE=http

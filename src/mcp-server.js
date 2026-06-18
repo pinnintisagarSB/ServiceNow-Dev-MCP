@@ -6865,11 +6865,12 @@ if (process.env.MCP_MODE === 'http') {
   const app     = express();
   const port    = parseInt(process.env.MCP_PORT ?? '3000', 10);
   const clients = new Map();
-  const apiKey  = process.env.MCP_API_KEY; // optional — set to protect the endpoint
+  const apiKey  = process.env.MCP_API_KEY;
 
-  app.use(express.json());
+  // ── Body size limit — prevents DoS via oversized payloads ─────────────────
+  app.use(express.json({ limit: '1mb' }));
 
-  // CORS — required for Claude.ai web connector (browser sends preflight OPTIONS)
+  // ── CORS — required for Claude.ai web connector (browser sends OPTIONS) ───
   app.use((req, res, next) => {
     res.setHeader('Access-Control-Allow-Origin', '*');
     res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
@@ -6878,49 +6879,116 @@ if (process.env.MCP_MODE === 'http') {
     next();
   });
 
-  // Optional API key guard — skip if MCP_API_KEY is not set
+  // ── Rate limiter — sliding window per IP (no extra deps) ──────────────────
+  const _rateLimits = new Map();
+  function isRateLimited(ip, { maxReqs = 60, windowMs = 60_000 } = {}) {
+    const now   = Date.now();
+    const times = (_rateLimits.get(ip) ?? []).filter(t => now - t < windowMs);
+    if (times.length >= maxReqs) return true;
+    times.push(now);
+    _rateLimits.set(ip, times);
+    return false;
+  }
+  // Prune stale entries every 5 min to avoid unbounded memory growth
+  setInterval(() => {
+    const cutoff = Date.now() - 60_000;
+    for (const [ip, times] of _rateLimits) {
+      const pruned = times.filter(t => t > cutoff);
+      if (pruned.length === 0) _rateLimits.delete(ip);
+      else _rateLimits.set(ip, pruned);
+    }
+  }, 5 * 60_000).unref();
+
+  function rateLimit(maxReqs) {
+    return (req, res, next) => {
+      const ip = req.ip ?? req.socket.remoteAddress ?? 'unknown';
+      if (isRateLimited(ip, { maxReqs })) {
+        res.status(429).json({ error: 'Too many requests — please slow down' });
+        return;
+      }
+      next();
+    };
+  }
+
+  // ── API key guard — skip if MCP_API_KEY is not set ─────────────────────────
   function checkApiKey(req, res, next) {
     if (!apiKey) { next(); return; }
-    const auth = req.headers['authorization'];
-    if (auth === `Bearer ${apiKey}`) { next(); return; }
+    if (req.headers['authorization'] === `Bearer ${apiKey}`) { next(); return; }
     res.status(401).json({ error: 'Unauthorized' });
   }
 
-  // Health check — no auth required
-  app.get('/health', (_req, res) => res.json({ status: 'ok', server: 'sn-data-migration', tools: 116 }));
+  // ── Health — no auth, reports live tool count ──────────────────────────────
+  const toolCount = server._registeredTools ? Object.keys(server._registeredTools).length : 116;
+  app.get('/health', (_req, res) =>
+    res.json({ status: 'ok', server: 'sn-data-migration', tools: toolCount, sessions: clients.size })
+  );
 
-  // SSE endpoint — Claude.ai web connects here
-  app.get('/sse', checkApiKey, async (req, res) => {
+  // ── SSE endpoint — Claude.ai web connects here ────────────────────────────
+  // Rate-limited to 10 new connections/min per IP to prevent session flooding
+  app.get('/sse', rateLimit(10), checkApiKey, async (req, res) => {
     const transport = new SSEServerTransport('/messages', res);
     clients.set(transport.sessionId, transport);
+
+    // Heartbeat comment every 30 s — keeps connection alive through nginx/Cloudflare
+    const heartbeat = setInterval(() => {
+      if (!res.writableEnded) res.write(': heartbeat\n\n');
+      else clearInterval(heartbeat);
+    }, 30_000);
+
     res.on('close', () => {
+      clearInterval(heartbeat);
       clients.delete(transport.sessionId);
-      _sessions.delete(transport.sessionId);   // free per-session credential memory
+      _sessions.delete(transport.sessionId);
       logger.info(`SSE client disconnected (session: ${transport.sessionId})`);
     });
+
     await server.connect(transport);
     logger.info(`SSE client connected (session: ${transport.sessionId})`);
   });
 
-  // Message endpoint — receives tool calls from the client.
-  // Each request runs inside its sessionId context so tool handlers get
-  // the right credentials without any changes to their own code.
-  app.post('/messages', checkApiKey, async (req, res) => {
+  // ── Messages — tool calls from the client ─────────────────────────────────
+  app.post('/messages', rateLimit(300), checkApiKey, async (req, res) => {
     const sessionId = req.query.sessionId;
     const transport = clients.get(sessionId);
     if (!transport) { res.status(404).json({ error: 'Session not found' }); return; }
     await _sessionContext.run(sessionId, () => transport.handlePostMessage(req, res));
   });
 
-  app.listen(port, () => {
+  // ── Graceful shutdown ──────────────────────────────────────────────────────
+  const httpServer = app.listen(port, () => {
     logger.info(`sn-data-migration MCP server running in HTTP/SSE mode on port ${port}`);
     logger.info(`  SSE:     http://localhost:${port}/sse`);
     logger.info(`  Health:  http://localhost:${port}/health`);
     logger.info(`  Auth:    ${apiKey ? 'Bearer token enabled' : 'open (set MCP_API_KEY to protect)'}`);
   });
+
+  function shutdown(signal) {
+    logger.info(`${signal} received — draining ${clients.size} session(s) then exiting`);
+    httpServer.close(() => {
+      logger.info('HTTP server closed — exiting');
+      process.exit(0);
+    });
+    // Force exit after 15 s if connections haven't drained
+    setTimeout(() => { logger.warn('Forced exit after timeout'); process.exit(1); }, 15_000).unref();
+  }
+
+  process.on('SIGTERM', () => shutdown('SIGTERM'));
+  process.on('SIGINT',  () => shutdown('SIGINT'));
+
 } else {
   // Default: stdio for Claude Code CLI
   const transport = new StdioServerTransport();
   await server.connect(transport);
   logger.info('sn-data-migration MCP server running (stdio)');
 }
+
+// ── Process-level safety net — log and survive unhandled rejections ──────────
+// An error in one tool call must not take down the entire server.
+process.on('unhandledRejection', (reason) => {
+  logger.error(`Unhandled rejection: ${reason instanceof Error ? reason.stack : String(reason)}`);
+});
+process.on('uncaughtException', (err) => {
+  logger.error(`Uncaught exception: ${err.stack}`);
+  // Exit for truly unrecoverable errors so the container restarts cleanly
+  process.exit(1);
+});
