@@ -415,6 +415,25 @@
 
   .step-text strong { color: var(--text-primary); font-weight: 500; }
 
+  .tab-btn {
+    padding: 5px 12px;
+    font-size: 12px;
+    font-weight: 500;
+    border: 1px solid var(--border-md);
+    border-radius: var(--r-sm);
+    background: var(--surface);
+    color: var(--text-secondary);
+    cursor: pointer;
+    font-family: inherit;
+    transition: all 0.12s;
+  }
+  .tab-btn:hover { color: var(--text-primary); }
+  .tab-btn.active {
+    background: var(--accent);
+    border-color: var(--accent);
+    color: #fff;
+  }
+
   .footer {
     text-align: center;
     margin-top: 20px;
@@ -462,7 +481,7 @@
       </div>
 
       <div class="section-title">Get your access token</div>
-      <p class="section-sub">Generate a personal token to connect this server to Claude.ai. Your ServiceNow, Jira, and Salesforce credentials are entered securely in the conversation — never stored.</p>
+      <p class="section-sub">Generate a personal token, then enter your ServiceNow / Jira / Salesforce credentials securely below. Credentials are AES-256 encrypted and never visible to Claude.</p>
 
       <div class="form-group">
         <label for="nameInput">Your name</label>
@@ -518,7 +537,7 @@
           </div>
           <div class="step-item">
             <div class="step-num">3</div>
-            <div class="step-text">Click <strong>Save</strong> — Claude will prompt for your <strong>ServiceNow, Jira, or Salesforce</strong> credentials on first use</div>
+            <div class="step-text">Click <strong>Save</strong> — then scroll down to <strong>Configure Credentials</strong> to enter your platform credentials securely</div>
           </div>
         </div>
 
@@ -529,6 +548,114 @@
       </div>
     </div>
 
+  </div>
+
+  <!-- ── Credential configuration card ─────────────────────────────────── -->
+  <div class="card" id="credCard" style="margin-top:16px">
+    <div class="card-body">
+      <div class="section-title" style="display:flex;align-items:center;gap:8px">
+        <i class="ti ti-lock" style="font-size:15px;color:var(--accent)"></i>
+        Configure Credentials
+      </div>
+      <p class="section-sub" style="margin-top:6px">
+        Enter your platform credentials here — they are <strong>AES-256-GCM encrypted</strong>
+        and stored server-side. Claude never sees your passwords or tokens.
+      </p>
+
+      <div class="form-group" style="margin-top:16px">
+        <label for="credToken">Your MCP token</label>
+        <input type="password" id="credToken" placeholder="sn-mcp-…" autocomplete="off"/>
+        <div style="font-size:11px;color:var(--text-tertiary);margin-top:4px">The token you received above</div>
+      </div>
+
+      <!-- Platform tabs -->
+      <div style="display:flex;gap:6px;margin:16px 0 12px">
+        <button class="tab-btn active" data-tab="servicenow" onclick="switchTab('servicenow',this)">ServiceNow</button>
+        <button class="tab-btn" data-tab="jira" onclick="switchTab('jira',this)">Jira</button>
+        <button class="tab-btn" data-tab="salesforce" onclick="switchTab('salesforce',this)">Salesforce</button>
+      </div>
+
+      <!-- ServiceNow -->
+      <div class="tab-panel" id="tab-servicenow">
+        <div class="form-group">
+          <label>Instance URL</label>
+          <input type="url" id="sn-instance_url" placeholder="https://yourcompany.service-now.com" autocomplete="off"/>
+        </div>
+        <div class="form-group">
+          <label>Username</label>
+          <input type="text" id="sn-username" placeholder="admin" autocomplete="off"/>
+        </div>
+        <div class="form-group">
+          <label>Password</label>
+          <input type="password" id="sn-password" placeholder="••••••••" autocomplete="new-password"/>
+        </div>
+      </div>
+
+      <!-- Jira -->
+      <div class="tab-panel" id="tab-jira" style="display:none">
+        <div class="form-group">
+          <label>Base URL</label>
+          <input type="url" id="jira-base_url" placeholder="https://yourcompany.atlassian.net" autocomplete="off"/>
+        </div>
+        <div class="form-group">
+          <label>Email</label>
+          <input type="email" id="jira-email" placeholder="you@company.com" autocomplete="off"/>
+        </div>
+        <div class="form-group">
+          <label>API Token</label>
+          <input type="password" id="jira-api_token" placeholder="••••••••" autocomplete="new-password"/>
+          <div style="font-size:11px;color:var(--text-tertiary);margin-top:4px">Generate at id.atlassian.com → Security → API tokens</div>
+        </div>
+      </div>
+
+      <!-- Salesforce -->
+      <div class="tab-panel" id="tab-salesforce" style="display:none">
+        <div class="form-group">
+          <label>Login URL</label>
+          <input type="url" id="sf-login_url" placeholder="https://login.salesforce.com" value="https://login.salesforce.com" autocomplete="off"/>
+          <div style="font-size:11px;color:var(--text-tertiary);margin-top:4px">Use https://test.salesforce.com for sandboxes</div>
+        </div>
+        <div class="form-group">
+          <label>Client ID</label>
+          <input type="text" id="sf-client_id" placeholder="Connected App consumer key" autocomplete="off"/>
+        </div>
+        <div class="form-group">
+          <label>Client Secret</label>
+          <input type="password" id="sf-client_secret" placeholder="••••••••" autocomplete="new-password"/>
+        </div>
+        <div class="form-group">
+          <label>Username</label>
+          <input type="email" id="sf-username" placeholder="you@company.com" autocomplete="off"/>
+        </div>
+        <div class="form-group">
+          <label>Password</label>
+          <input type="password" id="sf-password" placeholder="••••••••" autocomplete="new-password"/>
+        </div>
+        <div class="form-group">
+          <label>Security Token <span style="font-weight:400;opacity:0.7">(optional)</span></label>
+          <input type="password" id="sf-security_token" placeholder="Leave blank if IP is allowlisted" autocomplete="new-password"/>
+        </div>
+      </div>
+
+      <div style="display:flex;gap:8px;margin-top:4px;align-items:center">
+        <button class="btn-primary" id="saveCredBtn" onclick="saveCredentials()" style="flex:1">
+          <i class="ti ti-lock" style="font-size:14px" aria-hidden="true"></i>
+          Save credentials securely
+        </button>
+        <button class="btn-secondary" id="checkStatusBtn" onclick="checkCredStatus()" title="Check which platforms are configured">
+          <i class="ti ti-refresh" style="font-size:13px" aria-hidden="true"></i>
+        </button>
+      </div>
+
+      <div class="error-box" id="credErrorMsg"></div>
+      <div id="credSuccess" style="display:none;margin-top:12px;padding:12px 14px;background:var(--success-bg);border:1px solid var(--success-border);border-radius:var(--r-sm);font-size:13px;color:var(--success)"></div>
+
+      <!-- Status badges -->
+      <div id="credStatus" style="display:none;margin-top:14px">
+        <div style="font-size:10px;font-weight:600;text-transform:uppercase;letter-spacing:0.08em;color:var(--text-tertiary);margin-bottom:8px">Configured platforms</div>
+        <div style="display:flex;gap:6px;flex-wrap:wrap" id="credStatusBadges"></div>
+      </div>
+    </div>
   </div>
 
   <div class="footer">
@@ -607,6 +734,148 @@
   const style = document.createElement('style');
   style.textContent = '@keyframes spin { to { transform: rotate(360deg); } }';
   document.head.appendChild(style);
+
+  // ── Credential configuration ─────────────────────────────────────────────
+
+  let _activeTab = 'servicenow';
+
+  function switchTab(tab, btn) {
+    _activeTab = tab;
+    document.querySelectorAll('.tab-panel').forEach(p => p.style.display = 'none');
+    document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
+    document.getElementById('tab-' + tab).style.display = 'block';
+    btn.classList.add('active');
+  }
+
+  // After token is generated, pre-fill it into the credential section
+  const _origShowResult = window.showResult;
+  function afterRegister(token) {
+    document.getElementById('credToken').value = token;
+    document.getElementById('credCard').scrollIntoView({ behavior: 'smooth', block: 'start' });
+  }
+
+  // Patch register() to pre-fill token
+  const _origFetch = window.fetch;
+  const _origRegister = register;
+  function register() {
+    const name     = document.getElementById('nameInput').value.trim();
+    const adminKey = document.getElementById('adminKeyInput').value.trim();
+    const btn      = document.getElementById('registerBtn');
+    const errEl    = document.getElementById('errorMsg');
+
+    if (!name) { showError('Please enter your name.'); return; }
+
+    btn.disabled = true;
+    btn.innerHTML = '<i class="ti ti-loader-2" style="font-size:14px;animation:spin 0.8s linear infinite" aria-hidden="true"></i> Generating…';
+    errEl.classList.remove('show');
+
+    const headers = { 'Content-Type': 'application/json' };
+    if (adminKey) headers['Authorization'] = 'Bearer ' + adminKey;
+
+    fetch('/register', { method: 'POST', headers, body: JSON.stringify({ name }) })
+      .then(r => r.json().then(d => ({ ok: r.ok, data: d })))
+      .then(({ ok, data }) => {
+        if (!ok) { showError(data.error || 'Registration failed.'); return; }
+        document.getElementById('resultName').textContent = data.name;
+        document.getElementById('connectorUrl').textContent = data.sse_url + '?token=' + data.token;
+        document.getElementById('formView').style.display  = 'none';
+        document.getElementById('resultView').classList.add('show');
+        // Pre-fill credential section
+        afterRegister(data.token);
+      })
+      .catch(() => showError('Network error — is the server reachable?'))
+      .finally(() => {
+        btn.disabled = false;
+        btn.innerHTML = 'Generate token <i class="ti ti-arrow-right" style="font-size:14px" aria-hidden="true"></i>';
+      });
+  }
+
+  function saveCredentials() {
+    const token    = document.getElementById('credToken').value.trim();
+    const platform = _activeTab;
+    const btn      = document.getElementById('saveCredBtn');
+    const errEl    = document.getElementById('credErrorMsg');
+    const succEl   = document.getElementById('credSuccess');
+
+    errEl.classList.remove('show');
+    succEl.style.display = 'none';
+
+    if (!token) { showCredError('Please enter your MCP token above.'); return; }
+
+    // Collect fields for active platform
+    const fields = {
+      servicenow: ['instance_url','username','password'],
+      jira:       ['base_url','email','api_token'],
+      salesforce: ['login_url','client_id','client_secret','username','password','security_token'],
+    }[platform];
+
+    const prefix = platform === 'servicenow' ? 'sn' : platform === 'jira' ? 'jira' : 'sf';
+    const credentials = {};
+    for (const f of fields) {
+      credentials[f] = document.getElementById(prefix + '-' + f)?.value.trim() ?? '';
+    }
+
+    const required = {
+      servicenow: ['instance_url','username','password'],
+      jira:       ['base_url','email','api_token'],
+      salesforce: ['login_url','client_id','client_secret','username','password'],
+    }[platform];
+
+    const missing = required.filter(f => !credentials[f]);
+    if (missing.length) {
+      showCredError('Please fill in: ' + missing.map(f => f.replace(/_/g,' ')).join(', '));
+      return;
+    }
+
+    btn.disabled = true;
+    btn.innerHTML = '<i class="ti ti-loader-2" style="font-size:14px;animation:spin 0.8s linear infinite"></i> Saving…';
+
+    fetch('/configure-credentials', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + token },
+      body: JSON.stringify({ platform, credentials }),
+    })
+      .then(r => r.json().then(d => ({ ok: r.ok, data: d })))
+      .then(({ ok, data }) => {
+        if (!ok) { showCredError(data.error || 'Save failed.'); return; }
+        succEl.innerHTML = '<i class="ti ti-lock-check" style="font-size:14px;vertical-align:-2px"></i> '
+          + (platform.charAt(0).toUpperCase() + platform.slice(1))
+          + ' credentials saved and encrypted. Start a new Claude conversation to use them.';
+        succEl.style.display = 'block';
+        checkCredStatus();
+      })
+      .catch(() => showCredError('Network error.'))
+      .finally(() => {
+        btn.disabled = false;
+        btn.innerHTML = '<i class="ti ti-lock" style="font-size:14px"></i> Save credentials securely';
+      });
+  }
+
+  function checkCredStatus() {
+    const token = document.getElementById('credToken').value.trim();
+    if (!token) return;
+
+    fetch('/credential-status', { headers: { 'Authorization': 'Bearer ' + token } })
+      .then(r => r.json())
+      .then(data => {
+        const el = document.getElementById('credStatus');
+        const badges = document.getElementById('credStatusBadges');
+        el.style.display = 'block';
+        badges.innerHTML = Object.entries(data.configured).map(([p, on]) =>
+          `<span style="display:inline-flex;align-items:center;gap:5px;padding:4px 10px;font-size:12px;font-weight:500;border-radius:20px;border:1px solid ${on ? 'var(--success-border)' : 'var(--border-md)'};background:${on ? 'var(--success-bg)' : 'var(--bg)'};color:${on ? 'var(--success)' : 'var(--text-tertiary)'}">
+            <span style="width:6px;height:6px;border-radius:50%;background:${on ? 'var(--success)' : 'var(--text-tertiary)'}"></span>
+            ${p}
+          </span>`
+        ).join('');
+      })
+      .catch(() => {});
+  }
+
+  function showCredError(msg) {
+    const el = document.getElementById('credErrorMsg');
+    el.textContent = msg;
+    el.classList.add('show');
+  }
 </script>
 </body>
 </html>

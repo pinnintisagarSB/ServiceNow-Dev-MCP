@@ -9,10 +9,10 @@
  */
 
 import 'dotenv/config';
-import { AsyncLocalStorage }    from 'node:async_hooks';
-import { randomUUID }           from 'node:crypto';
-import { readFileSync } from 'node:fs';
-import { createClient } from '@supabase/supabase-js';
+import { AsyncLocalStorage }            from 'node:async_hooks';
+import { randomUUID, createCipheriv, createDecipheriv, randomBytes } from 'node:crypto';
+import { readFileSync }                 from 'node:fs';
+import { createClient }                 from '@supabase/supabase-js';
 import { fileURLToPath }        from 'node:url';
 import { dirname, join }        from 'node:path';
 
@@ -76,7 +76,8 @@ const _migrationTester = new MigrationTester();
 // stdio mode (CLI): falls back to a single global session keyed '_stdio'.
 
 const _sessionContext = new AsyncLocalStorage();
-const _sessions       = new Map(); // sessionId → { creds, connectors }
+// sessionId → { creds, connectors, mcpToken }
+const _sessions       = new Map();
 
 function _getSession() {
   const id = _sessionContext.getStore() ?? '_stdio';
@@ -84,9 +85,15 @@ function _getSession() {
     _sessions.set(id, {
       creds:      { servicenow: null, jira: null, salesforce: null },
       connectors: { sn: null, sf: null, jira: null },
+      mcpToken:   null,
     });
   }
   return _sessions.get(id);
+}
+
+// Returns the MCP token for the current session (set when the SSE/HTTP session starts).
+function _getSessionToken() {
+  try { return _getSession().mcpToken ?? null; } catch { return null; }
 }
 
 // Expose for configure_credentials and resetConnectors
@@ -161,6 +168,27 @@ function resetConnectors() {
   s.connectors.sn = null; s.connectors.sf = null; s.connectors.jira = null;
 }
 
+// ── Global credential loader ───────────────────────────────────────────────
+// Injected by the HTTP server block once Supabase is available.
+// Falls back to a no-op in stdio mode (env vars / session memory are used instead).
+let _credentialLoader = async (_token, _platform) => null;
+
+async function _loadPlatformCreds(platform) {
+  // 1. Session memory (set by connect_* tools in CLI mode)
+  const sessionVal = _getSession().creds[platform === 'servicenow' ? 'servicenow'
+                                        : platform === 'jira'       ? 'jira'
+                                        : 'salesforce'];
+  if (sessionVal) return sessionVal;
+  // 2. Supabase (set via portal)
+  const token = _getSessionToken();
+  if (token) {
+    const stored = await _credentialLoader(token, platform);
+    if (stored) return stored;
+  }
+  // 3. Env vars (server-level defaults, stdio / self-hosted)
+  return null;
+}
+
 // ── Response helpers ───────────────────────────────────────────────────────
 const ok  = (data) => ({ content: [{ type: 'text', text: JSON.stringify(data, null, 2) }] });
 const fail = (msg) => ({ content: [{ type: 'text', text: `ERROR: ${msg}` }], isError: true });
@@ -171,11 +199,23 @@ const fail = (msg) => ({ content: [{ type: 'text', text: `ERROR: ${msg}` }], isE
 //   const { sn, error } = await _requireSn(); if (error) return error;
 
 async function _requireSn() {
+  // Load from Supabase / session memory / env vars
+  const stored = await _loadPlatformCreds('servicenow');
+  if (stored) {
+    // Inject into session so getSn() picks them up
+    _getSession().creds.servicenow = {
+      instanceUrl: stored.instance_url,
+      username:    stored.username,
+      password:    stored.password,
+    };
+    _getSession().connectors.sn = null; // force re-init with new creds
+  }
   const hasEnv = !!(process.env.SN_INSTANCE_URL && (process.env.SN_USERNAME || process.env.SN_USE_SDK_AUTH === 'true'));
-  if (!_sessionCreds.servicenow && !hasEnv) {
+  if (!stored && !_sessionCreds.servicenow && !hasEnv) {
     return { error: fail(
-      'ServiceNow credentials are not configured for this session. ' +
-      'Please call connect_servicenow and provide your instance URL, username, and password.'
+      'ServiceNow credentials are not configured. ' +
+      'Please visit the MCP portal and enter your ServiceNow instance URL, username, and password ' +
+      'in the "Configure Credentials" section.'
     )};
   }
   try {
@@ -184,18 +224,27 @@ async function _requireSn() {
     const msg = String(e.message ?? e);
     return { error: fail(
       /401|403|unauthorized|forbidden/i.test(msg)
-        ? 'ServiceNow authentication failed — call connect_servicenow again with the correct credentials.'
+        ? 'ServiceNow authentication failed. Please update your credentials in the MCP portal.'
         : `ServiceNow connection error: ${msg}`
     )};
   }
 }
 
 async function _requireJira() {
+  const stored = await _loadPlatformCreds('jira');
+  if (stored) {
+    _getSession().creds.jira = {
+      baseUrl:  stored.base_url,
+      email:    stored.email,
+      apiToken: stored.api_token,
+    };
+    _getSession().connectors.jira = null;
+  }
   const hasEnv = !!(process.env.JIRA_BASE_URL && process.env.JIRA_EMAIL && process.env.JIRA_API_TOKEN);
-  if (!_sessionCreds.jira && !hasEnv) {
+  if (!stored && !_sessionCreds.jira && !hasEnv) {
     return { error: fail(
-      'Jira credentials are not configured for this session. ' +
-      'Please call connect_jira and provide your Jira base URL, email, and API token.'
+      'Jira credentials are not configured. ' +
+      'Please visit the MCP portal and enter your Jira base URL, email, and API token.'
     )};
   }
   try {
@@ -204,18 +253,30 @@ async function _requireJira() {
     const msg = String(e.message ?? e);
     return { error: fail(
       /401|403|unauthorized|forbidden/i.test(msg)
-        ? 'Jira authentication failed — call connect_jira again with the correct credentials.'
+        ? 'Jira authentication failed. Please update your credentials in the MCP portal.'
         : `Jira connection error: ${msg}`
     )};
   }
 }
 
 async function _requireSf() {
+  const stored = await _loadPlatformCreds('salesforce');
+  if (stored) {
+    _getSession().creds.salesforce = {
+      loginUrl:      stored.login_url ?? 'https://login.salesforce.com',
+      clientId:      stored.client_id,
+      clientSecret:  stored.client_secret,
+      username:      stored.username,
+      password:      stored.password,
+      securityToken: stored.security_token ?? '',
+    };
+    _getSession().connectors.sf = null;
+  }
   const hasEnv = !!(process.env.SF_CLIENT_ID && process.env.SF_USERNAME);
-  if (!_sessionCreds.salesforce && !hasEnv) {
+  if (!stored && !_sessionCreds.salesforce && !hasEnv) {
     return { error: fail(
-      'Salesforce credentials are not configured for this session. ' +
-      'Please call connect_salesforce and provide your login URL, client ID, client secret, username, and password.'
+      'Salesforce credentials are not configured. ' +
+      'Please visit the MCP portal and enter your Salesforce credentials.'
     )};
   }
   try {
@@ -224,7 +285,7 @@ async function _requireSf() {
     const msg = String(e.message ?? e);
     return { error: fail(
       /401|403|unauthorized|forbidden/i.test(msg)
-        ? 'Salesforce authentication failed — call connect_salesforce again with the correct credentials.'
+        ? 'Salesforce authentication failed. Please update your credentials in the MCP portal.'
         : `Salesforce connection error: ${msg}`
     )};
   }
@@ -239,20 +300,14 @@ const SERVER_INSTRUCTIONS = `
 **IMPORTANT: At the very start of every conversation, before doing anything else:**
 
 1. Call \`get_config\` to check which platforms are configured.
-2. If \`servicenow.configured\` is false → call \`connect_servicenow\` right away and ask
-   the user for their ServiceNow credentials (instance URL, username, password).
-3. If Jira or Salesforce is needed and not configured → call the matching connect tool.
+2. If a platform shows \`configured: false\`, call \`get_credential_setup_url\` and
+   tell the user to open the portal link to enter their credentials.
+3. NEVER ask the user for passwords, API tokens, or secrets in this chat.
+   Credentials are entered securely in the web portal — not through Claude.
 
-Do NOT attempt to use any ServiceNow / Jira / Salesforce tool until credentials have
-been collected and verified. If a tool returns an auth error, call the relevant connect
-tool again to refresh credentials.
-
-### Credential questions to ask the user (ServiceNow):
-- "What is your ServiceNow instance URL?" (e.g. https://yourcompany.service-now.com)
-- "What is your ServiceNow username?"
-- "What is your ServiceNow password?"
-
-Credentials are held only in memory for this session — they are never logged or stored.
+Once credentials are saved in the portal, they are loaded automatically at
+the start of each session. If a tool returns an auth error, call
+\`get_credential_setup_url\` and ask the user to update their credentials in the portal.
 `.trim();
 
 function createServer() {
@@ -275,20 +330,17 @@ server.tool(
 
 Returns which platforms are configured and ready to use.
 
-Credentials come from one of two places (checked in this order):
-  1. Session memory — set via connect_servicenow / configure_credentials (web Claude.ai)
-  2. .env file on the server (CLI / self-hosted deployment)
+Credentials are loaded automatically from the MCP portal (Supabase-backed, AES-256 encrypted).
+Users enter credentials once in the portal — Claude never handles passwords or tokens.
 
 Decision tree:
-  • servicenow.configured = false → call connect_servicenow immediately. Ask the user:
-      - "What is your ServiceNow instance URL? (e.g. https://yourcompany.service-now.com)"
-      - "What is your ServiceNow username?"
-      - "What is your ServiceNow password?"
-  • jira.configured = false (and user needs Jira) → call connect_jira
-  • salesforce.configured = false (and user needs Salesforce) → call connect_salesforce
+  • All platforms configured → proceed with the user's request.
+  • Any platform configured=false → call get_credential_setup_url and tell the user
+    to open the portal to enter their credentials. NEVER ask for passwords in chat.
 
-Do NOT attempt any leave, onboarding, or data-migration tool until the required
-platform credentials are configured and verified.`,
+Credential sources checked in order:
+  1. Supabase (entered via portal — preferred, secure)
+  2. .env file on server (CLI / self-hosted)`,
   {},
   async () => {
     const snCreds  = _sessionCreds.servicenow;
@@ -348,291 +400,41 @@ platform credentials are configured and verified.`,
 // ══════════════════════════════════════════════════════════════════════════
 // TOOL: configure_credentials
 // ══════════════════════════════════════════════════════════════════════════
+// TOOL: get_credential_setup_url
+// Replaces configure_credentials / connect_* — credentials are now entered
+// securely in the web portal, never through Claude.
+// ══════════════════════════════════════════════════════════════════════════
 server.tool(
-  'configure_credentials',
-  `Set credentials for this session when running in web Claude Code or any context
-   where a .env file is not present on the server.
+  'get_credential_setup_url',
+  `Returns the URL where the user can securely enter their platform credentials.
 
-   WHEN TO CALL THIS:
-   - Web Claude Code (claude.ai/code): the server is deployed remotely and has no
-     access to the user's .env. Call this once at the start of the session.
-   - CLI: only needed if the user wants to override their .env for this session.
+Use this whenever a platform is not configured (get_config shows configured=false).
+DO NOT ask the user for passwords, API tokens, or secrets — direct them to the
+portal URL instead. Credentials entered there are encrypted (AES-256-GCM) and
+stored server-side; Claude never sees them.
 
-   SECURITY: credentials are held in memory for this session only and are never
-   logged, stored to disk, or returned in any tool response. They are cleared
-   when the session ends.
-
-   Only provide credentials for the platforms you actually need.
-   After calling this, call get_config to confirm the platforms are now configured,
-   then call connect to verify the live connections.`,
-  {
-    servicenow: z.object({
-      instance_url: z.string().describe('e.g. https://yourinstance.service-now.com'),
-      username:     z.string().describe('ServiceNow username'),
-      password:     z.string().describe('ServiceNow password'),
-    }).optional().describe('ServiceNow credentials'),
-
-    jira: z.object({
-      base_url:  z.string().describe('e.g. https://yourcompany.atlassian.net'),
-      email:     z.string().describe('Atlassian account email'),
-      api_token: z.string().describe('Jira API token from id.atlassian.com/manage-profile/security'),
-    }).optional().describe('Jira credentials'),
-
-    salesforce: z.object({
-      login_url:      z.string().optional().default('https://login.salesforce.com').describe('Use https://test.salesforce.com for sandboxes'),
-      client_id:      z.string().describe('Connected App consumer key'),
-      client_secret:  z.string().describe('Connected App consumer secret'),
-      username:       z.string().describe('Salesforce username'),
-      password:       z.string().describe('Salesforce password'),
-      security_token: z.string().optional().default('').describe('Salesforce security token (if IP not allowlisted)'),
-    }).optional().describe('Salesforce credentials'),
-  },
-  async ({ servicenow, jira, salesforce }) => {
-    const configured = [];
-    const skipped    = [];
-
-    if (servicenow) {
-      _sessionCreds.servicenow = {
-        instanceUrl: servicenow.instance_url,
-        username:    servicenow.username,
-        password:    servicenow.password,
-      };
-      configured.push('servicenow');
-    } else skipped.push('servicenow');
-
-    if (jira) {
-      _sessionCreds.jira = {
-        baseUrl:  jira.base_url,
-        email:    jira.email,
-        apiToken: jira.api_token,
-      };
-      configured.push('jira');
-    } else skipped.push('jira');
-
-    if (salesforce) {
-      _sessionCreds.salesforce = {
-        loginUrl:      salesforce.login_url ?? 'https://login.salesforce.com',
-        clientId:      salesforce.client_id,
-        clientSecret:  salesforce.client_secret,
-        username:      salesforce.username,
-        password:      salesforce.password,
-        securityToken: salesforce.security_token ?? '',
-      };
-      configured.push('salesforce');
-    } else skipped.push('salesforce');
-
-    // Reset cached connectors so they re-initialise with the new credentials
-    resetConnectors();
-
+After the user saves their credentials in the portal, they should start a new
+Claude conversation — credentials are loaded automatically at session start.`,
+  {},
+  async () => {
+    // Best-effort: derive the portal URL from the session token or env
+    const token = _getSessionToken();
     return ok({
-      instructions_for_claude: [
-        `Credentials stored in session memory for: ${configured.join(', ')}.`,
-        'Credentials are NOT logged or persisted — they exist only for this session.',
-        'Call get_config to confirm, then call connect to verify the live connections.',
+      message: 'Please enter your credentials in the MCP portal — never share passwords with Claude.',
+      portal_url: 'Visit the MCP portal URL you used to register your token (the root URL of this server)',
+      token_hint: token ? `Your token starts with: ${token.slice(0, 20)}...` : null,
+      instructions: [
+        '1. Open the MCP portal in your browser',
+        '2. Find the "Configure Credentials" section',
+        '3. Enter your ServiceNow / Jira / Salesforce credentials and click Save',
+        '4. Start a new Claude conversation — your credentials will be loaded automatically',
       ],
-      configured,
-      skipped,
-      note: 'Credentials held in memory only. Call configure_credentials again to update.',
+      platforms: {
+        servicenow:  { fields: ['Instance URL (e.g. https://yourcompany.service-now.com)', 'Username', 'Password'] },
+        jira:        { fields: ['Base URL (e.g. https://yourcompany.atlassian.net)', 'Email', 'API Token'] },
+        salesforce:  { fields: ['Login URL', 'Client ID', 'Client Secret', 'Username', 'Password'] },
+      },
     });
-  }
-);
-
-// ══════════════════════════════════════════════════════════════════════════
-// TOOLS: connect_servicenow / connect_jira / connect_salesforce
-//
-// One-step shortcut tools: accept credentials, store them, and immediately
-// verify the live connection — so the user never has to call configure_credentials
-// + connect as two separate steps. Claude should prefer these over the generic
-// configure_credentials tool when the user wants to connect a single platform.
-// ══════════════════════════════════════════════════════════════════════════
-
-server.tool(
-  'connect_servicenow',
-  `Connect to a ServiceNow instance in one step.
-
-  WHEN TO CALL: At the start of any session that needs ServiceNow access, or when
-  get_config shows servicenow.configured = false.
-
-  HOW TO ASK THE USER:
-    "To connect to your ServiceNow instance I need three things:
-     1. Your instance URL  (e.g. https://yourcompany.service-now.com)
-     2. Your username
-     3. Your password
-     These are held in memory for this session only — never stored or logged."
-
-  After calling this tool, tell the user whether the connection succeeded and
-  which instance you connected to. Then proceed with their request.`,
-  {
-    instance_url: z.string().url().describe('Full URL of the ServiceNow instance, e.g. https://yourcompany.service-now.com'),
-    username:     z.string().describe('ServiceNow username'),
-    password:     z.string().describe('ServiceNow password'),
-  },
-  async ({ instance_url, username, password }) => {
-    try {
-      // Store credentials for this session
-      _sessionCreds.servicenow = { instanceUrl: instance_url, username, password };
-      resetConnectors();
-
-      // Verify live connection immediately
-      process.env.SN_INSTANCE_URL = instance_url;
-      process.env.SN_USERNAME     = username;
-      process.env.SN_PASSWORD     = password;
-      const { sn, error: _snErr } = await _requireSn();
-      if (_snErr) return _snErr;
-
-      // Quick smoke-test: fetch one record from sys_user
-      await sn.get('sys_user', { sysparm_limit: '1', sysparm_fields: 'sys_id' });
-
-      return ok({
-        connected:    true,
-        instance:     instance_url,
-        instructions_for_claude: [
-          `ServiceNow connected ✓ (${instance_url})`,
-          'Credentials are held in session memory only — they will be cleared when this conversation ends.',
-          'You can now use any ServiceNow tool. Proceed with the user\'s request.',
-        ],
-      });
-    } catch (e) {
-      // Clear bad credentials so a retry starts fresh
-      _sessionCreds.servicenow = null;
-      resetConnectors();
-      return fail(
-        `Could not connect to ServiceNow: ${e.message}\n` +
-        'Ask the user to check their instance URL, username, and password and try again.'
-      );
-    }
-  }
-);
-
-server.tool(
-  'connect_jira',
-  `Connect to a Jira Cloud instance in one step.
-
-  WHEN TO CALL: At the start of any session that needs Jira access, or when
-  get_config shows jira.configured = false.
-
-  HOW TO ASK THE USER:
-    "To connect to your Jira instance I need three things:
-     1. Your Atlassian URL  (e.g. https://yourcompany.atlassian.net)
-     2. Your Atlassian account email
-     3. A Jira API token — generate one at:
-        https://id.atlassian.com/manage-profile/security/api-tokens
-     These are held in memory for this session only — never stored or logged."
-
-  After calling this tool, confirm the connection and proceed with the user's request.`,
-  {
-    base_url:  z.string().url().describe('Atlassian URL, e.g. https://yourcompany.atlassian.net'),
-    email:     z.string().email().describe('Atlassian account email address'),
-    api_token: z.string().describe('Jira API token from id.atlassian.com/manage-profile/security/api-tokens'),
-  },
-  async ({ base_url, email, api_token }) => {
-    try {
-      _sessionCreds.jira = { baseUrl: base_url, email, apiToken: api_token };
-      resetConnectors();
-
-      process.env.JIRA_BASE_URL  = base_url;
-      process.env.JIRA_EMAIL     = email;
-      process.env.JIRA_API_TOKEN = api_token;
-      const { jira, error: _jiraErr } = await _requireJira();
-      if (_jiraErr) return _jiraErr;
-
-      // Smoke-test: fetch current user
-      await jira.get('/rest/api/3/myself');
-
-      return ok({
-        connected:    true,
-        instance:     base_url,
-        instructions_for_claude: [
-          `Jira connected ✓ (${base_url})`,
-          'Credentials are held in session memory only.',
-          'You can now use any Jira tool. Proceed with the user\'s request.',
-        ],
-      });
-    } catch (e) {
-      _sessionCreds.jira = null;
-      resetConnectors();
-      return fail(
-        `Could not connect to Jira: ${e.message}\n` +
-        'Ask the user to verify their Atlassian URL, email, and API token. ' +
-        'API tokens are generated at https://id.atlassian.com/manage-profile/security/api-tokens'
-      );
-    }
-  }
-);
-
-server.tool(
-  'connect_salesforce',
-  `Connect to a Salesforce org in one step.
-
-  WHEN TO CALL: At the start of any session that needs Salesforce access, or when
-  get_config shows salesforce.configured = false.
-
-  HOW TO ASK THE USER:
-    "To connect to Salesforce I need:
-     1. Connected App consumer key (client ID)
-     2. Connected App consumer secret (client secret)
-     3. Your Salesforce username
-     4. Your Salesforce password
-     5. Your security token (optional — only needed if your IP is not allowlisted)
-     6. Login URL — use https://test.salesforce.com for sandboxes, otherwise leave default
-
-     To get a Connected App:
-       Salesforce Setup → App Manager → New Connected App
-       Enable OAuth, add 'api' and 'refresh_token' scopes
-
-     These are held in memory for this session only — never stored or logged."
-
-  After calling this tool, confirm the connection and proceed with the user's request.`,
-  {
-    client_id:      z.string().describe('Connected App consumer key'),
-    client_secret:  z.string().describe('Connected App consumer secret'),
-    username:       z.string().describe('Salesforce username (email format)'),
-    password:       z.string().describe('Salesforce password'),
-    security_token: z.string().optional().default('').describe('Security token — leave blank if IP is allowlisted'),
-    login_url:      z.string().url().optional().default('https://login.salesforce.com')
-                      .describe('https://login.salesforce.com for production, https://test.salesforce.com for sandboxes'),
-  },
-  async ({ client_id, client_secret, username, password, security_token, login_url }) => {
-    try {
-      _sessionCreds.salesforce = {
-        loginUrl:      login_url     ?? 'https://login.salesforce.com',
-        clientId:      client_id,
-        clientSecret:  client_secret,
-        username,
-        password,
-        securityToken: security_token ?? '',
-      };
-      resetConnectors();
-
-      process.env.SF_LOGIN_URL      = login_url      ?? 'https://login.salesforce.com';
-      process.env.SF_CLIENT_ID      = client_id;
-      process.env.SF_CLIENT_SECRET  = client_secret;
-      process.env.SF_USERNAME       = username;
-      process.env.SF_PASSWORD       = password;
-      process.env.SF_SECURITY_TOKEN = security_token ?? '';
-      const { sf, error: _sfErr } = await _requireSf();
-      if (_sfErr) return _sfErr;
-
-      // Smoke-test: fetch org info
-      const orgInfo = await sf.query('SELECT Id, Name FROM Organization LIMIT 1');
-
-      return ok({
-        connected:    true,
-        org:          orgInfo?.records?.[0]?.Name ?? 'connected',
-        instructions_for_claude: [
-          `Salesforce connected ✓ (org: ${orgInfo?.records?.[0]?.Name ?? username})`,
-          'Credentials are held in session memory only.',
-          'You can now use any Salesforce tool. Proceed with the user\'s request.',
-        ],
-      });
-    } catch (e) {
-      _sessionCreds.salesforce = null;
-      resetConnectors();
-      return fail(
-        `Could not connect to Salesforce: ${e.message}\n` +
-        'Ask the user to check their Connected App credentials and whether their IP needs a security token.'
-      );
-    }
   }
 );
 
@@ -8080,6 +7882,57 @@ if (process.env.MCP_MODE === 'http') {
     : null;
   if (!_supabase) logger.info('Supabase not configured — tokens stored in-memory only');
 
+  // ── Credential encryption (AES-256-GCM) ────────────────────────────────────
+  // Key must be 32 random bytes stored as 64-char hex in CREDENTIAL_ENCRYPTION_KEY.
+  // If the env var is missing the /configure-credentials endpoint is disabled.
+  const _encKeyHex = (process.env.CREDENTIAL_ENCRYPTION_KEY ?? '').trim();
+  const _encKey    = _encKeyHex.length === 64 ? Buffer.from(_encKeyHex, 'hex') : null;
+  if (!_encKey) logger.warn('CREDENTIAL_ENCRYPTION_KEY not set — portal credential storage disabled');
+
+  function _encrypt(plaintext) {
+    if (!_encKey) throw new Error('Encryption key not configured');
+    const iv         = randomBytes(12);
+    const cipher     = createCipheriv('aes-256-gcm', _encKey, iv);
+    const encrypted  = Buffer.concat([cipher.update(plaintext, 'utf8'), cipher.final()]);
+    const authTag    = cipher.getAuthTag();
+    return `${iv.toString('hex')}:${authTag.toString('hex')}:${encrypted.toString('hex')}`;
+  }
+
+  function _decrypt(ciphertext) {
+    if (!_encKey) throw new Error('Encryption key not configured');
+    const [ivHex, tagHex, dataHex] = ciphertext.split(':');
+    const decipher = createDecipheriv('aes-256-gcm', _encKey, Buffer.from(ivHex, 'hex'));
+    decipher.setAuthTag(Buffer.from(tagHex, 'hex'));
+    return decipher.update(Buffer.from(dataHex, 'hex')) + decipher.final('utf8');
+  }
+
+  async function _saveCredentials(token, platform, credObject) {
+    if (!_supabase || !_encKey) return;
+    const encrypted = _encrypt(JSON.stringify(credObject));
+    await _supabase.from('mcp_credentials').upsert({ token, platform, encrypted_data: encrypted });
+  }
+
+  async function _loadCredentials(token, platform) {
+    if (!_supabase || !_encKey) return null;
+    try {
+      const { data, error } = await _supabase
+        .from('mcp_credentials').select('encrypted_data')
+        .eq('token', token).eq('platform', platform).single();
+      if (error || !data) return null;
+      return JSON.parse(_decrypt(data.encrypted_data));
+    } catch (e) { logger.error(`Credential load error: ${e.message}`); return null; }
+  }
+
+  // Wire into the global loader so all tools can use it
+  _credentialLoader = _loadCredentials;
+
+  async function _deleteCredentials(token, platform) {
+    if (!_supabase) return;
+    const q = _supabase.from('mcp_credentials').delete().eq('token', token);
+    if (platform) await q.eq('platform', platform);
+    else          await q;
+  }
+
   async function _loadPersistedTokens() {
     if (!_supabase) return [];
     try {
@@ -8232,11 +8085,90 @@ if (process.env.MCP_MODE === 'http') {
     const { token } = req.params;
     if (_runtimeKeys.delete(token)) {
       await _deleteToken(token);
+      await _deleteCredentials(token, null); // remove all platforms
       logger.info(`Token revoked: ${token.slice(0, 20)}...`);
       res.json({ revoked: true, token });
     } else {
       res.status(404).json({ error: 'Token not found' });
     }
+  });
+
+  // ── Credential configuration — POST /configure-credentials ────────────────
+  // Called by the portal (not Claude) to store encrypted credentials server-side.
+  // The MCP token in the Authorization header identifies the user.
+  //
+  // Request:  POST /configure-credentials
+  //           Authorization: Bearer <MCP_TOKEN>
+  //           { "platform": "servicenow",
+  //             "credentials": { "instance_url": "...", "username": "...", "password": "..." } }
+  //
+  // Platforms: servicenow | jira | salesforce
+  app.post('/configure-credentials', rateLimit(10), async (req, res) => {
+    const token = (req.headers['authorization'] ?? '').replace(/^Bearer /, '').trim()
+               || (req.query.token ?? '').trim();
+    if (!isValidToken(`Bearer ${token}`, token)) {
+      res.status(401).json({ error: 'Invalid or missing MCP token' }); return;
+    }
+    if (!_encKey) {
+      res.status(503).json({ error: 'Credential storage not configured on this server (CREDENTIAL_ENCRYPTION_KEY missing)' }); return;
+    }
+
+    const { platform, credentials } = req.body ?? {};
+    const allowed = ['servicenow', 'jira', 'salesforce'];
+    if (!allowed.includes(platform)) {
+      res.status(400).json({ error: `platform must be one of: ${allowed.join(', ')}` }); return;
+    }
+    if (!credentials || typeof credentials !== 'object') {
+      res.status(400).json({ error: 'credentials object required' }); return;
+    }
+
+    // Validate required fields per platform
+    const required = {
+      servicenow:  ['instance_url', 'username', 'password'],
+      jira:        ['base_url', 'email', 'api_token'],
+      salesforce:  ['login_url', 'client_id', 'client_secret', 'username', 'password'],
+    };
+    const missing = required[platform].filter(f => !credentials[f]);
+    if (missing.length) {
+      res.status(400).json({ error: `Missing fields for ${platform}: ${missing.join(', ')}` }); return;
+    }
+
+    try {
+      await _saveCredentials(token, platform, credentials);
+      logger.info(`Credentials stored for token ${token.slice(0, 20)}... platform=${platform}`);
+      res.json({ ok: true, platform, message: `${platform} credentials saved securely.` });
+    } catch (e) {
+      logger.error(`Credential save error: ${e.message}`);
+      res.status(500).json({ error: 'Failed to save credentials' });
+    }
+  });
+
+  // ── Credential status — GET /credential-status ────────────────────────────
+  // Returns which platforms are configured for a token (no credential values).
+  app.get('/credential-status', rateLimit(30), async (req, res) => {
+    const token = (req.headers['authorization'] ?? '').replace(/^Bearer /, '').trim()
+               || (req.query.token ?? '').trim();
+    if (!isValidToken(`Bearer ${token}`, token)) {
+      res.status(401).json({ error: 'Invalid or missing MCP token' }); return;
+    }
+    const platforms = ['servicenow', 'jira', 'salesforce'];
+    const status = {};
+    for (const p of platforms) {
+      status[p] = !!(await _loadCredentials(token, p));
+    }
+    res.json({ token: token.slice(0, 20) + '...', configured: status });
+  });
+
+  // ── Credential deletion — DELETE /configure-credentials ───────────────────
+  app.delete('/configure-credentials', rateLimit(10), async (req, res) => {
+    const token = (req.headers['authorization'] ?? '').replace(/^Bearer /, '').trim()
+               || (req.query.token ?? '').trim();
+    if (!isValidToken(`Bearer ${token}`, token)) {
+      res.status(401).json({ error: 'Invalid or missing MCP token' }); return;
+    }
+    const { platform } = req.body ?? {};
+    await _deleteCredentials(token, platform ?? null);
+    res.json({ ok: true, message: platform ? `${platform} credentials removed.` : 'All credentials removed.' });
   });
 
   // ── List active tokens — GET /register ────────────────────────────────────
@@ -8262,12 +8194,22 @@ if (process.env.MCP_MODE === 'http') {
       return;
     }
 
-    // New session
+    // New session — extract the MCP token from this request so tools can load
+    // credentials from Supabase without the user typing them into Claude.
+    const reqToken = (req.headers['authorization'] ?? '').replace(/^Bearer /, '').trim()
+                  || (req.query.token ?? '').trim();
+
     const transport = new StreamableHTTPServerTransport({
       sessionIdGenerator: () => randomUUID(),
       enableJsonResponse: true,
       onsessioninitialized: (sessionId) => {
         clients.set(sessionId, transport);
+        // Store the token so _getSessionToken() can read it inside any tool call
+        const sess = _sessions.get(sessionId) ?? (() => {
+          const s = { creds: { servicenow: null, jira: null, salesforce: null }, connectors: { sn: null, sf: null, jira: null }, mcpToken: null };
+          _sessions.set(sessionId, s); return s;
+        })();
+        sess.mcpToken = reqToken || null;
         logger.info(`Session started (${sessionId})`);
       },
     });
