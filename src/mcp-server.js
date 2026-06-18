@@ -170,14 +170,9 @@ const fail = (msg) => ({ content: [{ type: 'text', text: `ERROR: ${msg}` }], isE
 // are missing or authentication fails — so every tool can gate itself with:
 //   const { sn, error } = await _requireSn(); if (error) return error;
 
-function _sessionCreds() {
-  try { return _getSession().creds; } catch { return {}; }
-}
-
 async function _requireSn() {
-  const creds  = _sessionCreds();
   const hasEnv = !!(process.env.SN_INSTANCE_URL && (process.env.SN_USERNAME || process.env.SN_USE_SDK_AUTH === 'true'));
-  if (!creds.servicenow && !hasEnv) {
+  if (!_sessionCreds.servicenow && !hasEnv) {
     return { error: fail(
       'ServiceNow credentials are not configured for this session. ' +
       'Please call connect_servicenow and provide your instance URL, username, and password.'
@@ -196,9 +191,8 @@ async function _requireSn() {
 }
 
 async function _requireJira() {
-  const creds  = _sessionCreds();
   const hasEnv = !!(process.env.JIRA_BASE_URL && process.env.JIRA_EMAIL && process.env.JIRA_API_TOKEN);
-  if (!creds.jira && !hasEnv) {
+  if (!_sessionCreds.jira && !hasEnv) {
     return { error: fail(
       'Jira credentials are not configured for this session. ' +
       'Please call connect_jira and provide your Jira base URL, email, and API token.'
@@ -217,9 +211,8 @@ async function _requireJira() {
 }
 
 async function _requireSf() {
-  const creds  = _sessionCreds();
   const hasEnv = !!(process.env.SF_CLIENT_ID && process.env.SF_USERNAME);
-  if (!creds.salesforce && !hasEnv) {
+  if (!_sessionCreds.salesforce && !hasEnv) {
     return { error: fail(
       'Salesforce credentials are not configured for this session. ' +
       'Please call connect_salesforce and provide your login URL, client ID, client secret, username, and password.'
