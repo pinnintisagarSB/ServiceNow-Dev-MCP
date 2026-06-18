@@ -11,7 +11,7 @@
 import 'dotenv/config';
 import { AsyncLocalStorage }    from 'node:async_hooks';
 import { randomUUID }           from 'node:crypto';
-import { readFileSync }         from 'node:fs';
+import { readFileSync, writeFileSync, mkdirSync } from 'node:fs';
 import { fileURLToPath }        from 'node:url';
 import { dirname, join }        from 'node:path';
 
@@ -7089,13 +7089,32 @@ if (process.env.MCP_MODE === 'http') {
 
   const adminKey = process.env.ADMIN_KEY;
 
-  // Build the live token set from env — re-evaluated on each request so you
-  // can update ALLOWED_KEYS via your deployment config without a restart.
-  // For runtime-registered tokens we maintain a separate in-memory set.
-  const _runtimeKeys = new Set(
-    (process.env.ALLOWED_KEYS ?? '').split(',').map(k => k.trim()).filter(Boolean)
-  );
-  if (process.env.MCP_API_KEY) _runtimeKeys.add(process.env.MCP_API_KEY);
+  // ── Persistent token store ─────────────────────────────────────────────────
+  // Tokens are written to TOKEN_STORE_PATH (default /data/tokens.json) so they
+  // survive container restarts and redeploys. Falls back to in-memory silently
+  // if the path is not writable (e.g. no persistent disk mounted).
+  const _tokenStorePath = process.env.TOKEN_STORE_PATH ?? '/data/tokens.json';
+
+  function _loadPersistedTokens() {
+    try {
+      const raw = readFileSync(_tokenStorePath, 'utf8');
+      return new Set(JSON.parse(raw));
+    } catch { return new Set(); }
+  }
+
+  function _persistTokens(keys) {
+    try {
+      mkdirSync(_tokenStorePath.replace(/\/[^/]+$/, ''), { recursive: true });
+      writeFileSync(_tokenStorePath, JSON.stringify([...keys]), 'utf8');
+    } catch { /* no persistent disk — in-memory only */ }
+  }
+
+  // Seed from env vars + persisted file
+  const _runtimeKeys = new Set([
+    ...(process.env.ALLOWED_KEYS ?? '').split(',').map(k => k.trim()).filter(Boolean),
+    ...(process.env.MCP_API_KEY ? [process.env.MCP_API_KEY] : []),
+    ..._loadPersistedTokens(),
+  ]);
 
   function isValidToken(authHeader, queryToken) {
     if (_runtimeKeys.size === 0) return true; // open if no keys configured
@@ -7186,6 +7205,7 @@ if (process.env.MCP_MODE === 'http') {
     // crypto.randomUUID is available in Node 22
     const token = `sn-mcp-${name}-${randomUUID().replace(/-/g, '').slice(0, 16)}`;
     _runtimeKeys.add(token);
+    _persistTokens(_runtimeKeys);
 
     const host    = req.headers['x-forwarded-host'] ?? req.headers['host'] ?? `localhost:${port}`;
     const proto   = req.headers['x-forwarded-proto'] ?? (port === 443 ? 'https' : 'http');
@@ -7215,6 +7235,7 @@ if (process.env.MCP_MODE === 'http') {
     }
     const { token } = req.params;
     if (_runtimeKeys.delete(token)) {
+      _persistTokens(_runtimeKeys);
       logger.info(`Token revoked: ${token.slice(0, 20)}...`);
       res.json({ revoked: true, token });
     } else {
