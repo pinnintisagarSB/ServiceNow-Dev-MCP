@@ -7065,7 +7065,7 @@ if (process.env.MCP_MODE === 'http') {
   const { SSEServerTransport } = await import('@modelcontextprotocol/sdk/server/sse.js');
 
   const app     = express();
-  const port    = parseInt(process.env.MCP_PORT ?? '3000', 10);
+  const port    = parseInt(process.env.PORT ?? process.env.MCP_PORT ?? '3000', 10);
   const clients = new Map();
 
   // ── Token registry ─────────────────────────────────────────────────────────
