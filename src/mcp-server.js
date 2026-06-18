@@ -168,8 +168,33 @@ const fail = (msg) => ({ content: [{ type: 'text', text: `ERROR: ${msg}` }], isE
 // ── Server factory — one McpServer instance per SSE connection ─────────────
 // McpServer can only be connected to one transport at a time. For multi-user
 // SSE we create a fresh instance per connection via registerTools(server).
+const SERVER_INSTRUCTIONS = `
+## ServiceNow Dev MCP — Session Setup
+
+**IMPORTANT: At the very start of every conversation, before doing anything else:**
+
+1. Call \`get_config\` to check which platforms are configured.
+2. If \`servicenow.configured\` is false → call \`connect_servicenow\` right away and ask
+   the user for their ServiceNow credentials (instance URL, username, password).
+3. If Jira or Salesforce is needed and not configured → call the matching connect tool.
+
+Do NOT attempt to use any ServiceNow / Jira / Salesforce tool until credentials have
+been collected and verified. If a tool returns an auth error, call the relevant connect
+tool again to refresh credentials.
+
+### Credential questions to ask the user (ServiceNow):
+- "What is your ServiceNow instance URL?" (e.g. https://yourcompany.service-now.com)
+- "What is your ServiceNow username?"
+- "What is your ServiceNow password?"
+
+Credentials are held only in memory for this session — they are never logged or stored.
+`.trim();
+
 function createServer() {
-  const s = new McpServer({ name: 'sn-data-migration', version: '2.1.0' });
+  const s = new McpServer(
+    { name: 'sn-data-migration', version: '2.1.0' },
+    { instructions: SERVER_INSTRUCTIONS }
+  );
   registerTools(s);
   return s;
 }
@@ -181,19 +206,24 @@ function registerTools(server) {
 // ══════════════════════════════════════════════════════════════════════════
 server.tool(
   'get_config',
-  `Returns which platforms are configured and ready to use.
-   Call this at the very start of every session BEFORE asking the user for anything.
+  `CALL THIS FIRST — at the very start of every session, before ANY other tool.
 
-   Credentials come from one of two places (checked in this order):
-     1. Session memory — set via configure_credentials (used in web Claude Code)
-     2. .env file on the server (used in CLI / personal deployment)
+Returns which platforms are configured and ready to use.
 
-   If a platform shows configured=false AND the server has no .env:
-     → Call configure_credentials first, then re-call get_config.
-   If a platform shows configured=false AND a .env exists:
-     → The .env is missing that platform's values. Tell the user which vars are needed.
+Credentials come from one of two places (checked in this order):
+  1. Session memory — set via connect_servicenow / configure_credentials (web Claude.ai)
+  2. .env file on the server (CLI / self-hosted deployment)
 
-   Never ask the user for credentials unless get_config reports a platform is not configured.`,
+Decision tree:
+  • servicenow.configured = false → call connect_servicenow immediately. Ask the user:
+      - "What is your ServiceNow instance URL? (e.g. https://yourcompany.service-now.com)"
+      - "What is your ServiceNow username?"
+      - "What is your ServiceNow password?"
+  • jira.configured = false (and user needs Jira) → call connect_jira
+  • salesforce.configured = false (and user needs Salesforce) → call connect_salesforce
+
+Do NOT attempt any leave, onboarding, or data-migration tool until the required
+platform credentials are configured and verified.`,
   {},
   async () => {
     const snCreds  = _sessionCreds.servicenow;
@@ -7069,6 +7099,36 @@ Use this when:
 
 // ── Leave & Onboarding — shared helpers ───────────────────────────────────
 
+// Wraps getSn() with a clear credential-missing message.
+// Returns { sn } on success or { error: fail(...) } if not configured.
+async function _requireSn() {
+  const snCreds = (() => { try { return _getSession().creds?.servicenow; } catch { return null; } })();
+  const hasEnv  = !!(process.env.SN_INSTANCE_URL && (process.env.SN_USERNAME || process.env.SN_USE_SDK_AUTH === 'true'));
+  if (!snCreds && !hasEnv) {
+    return {
+      error: fail(
+        'ServiceNow credentials are not configured for this session. ' +
+        'Please call connect_servicenow first and provide your instance URL, username, and password.'
+      ),
+    };
+  }
+  try {
+    const { sn, error: _snErr } = await _requireSn();
+    if (_snErr) return _snErr;
+    return { sn };
+  } catch (e) {
+    const msg = e.message ?? String(e);
+    const isAuth = /401|403|unauthorized|forbidden|credentials/i.test(msg);
+    return {
+      error: fail(
+        isAuth
+          ? 'ServiceNow authentication failed. Please call connect_servicenow again with the correct credentials.'
+          : `ServiceNow connection error: ${msg}`
+      ),
+    };
+  }
+}
+
 // Resolve a sys_user row from email, user_name, or sys_id.
 async function _snResolveUser(sn, identity) {
   const rows = await sn.get('sys_user', {
@@ -7140,7 +7200,8 @@ Returns available_balance, total_balance, used_pto for each leave type.`,
   },
   async ({ employee_id }) => {
     try {
-      const sn = await getSn();
+      const { sn, error: _snErr } = await _requireSn();
+      if (_snErr) return _snErr;
 
       // Identify caller from session credentials
       const callerUsername = _snCallerUsername();
@@ -7190,7 +7251,8 @@ Use this to show the employee what types of leave they can request
   {},
   async () => {
     try {
-      const sn = await getSn();
+      const { sn, error: _snErr } = await _requireSn();
+      if (_snErr) return _snErr;
       const types = await sn.get('sn_hr_core_emp_time_off_type', {
         sysparm_fields: 'sys_id,name,external_id',
         sysparm_limit:  '100',
@@ -7213,7 +7275,8 @@ counted against leave balance.`,
   },
   async ({ start_date, end_date }) => {
     try {
-      const sn = await getSn();
+      const { sn, error: _snErr } = await _requireSn();
+      if (_snErr) return _snErr;
       const to = end_date ?? start_date;
       const holidays = await sn.get('sys_holiday', {
         sysparm_query:  `date>=${start_date}^date<=${to}`,
@@ -7246,7 +7309,8 @@ can see what they've already submitted before making a new request.`,
   },
   async ({ employee_id, status, limit }) => {
     try {
-      const sn = await getSn();
+      const { sn, error: _snErr } = await _requireSn();
+      if (_snErr) return _snErr;
 
       const callerUsername = _snCallerUsername();
       const callerUser = callerUsername ? await _snResolveUser(sn, callerUsername) : null;
@@ -7305,7 +7369,8 @@ This is the main tool for answering "Can I take leave from X to Y?"`,
   },
   async ({ start_date, end_date, leave_type_id, employee_id }) => {
     try {
-      const sn = await getSn();
+      const { sn, error: _snErr } = await _requireSn();
+      if (_snErr) return _snErr;
 
       const callerUsername = _snCallerUsername();
       const callerUser = callerUsername ? await _snResolveUser(sn, callerUsername) : null;
@@ -7399,7 +7464,8 @@ employee before calling this tool. This creates a real record in ServiceNow.`,
   },
   async ({ leave_type_id, start_date, end_date, employee_id, comments }) => {
     try {
-      const sn = await getSn();
+      const { sn, error: _snErr } = await _requireSn();
+      if (_snErr) return _snErr;
 
       const callerUsername = _snCallerUsername();
       const callerUser = callerUsername ? await _snResolveUser(sn, callerUsername) : null;
@@ -7464,7 +7530,8 @@ Returns overall % complete, counts by category (HR / IT / Facilities / Learning)
   },
   async ({ employee_id }) => {
     try {
-      const sn = await getSn();
+      const { sn, error: _snErr } = await _requireSn();
+      if (_snErr) return _snErr;
 
       const callerUsername = _snCallerUsername();
       const callerUser = callerUsername ? await _snResolveUser(sn, callerUsername) : null;
@@ -7542,7 +7609,8 @@ Categories: HR, IT, Facilities, Learning, General`,
   },
   async ({ employee_id, category, status }) => {
     try {
-      const sn = await getSn();
+      const { sn, error: _snErr } = await _requireSn();
+      if (_snErr) return _snErr;
 
       const callerUsername = _snCallerUsername();
       const callerUser = callerUsername ? await _snResolveUser(sn, callerUsername) : null;
@@ -7615,7 +7683,8 @@ pending tasks in priority order: HR → IT → Facilities → Learning.`,
   },
   async ({ employee_id, limit }) => {
     try {
-      const sn = await getSn();
+      const { sn, error: _snErr } = await _requireSn();
+      if (_snErr) return _snErr;
 
       const callerUsername = _snCallerUsername();
       const callerUser = callerUsername ? await _snResolveUser(sn, callerUsername) : null;
@@ -7683,7 +7752,8 @@ Get the task ID from get_onboarding_tasks or get_next_onboarding_steps.`,
   },
   async ({ task_id, employee_id }) => {
     try {
-      const sn = await getSn();
+      const { sn, error: _snErr } = await _requireSn();
+      if (_snErr) return _snErr;
 
       // Verify the task exists and get its checklist
       const item = await sn.getById('checklist_item', task_id, { sysparm_fields: 'sys_id,name,checklist,complete' });
@@ -7724,7 +7794,8 @@ HR, IT, Facilities, and Learning. Requires HR role to use for others.`,
   },
   async ({ employee_id, start_date, role, custom_tasks }) => {
     try {
-      const sn = await getSn();
+      const { sn, error: _snErr } = await _requireSn();
+      if (_snErr) return _snErr;
 
       const callerUsername = _snCallerUsername();
       const callerUser = callerUsername ? await _snResolveUser(sn, callerUsername) : null;
