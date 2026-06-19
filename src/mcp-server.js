@@ -444,7 +444,7 @@ server.tool(
       // Set as current so all subsequent changes land here
       await sn.setCurrentUpdateSet(updateSet.sys_id).catch(() => null); // non-fatal if preference API blocked
 
-      const url = `${sn.baseUrl}/nav_to.do?uri=sys_update_set.do?sys_id=${updateSet.sys_id}`;
+      const url = _snRecordUrl(sn, 'sys_update_set', updateSet.sys_id);
 
       return ok({
         instructions_for_claude: [
@@ -520,7 +520,7 @@ server.tool(
       const { sn, error: _snErr } = await _requireSn();
       if (_snErr) return _snErr;
       await sn.completeUpdateSet(update_set_sys_id);
-      const url = `${sn.baseUrl}/nav_to.do?uri=sys_update_set.do?sys_id=${update_set_sys_id}`;
+      const url = _snRecordUrl(sn, 'sys_update_set', update_set_sys_id);
       return ok({
         instructions_for_claude: [
           'Tell the user: "The Update Set has been marked as complete. It\'s ready to be exported and deployed to other ServiceNow instances."',
@@ -845,9 +845,7 @@ server.tool(
           'Only call run_test_migration after they confirm.',
         ],
         artifacts: results,
-        transform_map_url: results.transformMap?.sys_id
-          ? `${sn.baseUrl}/nav_to.do?uri=sys_transform_map.do?sys_id=${results.transformMap.sys_id}`
-          : null,
+        transform_map_url: _snRecordUrl(sn, 'sys_transform_map', results.transformMap?.sys_id),
         staging_table: results.stagingTable?.name,
       });
     } catch (e) { return fail(e.message); }
@@ -2547,7 +2545,7 @@ server.tool(
           manualCount
             ? `${manualCount} step(s) need manual configuration. Show the manual_guide to the user step by step.`
             : 'All steps were automated successfully.',
-          `Share the SN Flow Designer URL: ${sn.baseUrl}/nav_to.do?uri=sys_flow.do`,
+          `Share the SN Flow Designer URL: ${sn.baseUrl}/sys_flow.do`,
         ],
         flow: results,
         manual_guide: plan.manual,
@@ -4030,7 +4028,7 @@ Always dry_run first to preview the record that will be created.`,
         sys_id:     record.sys_id,
         name,
         note:       'Fix Script record created. Navigate to System Definition > Fix Scripts in your SN instance to run it.',
-        navigate_to: `${process.env.SN_INSTANCE_URL}/nav_to.do?uri=sys_script_fix.do?sys_id=${record.sys_id}`,
+        navigate_to: _snRecordUrl(sn, 'sys_script_fix', record.sys_id),
       });
     } catch (e) { return fail(e.message); }
   }
