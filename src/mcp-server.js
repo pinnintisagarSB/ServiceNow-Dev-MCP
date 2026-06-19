@@ -193,6 +193,14 @@ async function _loadPlatformCreds(platform) {
 const ok  = (data) => ({ content: [{ type: 'text', text: JSON.stringify(data) }] });
 const fail = (msg) => ({ content: [{ type: 'text', text: `ERROR: ${msg}` }], isError: true });
 
+// Returns the live instance base URL from the connector (most reliable source).
+// Falls back to session creds → env var so it works in all auth modes.
+function _snRecordUrl(sn, table, sysId) {
+  const base = (sn?.baseUrl ?? _sessionCreds.servicenow?.instanceUrl ?? process.env.SN_INSTANCE_URL ?? '').replace(/\/$/, '');
+  if (!base || !sysId) return null;
+  return `${base}/${table}.do?sys_id=${sysId}`;
+}
+
 // ── Credential guards ──────────────────────────────────────────────────────
 // Each returns { connector } on success or { error: fail(...) } when credentials
 // are missing or authentication fails — so every tool can gate itself with:
@@ -7266,8 +7274,6 @@ can see what they've already submitted before making a new request.`,
         sysparm_orderby:       'start_date',
       });
 
-      const instanceBase = (_sessionCreds.servicenow?.instanceUrl ?? process.env.SN_INSTANCE_URL ?? '').replace(/\/$/, '');
-
       return ok({
         employee: targetUser.name,
         count: requests.length,
@@ -7281,7 +7287,7 @@ can see what they've already submitted before making a new request.`,
           status:     r.status,
           comments:   r.comments || null,
           approver:   r['approver.name'] ? { name: r['approver.name'], email: r['approver.email'] || null } : null,
-          url:        instanceBase ? `${instanceBase}/nav_to.do?uri=sn_hr_core_emp_time_off.do?sys_id=${r.sys_id}` : null,
+          url:        _snRecordUrl(sn, 'sn_hr_core_emp_time_off', r.sys_id),
         })),
       });
     } catch (e) { return fail(e.message); }
@@ -7446,8 +7452,6 @@ employee before calling this tool. This creates a real record in ServiceNow.`,
         if (created?.['approver.name']) approver = { name: created['approver.name'], email: created['approver.email'] || null };
       } catch (_) {}
 
-      const instanceBase = (_sessionCreds.servicenow?.instanceUrl ?? process.env.SN_INSTANCE_URL ?? '').replace(/\/$/, '');
-
       return ok({
         success:    true,
         employee:   targetUser.name,
@@ -7458,7 +7462,7 @@ employee before calling this tool. This creates a real record in ServiceNow.`,
         end_date:   record.end_date   ?? end_date,
         days:       quantity,
         approver,
-        url:        instanceBase ? `${instanceBase}/nav_to.do?uri=sn_hr_core_emp_time_off.do?sys_id=${record.sys_id}` : null,
+        url:        _snRecordUrl(sn, 'sn_hr_core_emp_time_off', record.sys_id),
         message:    `Leave request submitted for ${targetUser.name}. ${quantity} working day(s) from ${start_date} to ${end_date}.`,
       });
     } catch (e) { return fail(e.message); }
@@ -7507,8 +7511,6 @@ Use to change dates or cancel a pending/approved request. Confirm the action wit
         }
       }
 
-      const instanceBase = (_sessionCreds.servicenow?.instanceUrl ?? process.env.SN_INSTANCE_URL ?? '').replace(/\/$/, '');
-
       if (action === 'cancel') {
         const updated = await sn.patch('sn_hr_core_emp_time_off', request_id, {
           status: 'cancelled',
@@ -7520,7 +7522,7 @@ Use to change dates or cancel a pending/approved request. Confirm the action wit
           request_id,
           table:   'sn_hr_core_emp_time_off',
           status:  updated.status ?? 'cancelled',
-          url:     instanceBase ? `${instanceBase}/nav_to.do?uri=sn_hr_core_emp_time_off.do?sys_id=${request_id}` : null,
+          url:     _snRecordUrl(sn, 'sn_hr_core_emp_time_off', request_id),
           message: `Leave request cancelled successfully.`,
         });
       }
@@ -7555,7 +7557,7 @@ Use to change dates or cancel a pending/approved request. Confirm the action wit
         end_date:   updated.end_date   ?? end_date,
         days:       updated.quantity   ?? quantity,
         status:     updated.status,
-        url:        instanceBase ? `${instanceBase}/nav_to.do?uri=sn_hr_core_emp_time_off.do?sys_id=${request_id}` : null,
+        url:        _snRecordUrl(sn, 'sn_hr_core_emp_time_off', request_id),
         message:    `Leave request updated to ${start_date} – ${end_date} (${quantity} working day(s)).`,
       });
     } catch (e) { return fail(e.message); }
@@ -7579,7 +7581,6 @@ Always show the email preview to the user and ask for confirmation before sendin
       const { sn, error: _snErr } = await _requireSn();
       if (_snErr) return _snErr;
 
-      const instanceBase = (_sessionCreds.servicenow?.instanceUrl ?? process.env.SN_INSTANCE_URL ?? '').replace(/\/$/, '');
       const senderName = from_name ?? _snCallerUsername() ?? 'ServiceNow';
 
       // Build professional HTML body
@@ -7615,7 +7616,7 @@ Always show the email preview to the user and ask for confirmation before sendin
         cc:         cc_email || null,
         subject,
         status:     emailRecord.state ?? 'queued',
-        url:        instanceBase ? `${instanceBase}/nav_to.do?uri=sys_email.do?sys_id=${emailRecord.sys_id}` : null,
+        url:        _snRecordUrl(sn, 'sys_email', emailRecord.sys_id),
         message:    `Email queued to ${to_email} — subject: "${subject}". ServiceNow will send it shortly.`,
       });
     } catch (e) { return fail(e.message); }
