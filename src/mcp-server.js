@@ -301,6 +301,7 @@ ServiceNow Dev MCP — call get_config first every session.
 If any platform shows configured:false, call get_credential_setup_url and send the user the portal link.
 NEVER ask for passwords or tokens in chat — credentials are entered in the portal only.
 On auth errors, call get_credential_setup_url and ask the user to update credentials in the portal.
+Default platform is ServiceNow — always use ServiceNow tools unless the user explicitly mentions Jira or Salesforce.
 `.trim();
 
 function createServer() {
@@ -7259,15 +7260,18 @@ can see what they've already submitted before making a new request.`,
 
       const requests = await sn.get('sn_hr_core_emp_time_off', {
         sysparm_query:         query,
-        sysparm_fields:        'sys_id,type.name,start_date,end_date,quantity,status',
+        sysparm_fields:        'sys_id,type.name,start_date,end_date,quantity,status,approver.name,approver.email,comments',
         sysparm_display_value: 'true',
         sysparm_limit:         String(limit),
         sysparm_orderby:       'start_date',
       });
 
+      const instanceBase = (_sessionCreds.servicenow?.instanceUrl ?? process.env.SN_INSTANCE_URL ?? '').replace(/\/$/, '');
+
       return ok({
         employee: targetUser.name,
         count: requests.length,
+        table: 'sn_hr_core_emp_time_off',
         requests: requests.map(r => ({
           id:         r.sys_id,
           type:       r['type.name'] ?? r.type,
@@ -7275,6 +7279,9 @@ can see what they've already submitted before making a new request.`,
           end_date:   r.end_date,
           days:       r.quantity,
           status:     r.status,
+          comments:   r.comments || null,
+          approver:   r['approver.name'] ? { name: r['approver.name'], email: r['approver.email'] || null } : null,
+          url:        instanceBase ? `${instanceBase}/nav_to.do?uri=sn_hr_core_emp_time_off.do?sys_id=${r.sys_id}` : null,
         })),
       });
     } catch (e) { return fail(e.message); }
@@ -7429,15 +7436,187 @@ employee before calling this tool. This creates a real record in ServiceNow.`,
         ...(comments ? { comments } : {}),
       });
 
+      // Fetch the created record with approver details
+      let approver = null;
+      try {
+        const created = await sn.getById('sn_hr_core_emp_time_off', record.sys_id, {
+          sysparm_fields:        'approver.name,approver.email',
+          sysparm_display_value: 'true',
+        });
+        if (created?.['approver.name']) approver = { name: created['approver.name'], email: created['approver.email'] || null };
+      } catch (_) {}
+
+      const instanceBase = (_sessionCreds.servicenow?.instanceUrl ?? process.env.SN_INSTANCE_URL ?? '').replace(/\/$/, '');
+
       return ok({
-        success: true,
+        success:    true,
         employee:   targetUser.name,
         request_id: record.sys_id,
+        table:      'sn_hr_core_emp_time_off',
         status:     record.status ?? 'submitted',
         start_date: record.start_date ?? start_date,
         end_date:   record.end_date   ?? end_date,
-        days:       record.quantity   ?? quantity,
+        days:       quantity,
+        approver,
+        url:        instanceBase ? `${instanceBase}/nav_to.do?uri=sn_hr_core_emp_time_off.do?sys_id=${record.sys_id}` : null,
         message:    `Leave request submitted for ${targetUser.name}. ${quantity} working day(s) from ${start_date} to ${end_date}.`,
+      });
+    } catch (e) { return fail(e.message); }
+  }
+);
+
+server.tool(
+  'update_leave_request',
+  `Update or cancel an existing leave request in ServiceNow (table: sn_hr_core_emp_time_off).
+Use to change dates or cancel a pending/approved request. Confirm the action with the user before calling.`,
+  {
+    request_id: z.string().describe('sys_id of the leave request. Get from get_my_leave_requests.'),
+    action:     z.enum(['cancel', 'update_dates']).describe('cancel — withdraw the request; update_dates — change start/end dates'),
+    start_date: z.string().optional().describe('New start date YYYY-MM-DD (required for update_dates)'),
+    end_date:   z.string().optional().describe('New end date YYYY-MM-DD (required for update_dates)'),
+    comments:   z.string().optional().describe('Reason for cancellation or change'),
+  },
+  async ({ request_id, action, start_date, end_date, comments }) => {
+    try {
+      const { sn, error: _snErr } = await _requireSn();
+      if (_snErr) return _snErr;
+
+      // Fetch the existing request
+      const existing = await sn.getById('sn_hr_core_emp_time_off', request_id, {
+        sysparm_fields:        'sys_id,status,start_date,end_date,quantity,hr_profile,type,type.name',
+        sysparm_display_value: 'true',
+      });
+      if (!existing) return fail(`Leave request not found: ${request_id}`);
+
+      // Access control — only owner or HR can modify
+      const callerUsername = _snCallerUsername();
+      if (callerUsername) {
+        const callerUser = await _snResolveUser(sn, callerUsername);
+        if (callerUser) {
+          // Resolve owner via hr_profile
+          const profiles = await sn.get('sn_hr_core_profile', {
+            sysparm_query:  `sys_id=${existing.hr_profile?.value ?? existing.hr_profile}`,
+            sysparm_fields: 'user',
+            sysparm_limit:  '1',
+          });
+          const ownerSysId = profiles[0]?.user?.value ?? profiles[0]?.user;
+          if (ownerSysId && ownerSysId !== callerUser.sys_id) {
+            const denied = await _enforceLeaveAccess(sn, callerUser, { sys_id: ownerSysId, name: 'record owner' });
+            if (denied) return denied;
+          }
+        }
+      }
+
+      const instanceBase = (_sessionCreds.servicenow?.instanceUrl ?? process.env.SN_INSTANCE_URL ?? '').replace(/\/$/, '');
+
+      if (action === 'cancel') {
+        const updated = await sn.patch('sn_hr_core_emp_time_off', request_id, {
+          status: 'cancelled',
+          ...(comments ? { comments } : {}),
+        });
+        return ok({
+          success: true,
+          action:  'cancelled',
+          request_id,
+          table:   'sn_hr_core_emp_time_off',
+          status:  updated.status ?? 'cancelled',
+          url:     instanceBase ? `${instanceBase}/nav_to.do?uri=sn_hr_core_emp_time_off.do?sys_id=${request_id}` : null,
+          message: `Leave request cancelled successfully.`,
+        });
+      }
+
+      // update_dates
+      if (!start_date || !end_date) return fail('start_date and end_date are required for update_dates.');
+
+      // Recalculate working days
+      const s = new Date(start_date), e = new Date(end_date);
+      let working_days = 0;
+      for (let d = new Date(s); d <= e; d.setDate(d.getDate() + 1)) {
+        if (d.getDay() !== 0 && d.getDay() !== 6) working_days++;
+      }
+      const holRows = await sn.get('sys_holiday', {
+        sysparm_query: `date>=${start_date}^date<=${end_date}`,
+        sysparm_fields: 'date',
+        sysparm_limit:  '50',
+      });
+      const quantity = Math.max(1, working_days - holRows.length);
+
+      const updated = await sn.patch('sn_hr_core_emp_time_off', request_id, {
+        start_date, end_date, quantity,
+        ...(comments ? { comments } : {}),
+      });
+
+      return ok({
+        success:    true,
+        action:     'dates_updated',
+        request_id,
+        table:      'sn_hr_core_emp_time_off',
+        start_date: updated.start_date ?? start_date,
+        end_date:   updated.end_date   ?? end_date,
+        days:       updated.quantity   ?? quantity,
+        status:     updated.status,
+        url:        instanceBase ? `${instanceBase}/nav_to.do?uri=sn_hr_core_emp_time_off.do?sys_id=${request_id}` : null,
+        message:    `Leave request updated to ${start_date} – ${end_date} (${quantity} working day(s)).`,
+      });
+    } catch (e) { return fail(e.message); }
+  }
+);
+
+server.tool(
+  'send_email',
+  `Send a professional email to a user via ServiceNow (table: sys_email / sysevent_email_action).
+Use when the user asks to send a notification, reminder, or confirmation email.
+Always show the email preview to the user and ask for confirmation before sending.`,
+  {
+    to_email:    z.string().describe('Recipient email address'),
+    subject:     z.string().describe('Email subject line'),
+    body:        z.string().describe('Plain-text body — will be formatted professionally. Use \\n for line breaks.'),
+    cc_email:    z.string().optional().describe('Optional CC email address'),
+    from_name:   z.string().optional().describe('Sender display name (defaults to your name or the ServiceNow instance name)'),
+  },
+  async ({ to_email, subject, body, cc_email, from_name }) => {
+    try {
+      const { sn, error: _snErr } = await _requireSn();
+      if (_snErr) return _snErr;
+
+      const instanceBase = (_sessionCreds.servicenow?.instanceUrl ?? process.env.SN_INSTANCE_URL ?? '').replace(/\/$/, '');
+      const senderName = from_name ?? _snCallerUsername() ?? 'ServiceNow';
+
+      // Build professional HTML body
+      const htmlBody = `
+<div style="font-family:Arial,sans-serif;max-width:600px;margin:0 auto;color:#222">
+  <div style="background:#0066cc;padding:20px 28px">
+    <span style="color:#fff;font-size:18px;font-weight:bold">ServiceNow</span>
+  </div>
+  <div style="padding:28px;background:#fff;border:1px solid #e0e0e0">
+    ${body.split('\n').map(line => line.trim() ? `<p style="margin:0 0 12px">${line}</p>` : '<br/>').join('')}
+  </div>
+  <div style="padding:14px 28px;background:#f5f5f5;font-size:12px;color:#888;border:1px solid #e0e0e0;border-top:none">
+    This is an automated message sent via ServiceNow. Please do not reply directly to this email.
+  </div>
+</div>`.trim();
+
+      const emailRecord = await sn.post('sys_email', {
+        type:          'send',
+        state:         'ready',
+        to:            to_email,
+        subject,
+        body:          htmlBody,
+        body_text:     body,
+        ...(cc_email   ? { cc: cc_email }            : {}),
+        ...(senderName ? { from_name: senderName }   : {}),
+      });
+
+      return ok({
+        success:    true,
+        table:      'sys_email',
+        email_id:   emailRecord.sys_id,
+        to:         to_email,
+        cc:         cc_email || null,
+        subject,
+        status:     emailRecord.state ?? 'queued',
+        url:        instanceBase ? `${instanceBase}/nav_to.do?uri=sys_email.do?sys_id=${emailRecord.sys_id}` : null,
+        message:    `Email queued to ${to_email} — subject: "${subject}". ServiceNow will send it shortly.`,
       });
     } catch (e) { return fail(e.message); }
   }
