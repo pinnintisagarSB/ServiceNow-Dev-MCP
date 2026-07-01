@@ -4093,6 +4093,1259 @@ Returns Markdown text ready to paste into Confluence, GitHub, or a wiki.`,
   }
 );
 
+// ══════════════════════════════════════════════════════════════════════════
+// BUSINESS RULES  (sys_script)
+// Best practices: always scope to table, use condition field to limit
+// execution, prefer 'after' for notifications/integrations, 'before' for
+// data manipulation. Never do DML on 'query' business rules.
+// ══════════════════════════════════════════════════════════════════════════
+
+server.tool(
+  'list_business_rules',
+  `List Business Rules on a ServiceNow table (sys_script). Includes when/order/condition for quick review.`,
+  {
+    table:  z.string().optional().describe('Table name to filter (e.g. incident). Omit for all.'),
+    search: z.string().optional().describe('Filter by name (partial match)'),
+    active: z.boolean().optional().default(true),
+    limit:  z.number().optional().default(25),
+  },
+  async ({ table, search, active, limit }) => {
+    try {
+      const { sn, error } = await _requireSn();
+      if (error) return error;
+
+      let query = active !== undefined ? `active=${active}` : '';
+      if (table)  query += `${query ? '^' : ''}collection=${table}`;
+      if (search) query += `${query ? '^' : ''}nameLIKE${search}`;
+
+      const rules = await sn.get('sys_script', {
+        sysparm_query:  query || 'active=true',
+        sysparm_fields: 'sys_id,name,collection,when,order,active,condition,short_description',
+        sysparm_limit:  String(limit),
+        sysparm_orderby: 'collection,order',
+      });
+
+      return ok({
+        count: rules.length,
+        rules: rules.map(r => ({
+          sys_id:      r.sys_id,
+          name:        r.name,
+          table:       r.collection,
+          when:        r.when,
+          order:       r.order,
+          active:      r.active,
+          condition:   r.condition || null,
+          description: r.short_description || null,
+          url:         _snRecordUrl(sn, 'sys_script', r.sys_id),
+        })),
+      });
+    } catch (e) { return fail(e.message); }
+  }
+);
+
+server.tool(
+  'create_business_rule',
+  `Create a Business Rule in ServiceNow (sys_script).
+Best practices enforced:
+- 'before' rules for data manipulation (set fields, abort)
+- 'after' rules for notifications, integrations, async work
+- 'async' for heavy processing (email, REST calls) — never block transactions
+- Always set a condition to limit execution scope
+- Set a meaningful order (100–900) to control sequence`,
+  {
+    name:        z.string().describe('Descriptive name — include table and action (e.g. "Incident - Set Priority on Insert")'),
+    table:       z.string().describe('Table name (e.g. incident, change_request, sc_request)'),
+    when:        z.enum(['before','after','async','display']).describe('Execution timing. Use async for integrations/email.'),
+    order:       z.number().optional().default(100).describe('Execution order (100–900). Lower = earlier.'),
+    condition:   z.string().optional().describe('GlideRecord condition expression (e.g. current.priority==1). Leave blank to run always.'),
+    script:      z.string().describe('JavaScript body. Has access to current, previous, gs, GlideRecord, GlideSystem.'),
+    on_insert:   z.boolean().optional().default(true),
+    on_update:   z.boolean().optional().default(false),
+    on_delete:   z.boolean().optional().default(false),
+    on_query:    z.boolean().optional().default(false),
+    description: z.string().optional(),
+    active:      z.boolean().optional().default(true),
+  },
+  async ({ name, table, when, order, condition, script, on_insert, on_update, on_delete, on_query, description, active }) => {
+    try {
+      const { sn, error } = await _requireSn();
+      if (error) return error;
+
+      if (when === 'display' && (on_delete || on_query)) return fail('Display business rules only apply to insert/update.');
+      if (on_query && when !== 'before') return fail('Query business rules must run "before".');
+
+      const rule = await sn.post('sys_script', {
+        name,
+        collection:        table,
+        when,
+        order:             order ?? 100,
+        condition:         condition ?? '',
+        script,
+        action_insert:     on_insert  !== false,
+        action_update:     on_update  ?? false,
+        action_delete:     on_delete  ?? false,
+        action_query:      on_query   ?? false,
+        short_description: description ?? '',
+        active:            active !== false,
+      });
+
+      return ok({
+        success: true,
+        sys_id:  rule.sys_id,
+        name:    rule.name,
+        table,
+        when,
+        order:   rule.order,
+        url:     _snRecordUrl(sn, 'sys_script', rule.sys_id),
+        tip:     when === 'after' && (on_insert || on_update) ? 'Consider using async if this rule does external calls or sends emails.' : null,
+      });
+    } catch (e) { return fail(e.message); }
+  }
+);
+
+server.tool(
+  'toggle_business_rule',
+  `Activate or deactivate a Business Rule (sys_script) by sys_id.`,
+  {
+    sys_id: z.string().describe('sys_id of the business rule'),
+    active: z.boolean().describe('true to activate, false to deactivate'),
+  },
+  async ({ sys_id, active }) => {
+    try {
+      const { sn, error } = await _requireSn();
+      if (error) return error;
+      const rule = await sn.patch('sys_script', sys_id, { active });
+      return ok({ success: true, sys_id, name: rule.name, active: rule.active, url: _snRecordUrl(sn, 'sys_script', sys_id) });
+    } catch (e) { return fail(e.message); }
+  }
+);
+
+// ══════════════════════════════════════════════════════════════════════════
+// CLIENT SCRIPTS  (sys_script_client)
+// Best practices: use onChange sparingly (fires on every change), onLoad
+// for initial form setup, onSubmit for validation only. Never do REST
+// calls from client scripts — use GlideAjax or a server-side Script Include.
+// ══════════════════════════════════════════════════════════════════════════
+
+server.tool(
+  'list_client_scripts',
+  `List Client Scripts for a table (sys_script_client).`,
+  {
+    table:  z.string().optional().describe('Filter by table name'),
+    type:   z.enum(['onLoad','onChange','onSubmit','onCellEdit']).optional(),
+    search: z.string().optional(),
+    limit:  z.number().optional().default(25),
+  },
+  async ({ table, type, search, limit }) => {
+    try {
+      const { sn, error } = await _requireSn();
+      if (error) return error;
+
+      let query = 'active=true';
+      if (table)  query += `^table=${table}`;
+      if (type)   query += `^type=${type}`;
+      if (search) query += `^nameLIKE${search}`;
+
+      const scripts = await sn.get('sys_script_client', {
+        sysparm_query:  query,
+        sysparm_fields: 'sys_id,name,table,type,field_name,active,description',
+        sysparm_limit:  String(limit),
+        sysparm_orderby: 'table,type',
+      });
+
+      return ok({
+        count: scripts.length,
+        scripts: scripts.map(s => ({
+          sys_id:      s.sys_id,
+          name:        s.name,
+          table:       s.table,
+          type:        s.type,
+          field:       s.field_name || null,
+          active:      s.active,
+          description: s.description || null,
+          url:         _snRecordUrl(sn, 'sys_script_client', s.sys_id),
+        })),
+      });
+    } catch (e) { return fail(e.message); }
+  }
+);
+
+server.tool(
+  'create_client_script',
+  `Create a Client Script in ServiceNow (sys_script_client).
+Best practices enforced:
+- onChange requires a field_name
+- onSubmit scripts must return true (allow) or false (block)
+- Never make synchronous GlideRecord calls — use GlideAjax
+- Keep scripts small; heavy logic belongs in Script Includes`,
+  {
+    name:       z.string().describe('Descriptive name (e.g. "Incident - Require Category on Submit")'),
+    table:      z.string().describe('Table name (e.g. incident)'),
+    type:       z.enum(['onLoad','onChange','onSubmit','onCellEdit']).describe('Trigger type'),
+    script:     z.string().describe('JavaScript. Has access to g_form, g_user, g_list. Use GlideAjax for server calls.'),
+    field_name: z.string().optional().describe('Field name — required for onChange and onCellEdit'),
+    description: z.string().optional(),
+    active:     z.boolean().optional().default(true),
+    global:     z.boolean().optional().default(false).describe('Apply to all views (true) or current view only (false)'),
+  },
+  async ({ name, table, type, script, field_name, description, active, global: isGlobal }) => {
+    try {
+      const { sn, error } = await _requireSn();
+      if (error) return error;
+
+      if ((type === 'onChange' || type === 'onCellEdit') && !field_name) {
+        return fail(`field_name is required for ${type} client scripts.`);
+      }
+
+      const cs = await sn.post('sys_script_client', {
+        name,
+        table,
+        type,
+        script,
+        field_name:   field_name ?? '',
+        description:  description ?? '',
+        active:       active !== false,
+        global:       isGlobal ?? false,
+      });
+
+      return ok({
+        success: true,
+        sys_id:  cs.sys_id,
+        name:    cs.name,
+        table,
+        type,
+        field:   field_name || null,
+        url:     _snRecordUrl(sn, 'sys_script_client', cs.sys_id),
+      });
+    } catch (e) { return fail(e.message); }
+  }
+);
+
+// ══════════════════════════════════════════════════════════════════════════
+// UI POLICIES  (sys_ui_policy) & UI ACTIONS  (sys_ui_action)
+// ══════════════════════════════════════════════════════════════════════════
+
+server.tool(
+  'create_ui_policy',
+  `Create a UI Policy to show/hide/make mandatory fields based on conditions (sys_ui_policy).
+Preferred over Client Scripts for simple field visibility/mandatory rules — no JavaScript needed.`,
+  {
+    name:       z.string().describe('Policy name (e.g. "Require Resolution Notes when Resolved")'),
+    table:      z.string().describe('Table name'),
+    conditions: z.string().describe('Encoded query condition (e.g. state=6^priority=1). Use preview_query to build.'),
+    actions:    z.array(z.object({
+      field:     z.string().describe('Field name'),
+      mandatory: z.enum(['true','false','leave']).optional().default('leave'),
+      visible:   z.enum(['true','false','leave']).optional().default('leave'),
+      read_only: z.enum(['true','false','leave']).optional().default('leave'),
+    })).describe('Field actions to apply when condition is true'),
+    reverse_if_false: z.boolean().optional().default(true).describe('Reverse actions when condition becomes false (recommended: true)'),
+    active:     z.boolean().optional().default(true),
+  },
+  async ({ name, table, conditions, actions, reverse_if_false, active }) => {
+    try {
+      const { sn, error } = await _requireSn();
+      if (error) return error;
+
+      const policy = await sn.post('sys_ui_policy', {
+        short_description: name,
+        table,
+        conditions,
+        reverse_if_false: reverse_if_false !== false,
+        active:           active !== false,
+      });
+
+      // Create field actions
+      const fieldActions = await Promise.all(actions.map(a =>
+        sn.post('sys_ui_policy_action', {
+          ui_policy:  policy.sys_id,
+          field_name: a.field,
+          mandatory:  a.mandatory  ?? 'leave',
+          visible:    a.visible    ?? 'leave',
+          read_only:  a.read_only  ?? 'leave',
+        })
+      ));
+
+      return ok({
+        success:       true,
+        sys_id:        policy.sys_id,
+        name,
+        table,
+        fields_configured: fieldActions.length,
+        url:           _snRecordUrl(sn, 'sys_ui_policy', policy.sys_id),
+      });
+    } catch (e) { return fail(e.message); }
+  }
+);
+
+server.tool(
+  'create_ui_action',
+  `Create a UI Action (button, context menu item, or link) on a form or list (sys_ui_action).`,
+  {
+    name:       z.string().describe('Label shown to the user (e.g. "Escalate to Management")'),
+    table:      z.string().describe('Table name'),
+    action_name: z.string().describe('Internal action name — lowercase_underscores (e.g. escalate_to_mgmt)'),
+    script:     z.string().describe('Server-side JavaScript executed when clicked. Use current, gs, GlideRecord.'),
+    type:       z.enum(['button','context_menu','link','list_banner_button']).optional().default('button'),
+    condition:  z.string().optional().describe('Show this action only when condition is true (e.g. current.state!=6)'),
+    client:     z.boolean().optional().default(false).describe('Run as client-side action (uses g_form). Rarely needed — prefer server-side.'),
+    onclick:    z.string().optional().describe('Client-side JS to run before server call (only when client=true)'),
+    active:     z.boolean().optional().default(true),
+  },
+  async ({ name, table, action_name, script, type, condition, client, onclick, active }) => {
+    try {
+      const { sn, error } = await _requireSn();
+      if (error) return error;
+
+      const action = await sn.post('sys_ui_action', {
+        name,
+        table,
+        action_name:      action_name.toLowerCase().replace(/\s+/g, '_'),
+        script,
+        form_button:      type === 'button',
+        form_context_menu: type === 'context_menu',
+        form_link:        type === 'link',
+        list_banner_button: type === 'list_banner_button',
+        condition:        condition ?? '',
+        client:           client ?? false,
+        onclick:          onclick ?? '',
+        active:           active !== false,
+      });
+
+      return ok({
+        success:     true,
+        sys_id:      action.sys_id,
+        name:        action.name,
+        table,
+        action_name: action.action_name,
+        type,
+        url:         _snRecordUrl(sn, 'sys_ui_action', action.sys_id),
+      });
+    } catch (e) { return fail(e.message); }
+  }
+);
+
+// ══════════════════════════════════════════════════════════════════════════
+// SYSTEM PROPERTIES  (sys_properties)
+// Best practices: always set description, never overwrite system-owned
+// properties without understanding the impact. Use category to organise.
+// ══════════════════════════════════════════════════════════════════════════
+
+server.tool(
+  'get_sys_property',
+  `Read a ServiceNow system property value (sys_properties).`,
+  {
+    name: z.string().describe('Property name (e.g. glide.email.smtp.host)'),
+  },
+  async ({ name }) => {
+    try {
+      const { sn, error } = await _requireSn();
+      if (error) return error;
+
+      const props = await sn.get('sys_properties', {
+        sysparm_query:  `name=${name}`,
+        sysparm_fields: 'sys_id,name,value,description,type,category,private',
+        sysparm_limit:  '1',
+      });
+
+      if (!props[0]) return fail(`Property not found: ${name}`);
+      const p = props[0];
+
+      return ok({
+        name:        p.name,
+        value:       p.private === 'true' ? '*** (private)' : p.value,
+        type:        p.type,
+        category:    p.category,
+        description: p.description,
+        private:     p.private === 'true',
+        url:         _snRecordUrl(sn, 'sys_properties', p.sys_id),
+      });
+    } catch (e) { return fail(e.message); }
+  }
+);
+
+server.tool(
+  'set_sys_property',
+  `Create or update a ServiceNow system property (sys_properties).
+Always provide a description. Use category to group related properties.
+Changing core system properties (glide.*) can break the instance — confirm with the user first.`,
+  {
+    name:        z.string().describe('Property name (e.g. x_myapp.feature.enabled)'),
+    value:       z.string().describe('Property value'),
+    description: z.string().describe('What this property controls — always set this'),
+    type:        z.enum(['string','integer','boolean','choice','password2','date','reference']).optional().default('string'),
+    category:    z.string().optional().describe('Category for grouping (e.g. "My App Settings")'),
+    private:     z.boolean().optional().default(false).describe('Mask value from non-admin users'),
+  },
+  async ({ name, value, description, type, category, private: isPrivate }) => {
+    try {
+      const { sn, error } = await _requireSn();
+      if (error) return error;
+
+      const existing = await sn.get('sys_properties', {
+        sysparm_query: `name=${name}`,
+        sysparm_fields: 'sys_id',
+        sysparm_limit: '1',
+      });
+
+      const payload = { name, value, description, type: type ?? 'string', category: category ?? '', private: isPrivate ?? false };
+      let prop, action;
+
+      if (existing[0]) {
+        prop = await sn.patch('sys_properties', existing[0].sys_id, payload);
+        action = 'updated';
+      } else {
+        prop = await sn.post('sys_properties', payload);
+        action = 'created';
+      }
+
+      return ok({ success: true, action, name, value, url: _snRecordUrl(sn, 'sys_properties', prop.sys_id) });
+    } catch (e) { return fail(e.message); }
+  }
+);
+
+server.tool(
+  'list_sys_properties',
+  `List system properties, optionally filtered by category or name prefix (sys_properties).`,
+  {
+    category: z.string().optional().describe('Filter by category'),
+    prefix:   z.string().optional().describe('Filter by name prefix (e.g. "glide.email")'),
+    limit:    z.number().optional().default(30),
+  },
+  async ({ category, prefix, limit }) => {
+    try {
+      const { sn, error } = await _requireSn();
+      if (error) return error;
+
+      let query = 'active=true';
+      if (category) query += `^category=${category}`;
+      if (prefix)   query += `^nameLIKE${prefix}`;
+
+      const props = await sn.get('sys_properties', {
+        sysparm_query:   query,
+        sysparm_fields:  'sys_id,name,value,description,category,private,type',
+        sysparm_limit:   String(limit),
+        sysparm_orderby: 'name',
+      });
+
+      return ok({
+        count: props.length,
+        properties: props.map(p => ({
+          name:        p.name,
+          value:       p.private === 'true' ? '*** (private)' : p.value,
+          type:        p.type,
+          category:    p.category,
+          description: p.description,
+          url:         _snRecordUrl(sn, 'sys_properties', p.sys_id),
+        })),
+      });
+    } catch (e) { return fail(e.message); }
+  }
+);
+
+// ══════════════════════════════════════════════════════════════════════════
+// FLOW DESIGNER  (sys_hub_flow)
+// Best practices: use record-triggered flows for automation on table events,
+// manual triggers for on-demand, scheduled for periodic work.
+// Always activate flows after creation — they are inactive by default.
+// ══════════════════════════════════════════════════════════════════════════
+
+server.tool(
+  'list_flows',
+  `List Flow Designer flows (sys_hub_flow).`,
+  {
+    search:  z.string().optional().describe('Filter by name'),
+    trigger: z.enum(['record','manual','scheduled','subflow','any']).optional().default('any'),
+    active:  z.boolean().optional().default(true),
+    limit:   z.number().optional().default(25),
+  },
+  async ({ search, trigger, active, limit }) => {
+    try {
+      const { sn, error } = await _requireSn();
+      if (error) return error;
+
+      let query = active !== undefined ? `active=${active}` : '';
+      if (search)              query += `${query?'^':''}nameLIKE${search}`;
+      if (trigger && trigger !== 'any') query += `${query?'^':''}trigger_type=${trigger}`;
+
+      const flows = await sn.get('sys_hub_flow', {
+        sysparm_query:   query || 'active=true',
+        sysparm_fields:  'sys_id,name,active,trigger_type,description,internal_name',
+        sysparm_limit:   String(limit),
+        sysparm_orderby: 'name',
+      });
+
+      return ok({
+        count: flows.length,
+        flows: flows.map(f => ({
+          sys_id:      f.sys_id,
+          name:        f.name,
+          trigger:     f.trigger_type,
+          active:      f.active,
+          description: f.description || null,
+          url:         _snRecordUrl(sn, 'sys_hub_flow', f.sys_id),
+        })),
+      });
+    } catch (e) { return fail(e.message); }
+  }
+);
+
+server.tool(
+  'trigger_flow',
+  `Trigger a Flow Designer flow on demand via the Flow API (sys_hub_flow).
+Only works for flows with a manual trigger or subflows. Record-triggered flows run automatically.`,
+  {
+    flow_sys_id: z.string().describe('sys_id of the flow to trigger. Get from list_flows.'),
+    inputs:      z.record(z.string(), z.any()).optional().describe('Input variables for the flow as key-value pairs'),
+  },
+  async ({ flow_sys_id, inputs }) => {
+    try {
+      const { sn, error } = await _requireSn();
+      if (error) return error;
+
+      // Verify flow exists and is active
+      const flow = await sn.getById('sys_hub_flow', flow_sys_id, {
+        sysparm_fields: 'sys_id,name,active,trigger_type,internal_name',
+      });
+      if (!flow) return fail(`Flow not found: ${flow_sys_id}`);
+      if (flow.active === 'false' || flow.active === false) return fail(`Flow "${flow.name}" is inactive. Activate it first.`);
+
+      // Use the ServiceNow Flow API
+      const result = await sn.post('sys_hub_flow_api/run', {
+        flow:   flow.internal_name ?? flow_sys_id,
+        inputs: inputs ?? {},
+      });
+
+      return ok({
+        success:      true,
+        flow_name:    flow.name,
+        execution_id: result?.executionId ?? result?.sys_id ?? null,
+        status:       result?.status ?? 'triggered',
+        url:          _snRecordUrl(sn, 'sys_hub_flow', flow_sys_id),
+      });
+    } catch (e) { return fail(e.message); }
+  }
+);
+
+// ══════════════════════════════════════════════════════════════════════════
+// SCHEDULED JOBS  (sysauto_script — Scheduled Script Execution)
+// Best practices: use async business rules or flows when possible.
+// Scheduled jobs for periodic batch work only. Always set a run_as user.
+// Avoid gs.sleep() — use separate jobs. Log with gs.log() not gs.print().
+// ══════════════════════════════════════════════════════════════════════════
+
+server.tool(
+  'list_scheduled_jobs',
+  `List Scheduled Script Execution jobs in ServiceNow (sysauto_script).`,
+  {
+    search: z.string().optional(),
+    active: z.boolean().optional().default(true),
+    limit:  z.number().optional().default(25),
+  },
+  async ({ search, active, limit }) => {
+    try {
+      const { sn, error } = await _requireSn();
+      if (error) return error;
+
+      let query = active !== undefined ? `active=${active}` : 'active=true';
+      if (search) query += `^nameLIKE${search}`;
+
+      const jobs = await sn.get('sysauto_script', {
+        sysparm_query:   query,
+        sysparm_fields:  'sys_id,name,active,run_type,run_time,run_period,run_dayofweek,next_action',
+        sysparm_display_value: 'true',
+        sysparm_limit:   String(limit),
+        sysparm_orderby: 'name',
+      });
+
+      return ok({
+        count: jobs.length,
+        jobs: jobs.map(j => ({
+          sys_id:      j.sys_id,
+          name:        j.name,
+          active:      j.active,
+          run_type:    j.run_type,
+          run_time:    j.run_time || null,
+          next_run:    j.next_action || null,
+          url:         _snRecordUrl(sn, 'sysauto_script', j.sys_id),
+        })),
+      });
+    } catch (e) { return fail(e.message); }
+  }
+);
+
+server.tool(
+  'create_scheduled_job',
+  `Create a Scheduled Script Execution job in ServiceNow (sysauto_script).
+Best practices: always set run_as to a service account, not an admin. Use gs.log() for output.`,
+  {
+    name:         z.string().describe('Job name (e.g. "Daily Incident SLA Report")'),
+    script:       z.string().describe('JavaScript to execute. Use gs.log(), GlideRecord, GlideDateTime. No return value.'),
+    run_type:     z.enum(['daily','weekly','monthly','once','periodically','on_demand']).describe('Schedule frequency'),
+    run_time:     z.string().optional().describe('Time of day in HH:MM:SS format (for daily/weekly/monthly/once)'),
+    run_period:   z.string().optional().describe('Period in seconds for "periodically" (e.g. "3600" = every hour)'),
+    run_dayofweek: z.string().optional().describe('Day for weekly: 0=Sun,1=Mon,...,6=Sat'),
+    run_start:    z.string().optional().describe('Start date YYYY-MM-DD (for "once")'),
+    active:       z.boolean().optional().default(true),
+  },
+  async ({ name, script, run_type, run_time, run_period, run_dayofweek, run_start, active }) => {
+    try {
+      const { sn, error } = await _requireSn();
+      if (error) return error;
+
+      const payload = {
+        name,
+        script,
+        run_type,
+        active: active !== false,
+        run_time:       run_time      ?? '00:00:00',
+        run_period:     run_period    ?? '',
+        run_dayofweek:  run_dayofweek ?? '',
+        run_start:      run_start     ?? '',
+      };
+
+      const job = await sn.post('sysauto_script', payload);
+
+      return ok({
+        success:  true,
+        sys_id:   job.sys_id,
+        name:     job.name,
+        run_type,
+        url:      _snRecordUrl(sn, 'sysauto_script', job.sys_id),
+        tip:      'Jobs are active by default. Test with run_scheduled_job_now before deploying.',
+      });
+    } catch (e) { return fail(e.message); }
+  }
+);
+
+server.tool(
+  'run_scheduled_job_now',
+  `Execute a Scheduled Script Execution job immediately (outside its schedule) for testing.`,
+  {
+    sys_id: z.string().describe('sys_id of the sysauto_script record'),
+  },
+  async ({ sys_id }) => {
+    try {
+      const { sn, error } = await _requireSn();
+      if (error) return error;
+
+      const job = await sn.getById('sysauto_script', sys_id, { sysparm_fields: 'sys_id,name,active' });
+      if (!job) return fail(`Scheduled job not found: ${sys_id}`);
+
+      // Trigger via runNow endpoint
+      await sn.post(`sysauto_script/${sys_id}/runNow`, {});
+
+      return ok({
+        success:   true,
+        job_name:  job.name,
+        triggered: true,
+        note:      'Job queued for immediate execution. Check sys_log for output.',
+        log_url:   `${sn.baseUrl}/sys_log.do?sysparm_query=source=${job.name}`,
+      });
+    } catch (e) { return fail(e.message); }
+  }
+);
+
+// ══════════════════════════════════════════════════════════════════════════
+// KNOWLEDGE BASE  (kb_knowledge, kb_knowledge_base)
+// Best practices: always assign to a KB, set workflow state to 'published'
+// only after review. Use kb_category for organisation.
+// ══════════════════════════════════════════════════════════════════════════
+
+server.tool(
+  'search_knowledge',
+  `Search ServiceNow Knowledge Base articles (kb_knowledge).`,
+  {
+    query:    z.string().describe('Search term'),
+    kb_sys_id: z.string().optional().describe('Limit to a specific Knowledge Base sys_id'),
+    limit:    z.number().optional().default(10),
+  },
+  async ({ query, kb_sys_id, limit }) => {
+    try {
+      const { sn, error } = await _requireSn();
+      if (error) return error;
+
+      let snQuery = `workflow_state=published^short_descriptionLIKE${query}^ORtextLIKE${query}`;
+      if (kb_sys_id) snQuery += `^kb_knowledge_base=${kb_sys_id}`;
+
+      const articles = await sn.get('kb_knowledge', {
+        sysparm_query:   snQuery,
+        sysparm_fields:  'sys_id,short_description,kb_knowledge_base,category,author.name,sys_updated_on,view_count',
+        sysparm_display_value: 'true',
+        sysparm_limit:   String(limit),
+        sysparm_orderby: 'view_count',
+      });
+
+      return ok({
+        count: articles.length,
+        articles: articles.map(a => ({
+          sys_id:       a.sys_id,
+          title:        a.short_description,
+          kb:           a['kb_knowledge_base'],
+          category:     a.category || null,
+          author:       a['author.name'] || null,
+          updated:      a.sys_updated_on,
+          views:        a.view_count,
+          url:          _snRecordUrl(sn, 'kb_knowledge', a.sys_id),
+        })),
+      });
+    } catch (e) { return fail(e.message); }
+  }
+);
+
+server.tool(
+  'create_kb_article',
+  `Create a Knowledge Base article in ServiceNow (kb_knowledge).
+New articles are created in 'draft' state — publish only after review.`,
+  {
+    title:       z.string().describe('Article title'),
+    body:        z.string().describe('Article body (HTML supported)'),
+    kb_sys_id:   z.string().describe('sys_id of the Knowledge Base to publish to'),
+    category:    z.string().optional().describe('Category name or sys_id'),
+    tags:        z.string().optional().describe('Comma-separated meta tags'),
+    publish_now: z.boolean().optional().default(false).describe('Publish immediately (default: save as draft for review)'),
+  },
+  async ({ title, body, kb_sys_id, category, tags, publish_now }) => {
+    try {
+      const { sn, error } = await _requireSn();
+      if (error) return error;
+
+      const article = await sn.post('kb_knowledge', {
+        short_description: title,
+        text:              body,
+        kb_knowledge_base: kb_sys_id,
+        category:          category ?? '',
+        meta:              tags ?? '',
+        workflow_state:    publish_now ? 'published' : 'draft',
+      });
+
+      return ok({
+        success:        true,
+        sys_id:         article.sys_id,
+        title,
+        state:          publish_now ? 'published' : 'draft',
+        url:            _snRecordUrl(sn, 'kb_knowledge', article.sys_id),
+        tip:            publish_now ? null : 'Article saved as draft. Review and publish from the URL above.',
+      });
+    } catch (e) { return fail(e.message); }
+  }
+);
+
+// ══════════════════════════════════════════════════════════════════════════
+// SLA DEFINITIONS  (contract_sla)
+// ══════════════════════════════════════════════════════════════════════════
+
+server.tool(
+  'list_slas',
+  `List SLA definitions in ServiceNow (contract_sla).`,
+  {
+    table:  z.string().optional().describe('Filter by target table (e.g. incident)'),
+    search: z.string().optional(),
+    limit:  z.number().optional().default(20),
+  },
+  async ({ table, search, limit }) => {
+    try {
+      const { sn, error } = await _requireSn();
+      if (error) return error;
+
+      let query = 'active=true';
+      if (table)  query += `^table=${table}`;
+      if (search) query += `^nameLIKE${search}`;
+
+      const slas = await sn.get('contract_sla', {
+        sysparm_query:   query,
+        sysparm_fields:  'sys_id,name,table,type,duration,condition,active',
+        sysparm_display_value: 'true',
+        sysparm_limit:   String(limit),
+        sysparm_orderby: 'name',
+      });
+
+      return ok({
+        count: slas.length,
+        slas: slas.map(s => ({
+          sys_id:    s.sys_id,
+          name:      s.name,
+          table:     s.table,
+          type:      s.type,
+          duration:  s.duration,
+          condition: s.condition || null,
+          url:       _snRecordUrl(sn, 'contract_sla', s.sys_id),
+        })),
+      });
+    } catch (e) { return fail(e.message); }
+  }
+);
+
+server.tool(
+  'create_sla',
+  `Create an SLA definition in ServiceNow (contract_sla).
+Best practices: define clear start/stop/pause conditions. Use 'response' SLAs for first response, 'resolution' for closure.`,
+  {
+    name:             z.string().describe('SLA name (e.g. "P1 Incident Resolution - 4 Hours")'),
+    table:            z.string().describe('Target table (e.g. incident)'),
+    type:             z.enum(['response','resolution','request']).describe('SLA type'),
+    duration_days:    z.number().optional().default(0),
+    duration_hours:   z.number().optional().default(4),
+    duration_minutes: z.number().optional().default(0),
+    condition:        z.string().optional().describe('Encoded condition for SLA to apply (e.g. priority=1)'),
+    start_condition:  z.string().optional().describe('When the SLA clock starts'),
+    stop_condition:   z.string().optional().describe('When the SLA clock stops (resolved/closed)'),
+    pause_condition:  z.string().optional().describe('When to pause the SLA clock (e.g. awaiting_info)'),
+    schedule:         z.string().optional().describe('sys_id of a schedule (business hours). Leave blank for 24/7.'),
+  },
+  async ({ name, table, type, duration_days, duration_hours, duration_minutes, condition, start_condition, stop_condition, pause_condition, schedule }) => {
+    try {
+      const { sn, error } = await _requireSn();
+      if (error) return error;
+
+      const sla = await sn.post('contract_sla', {
+        name,
+        table,
+        type,
+        duration:         `${duration_days ?? 0} ${String(duration_hours ?? 4).padStart(2,'0')}:${String(duration_minutes ?? 0).padStart(2,'0')}:00`,
+        condition:        condition        ?? '',
+        start_condition:  start_condition  ?? '',
+        stop_condition:   stop_condition   ?? '',
+        pause_condition:  pause_condition  ?? '',
+        schedule:         schedule         ?? '',
+        active:           true,
+      });
+
+      return ok({
+        success:  true,
+        sys_id:   sla.sys_id,
+        name,
+        table,
+        type,
+        duration: `${duration_days}d ${duration_hours}h ${duration_minutes}m`,
+        url:      _snRecordUrl(sn, 'contract_sla', sla.sys_id),
+      });
+    } catch (e) { return fail(e.message); }
+  }
+);
+
+// ══════════════════════════════════════════════════════════════════════════
+// APPROVALS  (sysapproval_approver)
+// ══════════════════════════════════════════════════════════════════════════
+
+server.tool(
+  'get_approvals',
+  `List pending or recent approval requests for a user or a specific record (sysapproval_approver).`,
+  {
+    employee_id: z.string().optional().describe('Email or sys_id of approver. Omit for current user.'),
+    state:       z.enum(['requested','approved','rejected','cancelled','not requested','all']).optional().default('requested'),
+    record_sys_id: z.string().optional().describe('Filter approvals for a specific record sys_id'),
+    limit:       z.number().optional().default(20),
+  },
+  async ({ employee_id, state, record_sys_id, limit }) => {
+    try {
+      const { sn, error } = await _requireSn();
+      if (error) return error;
+
+      const callerUsername = _snCallerUsername();
+      let approverSysId = null;
+
+      if (employee_id) {
+        const u = await _snResolveUser(sn, employee_id);
+        if (!u) return fail(`User not found: ${employee_id}`);
+        approverSysId = u.sys_id;
+      } else if (callerUsername) {
+        const u = await _snResolveUser(sn, callerUsername);
+        approverSysId = u?.sys_id ?? null;
+      }
+
+      let query = '';
+      if (approverSysId)  query += `approver=${approverSysId}`;
+      if (state && state !== 'all') query += `${query?'^':''}state=${state}`;
+      if (record_sys_id)  query += `${query?'^':''}sysapproval=${record_sys_id}`;
+      if (!query) query = 'state=requested';
+
+      const approvals = await sn.get('sysapproval_approver', {
+        sysparm_query:         query,
+        sysparm_fields:        'sys_id,approver.name,sysapproval,source_table,state,due_date,comments',
+        sysparm_display_value: 'true',
+        sysparm_limit:         String(limit),
+        sysparm_orderby:       'due_date',
+      });
+
+      return ok({
+        count: approvals.length,
+        approvals: approvals.map(a => ({
+          sys_id:       a.sys_id,
+          approver:     a['approver.name'],
+          record_sys_id: a.sysapproval,
+          table:        a.source_table,
+          state:        a.state,
+          due_date:     a.due_date || null,
+          comments:     a.comments || null,
+          url:          _snRecordUrl(sn, 'sysapproval_approver', a.sys_id),
+        })),
+      });
+    } catch (e) { return fail(e.message); }
+  }
+);
+
+server.tool(
+  'act_on_approval',
+  `Approve or reject an approval request (sysapproval_approver). Confirm with the user before calling.`,
+  {
+    approval_sys_id: z.string().describe('sys_id of the sysapproval_approver record. Get from get_approvals.'),
+    action:          z.enum(['approved','rejected']).describe('Decision'),
+    comments:        z.string().optional().describe('Reason or comments (recommended for rejections)'),
+  },
+  async ({ approval_sys_id, action, comments }) => {
+    try {
+      const { sn, error } = await _requireSn();
+      if (error) return error;
+
+      const updated = await sn.patch('sysapproval_approver', approval_sys_id, {
+        state:    action,
+        comments: comments ?? '',
+      });
+
+      return ok({
+        success:  true,
+        sys_id:   approval_sys_id,
+        action,
+        state:    updated.state ?? action,
+        url:      _snRecordUrl(sn, 'sysapproval_approver', approval_sys_id),
+        message:  `Approval ${action} successfully.${comments ? ` Reason: ${comments}` : ''}`,
+      });
+    } catch (e) { return fail(e.message); }
+  }
+);
+
+// ══════════════════════════════════════════════════════════════════════════
+// SERVICE CATALOG VARIABLES  (item_option_new)
+// ══════════════════════════════════════════════════════════════════════════
+
+server.tool(
+  'list_catalog_variables',
+  `List variables defined on a Service Catalog item (item_option_new).`,
+  {
+    catalog_item_sys_id: z.string().describe('sys_id of the catalog item (sc_cat_item)'),
+  },
+  async ({ catalog_item_sys_id }) => {
+    try {
+      const { sn, error } = await _requireSn();
+      if (error) return error;
+
+      const vars = await sn.get('item_option_new', {
+        sysparm_query:   `cat_item=${catalog_item_sys_id}`,
+        sysparm_fields:  'sys_id,name,question_text,type,mandatory,order,default_value,active',
+        sysparm_display_value: 'true',
+        sysparm_limit:   '100',
+        sysparm_orderby: 'order',
+      });
+
+      return ok({
+        catalog_item_sys_id,
+        count: vars.length,
+        variables: vars.map(v => ({
+          sys_id:       v.sys_id,
+          name:         v.name,
+          label:        v.question_text,
+          type:         v.type,
+          mandatory:    v.mandatory,
+          order:        v.order,
+          default:      v.default_value || null,
+          url:          _snRecordUrl(sn, 'item_option_new', v.sys_id),
+        })),
+      });
+    } catch (e) { return fail(e.message); }
+  }
+);
+
+server.tool(
+  'add_catalog_variable',
+  `Add a variable (question) to a Service Catalog item (item_option_new).`,
+  {
+    catalog_item_sys_id: z.string().describe('sys_id of the parent catalog item'),
+    name:          z.string().describe('Variable name — lowercase_underscores (used in scripts as cat_item.variables.name)'),
+    label:         z.string().describe('Label shown to the user'),
+    type:          z.enum(['String','Integer','Boolean','Multiple Choice','Select Box','Date','Date/Time','Email','URL','Reference','Attachment','Label','Macro']).describe('Variable type'),
+    mandatory:     z.boolean().optional().default(false),
+    default_value: z.string().optional(),
+    order:         z.number().optional().default(100),
+    help_text:     z.string().optional().describe('Tooltip/help text for the user'),
+    reference_table: z.string().optional().describe('Table name for Reference type variables (e.g. sys_user)'),
+  },
+  async ({ catalog_item_sys_id, name, label, type, mandatory, default_value, order, help_text, reference_table }) => {
+    try {
+      const { sn, error } = await _requireSn();
+      if (error) return error;
+
+      const variable = await sn.post('item_option_new', {
+        cat_item:      catalog_item_sys_id,
+        name:          name.toLowerCase().replace(/\s+/g, '_'),
+        question_text: label,
+        type,
+        mandatory:     mandatory ?? false,
+        default_value: default_value ?? '',
+        order:         order ?? 100,
+        tooltip:       help_text ?? '',
+        reference:     reference_table ?? '',
+        active:        true,
+      });
+
+      return ok({
+        success:  true,
+        sys_id:   variable.sys_id,
+        name:     variable.name,
+        label,
+        type,
+        mandatory,
+        url:      _snRecordUrl(sn, 'item_option_new', variable.sys_id),
+      });
+    } catch (e) { return fail(e.message); }
+  }
+);
+
+// ══════════════════════════════════════════════════════════════════════════
+// ATTACHMENTS  (sys_attachment)
+// ══════════════════════════════════════════════════════════════════════════
+
+server.tool(
+  'list_attachments',
+  `List attachments on a ServiceNow record (sys_attachment).`,
+  {
+    table:    z.string().describe('Table name (e.g. incident)'),
+    sys_id:   z.string().describe('sys_id of the record'),
+  },
+  async ({ table, sys_id }) => {
+    try {
+      const { sn, error } = await _requireSn();
+      if (error) return error;
+
+      const attachments = await sn.get('sys_attachment', {
+        sysparm_query:   `table_name=${table}^table_sys_id=${sys_id}`,
+        sysparm_fields:  'sys_id,file_name,content_type,size_bytes,sys_created_on,sys_created_by',
+        sysparm_display_value: 'true',
+        sysparm_limit:   '50',
+        sysparm_orderby: 'sys_created_on',
+      });
+
+      return ok({
+        record:   `${table}:${sys_id}`,
+        count:    attachments.length,
+        attachments: attachments.map(a => ({
+          sys_id:       a.sys_id,
+          file_name:    a.file_name,
+          content_type: a.content_type,
+          size_kb:      Math.round(parseInt(a.size_bytes || '0') / 1024),
+          uploaded_by:  a.sys_created_by,
+          uploaded_on:  a.sys_created_on,
+          download_url: `${sn.baseUrl}/sys_attachment.do?sys_id=${a.sys_id}`,
+        })),
+      });
+    } catch (e) { return fail(e.message); }
+  }
+);
+
+// ══════════════════════════════════════════════════════════════════════════
+// CMDB / CI  (cmdb_ci)
+// Best practices: always set the correct class (cmdb_ci_server, cmdb_ci_appl
+// etc.), use relationship types from cmdb_rel_type, populate discovery_source.
+// ══════════════════════════════════════════════════════════════════════════
+
+server.tool(
+  'search_cmdb',
+  `Search the CMDB for Configuration Items (cmdb_ci and subclasses).`,
+  {
+    search:     z.string().describe('Name or IP address (partial match)'),
+    ci_class:   z.string().optional().describe('CI class to search (e.g. cmdb_ci_server, cmdb_ci_appl). Defaults to cmdb_ci.'),
+    status:     z.enum(['1','2','3','6','7']).optional().describe('Operational status: 1=Operational, 2=Non-Operational, 3=Repair in Progress, 6=End of Life, 7=Installed'),
+    limit:      z.number().optional().default(20),
+  },
+  async ({ search, ci_class, status, limit }) => {
+    try {
+      const { sn, error } = await _requireSn();
+      if (error) return error;
+
+      const table = ci_class ?? 'cmdb_ci';
+      let query = `nameLIKE${search}^ORip_addressLIKE${search}`;
+      if (status) query += `^operational_status=${status}`;
+
+      const cis = await sn.get(table, {
+        sysparm_query:   query,
+        sysparm_fields:  'sys_id,name,sys_class_name,ip_address,operational_status,assigned_to.name,location.name,environment',
+        sysparm_display_value: 'true',
+        sysparm_limit:   String(limit),
+        sysparm_orderby: 'name',
+      });
+
+      return ok({
+        count: cis.length,
+        cis: cis.map(c => ({
+          sys_id:      c.sys_id,
+          name:        c.name,
+          class:       c.sys_class_name,
+          ip:          c.ip_address || null,
+          status:      c.operational_status,
+          assigned_to: c['assigned_to.name'] || null,
+          location:    c['location.name'] || null,
+          environment: c.environment || null,
+          url:         _snRecordUrl(sn, table, c.sys_id),
+        })),
+      });
+    } catch (e) { return fail(e.message); }
+  }
+);
+
+server.tool(
+  'create_ci',
+  `Create a Configuration Item in the CMDB (cmdb_ci or a subclass).
+Always use the most specific CI class available (cmdb_ci_server, cmdb_ci_appl, cmdb_ci_database, etc.).`,
+  {
+    name:             z.string().describe('CI name'),
+    ci_class:         z.string().describe('CI class (e.g. cmdb_ci_server, cmdb_ci_appl, cmdb_ci_database, cmdb_ci_network_adapter)'),
+    ip_address:       z.string().optional(),
+    environment:      z.enum(['development','test','staging','production']).optional(),
+    operational_status: z.enum(['1','2','3']).optional().default('1').describe('1=Operational, 2=Non-Operational, 3=Repair in Progress'),
+    assigned_to:      z.string().optional().describe('Email or sys_id of assigned user'),
+    location:         z.string().optional().describe('Location name or sys_id'),
+    short_description: z.string().optional(),
+    discovery_source: z.string().optional().default('Manual').describe('How this CI was discovered'),
+    additional_fields: z.record(z.string(), z.string()).optional().describe('Any extra fields specific to the CI class'),
+  },
+  async ({ name, ci_class, ip_address, environment, operational_status, assigned_to, location, short_description, discovery_source, additional_fields }) => {
+    try {
+      const { sn, error } = await _requireSn();
+      if (error) return error;
+
+      let assignedSysId = null;
+      if (assigned_to) {
+        const u = await _snResolveUser(sn, assigned_to);
+        assignedSysId = u?.sys_id ?? null;
+      }
+
+      const ci = await sn.post(ci_class, {
+        name,
+        ip_address:         ip_address         ?? '',
+        environment:        environment         ?? '',
+        operational_status: operational_status  ?? '1',
+        assigned_to:        assignedSysId       ?? '',
+        location:           location            ?? '',
+        short_description:  short_description   ?? '',
+        discovery_source:   discovery_source    ?? 'Manual',
+        ...(additional_fields ?? {}),
+      });
+
+      return ok({
+        success:  true,
+        sys_id:   ci.sys_id,
+        name,
+        class:    ci_class,
+        url:      _snRecordUrl(sn, ci_class, ci.sys_id),
+      });
+    } catch (e) { return fail(e.message); }
+  }
+);
+
+server.tool(
+  'relate_cis',
+  `Create a relationship between two CIs in the CMDB (cmdb_rel_ci).
+Use standard relationship types: Depends on::Used by, Hosted on::Hosts, Runs on::Runs, Members of::Contains.`,
+  {
+    parent_sys_id:    z.string().describe('sys_id of the parent/upstream CI'),
+    child_sys_id:     z.string().describe('sys_id of the child/downstream CI'),
+    relationship_type: z.string().describe('Relationship type name (e.g. "Depends on::Used by"). Use "Depends on::Used by" if unsure.'),
+  },
+  async ({ parent_sys_id, child_sys_id, relationship_type }) => {
+    try {
+      const { sn, error } = await _requireSn();
+      if (error) return error;
+
+      // Resolve relationship type sys_id
+      const relTypes = await sn.get('cmdb_rel_type', {
+        sysparm_query:  `nameLIKE${relationship_type}`,
+        sysparm_fields: 'sys_id,name',
+        sysparm_limit:  '1',
+      });
+      if (!relTypes[0]) return fail(`Relationship type not found: ${relationship_type}. Try "Depends on::Used by".`);
+
+      const rel = await sn.post('cmdb_rel_ci', {
+        parent:   parent_sys_id,
+        child:    child_sys_id,
+        type:     relTypes[0].sys_id,
+      });
+
+      return ok({
+        success:           true,
+        sys_id:            rel.sys_id,
+        relationship_type: relTypes[0].name,
+        parent:            parent_sys_id,
+        child:             child_sys_id,
+        url:               _snRecordUrl(sn, 'cmdb_rel_ci', rel.sys_id),
+      });
+    } catch (e) { return fail(e.message); }
+  }
+);
+
+// ══════════════════════════════════════════════════════════════════════════
+// ACL / SECURITY RULES  (sys_security_acl)
+// Best practices: prefer roles over user-specific ACLs, use conditions
+// sparingly (they run on every record read), always test with impersonation.
+// ══════════════════════════════════════════════════════════════════════════
+
+server.tool(
+  'create_acl',
+  `Create an Access Control Rule (ACL) in ServiceNow (sys_security_acl).
+Best practices: restrict by role, not by user. Use condition only for row-level security.
+Always test by impersonating the target role after creation.`,
+  {
+    name:       z.string().describe('ACL name — typically auto-set by SN but provide for clarity'),
+    table:      z.string().describe('Table name (e.g. incident) or * for all tables'),
+    field:      z.string().optional().describe('Field name for field-level ACL. Leave blank for table-level.'),
+    operation:  z.enum(['read','write','create','delete']).describe('Operation to control'),
+    roles:      z.array(z.string()).optional().describe('Role names required (e.g. ["itil","admin"]). Empty = deny all non-admins.'),
+    condition:  z.string().optional().describe('Advanced condition script (server-side JS returning true/false)'),
+    script:     z.string().optional().describe('Script-based ACL (advanced — runs per record, use sparingly)'),
+    active:     z.boolean().optional().default(true),
+  },
+  async ({ name, table, field, operation, roles, condition, script, active }) => {
+    try {
+      const { sn, error } = await _requireSn();
+      if (error) return error;
+
+      const acl = await sn.post('sys_security_acl', {
+        name:      name || `${table}.${field || '*'}.${operation}`,
+        object:    table,
+        name_field: field ?? '',
+        operation,
+        condition: condition ?? '',
+        script:    script    ?? '',
+        active:    active !== false,
+      });
+
+      // Assign roles
+      const roleResults = [];
+      for (const roleName of (roles ?? [])) {
+        const roleRows = await sn.get('sys_user_role', {
+          sysparm_query:  `name=${roleName}`,
+          sysparm_fields: 'sys_id,name',
+          sysparm_limit:  '1',
+        });
+        if (roleRows[0]) {
+          await sn.post('sys_security_acl_role', { acl: acl.sys_id, role: roleRows[0].sys_id });
+          roleResults.push(roleName);
+        }
+      }
+
+      return ok({
+        success:   true,
+        sys_id:    acl.sys_id,
+        table,
+        field:     field || null,
+        operation,
+        roles:     roleResults,
+        url:       _snRecordUrl(sn, 'sys_security_acl', acl.sys_id),
+        warning:   roleResults.length === 0 ? 'No roles assigned — this ACL will deny access to all non-admin users.' : null,
+      });
+    } catch (e) { return fail(e.message); }
+  }
+);
+
 // ── Scripted REST API & MCP Connector Tools ───────────────────────────────
 // Tables: sys_ws_definition (API), sys_ws_operation (resource/method)
 
