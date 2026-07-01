@@ -4094,6 +4094,640 @@ Returns Markdown text ready to paste into Confluence, GitHub, or a wiki.`,
 );
 
 // ══════════════════════════════════════════════════════════════════════════
+// FORM LAYOUT  (sys_ui_section, sys_ui_element, sys_ui_view)
+// Best practices: always target a specific view (avoid Default view changes
+// that affect all users). Use sys_ui_element order in multiples of 100.
+// Never delete elements — set active=false to hide.
+// ══════════════════════════════════════════════════════════════════════════
+
+server.tool(
+  'list_form_views',
+  `List available form views for a table (sys_ui_view).`,
+  {
+    table: z.string().describe('Table name (e.g. incident)'),
+  },
+  async ({ table }) => {
+    try {
+      const { sn, error } = await _requireSn();
+      if (error) return error;
+
+      const views = await sn.get('sys_ui_view', {
+        sysparm_query:   `name!=''`,
+        sysparm_fields:  'sys_id,name,title',
+        sysparm_limit:   '50',
+        sysparm_orderby: 'name',
+      });
+
+      // Also get sections to confirm which views have layouts for this table
+      const sections = await sn.get('sys_ui_section', {
+        sysparm_query:   `name=${table}`,
+        sysparm_fields:  'view',
+        sysparm_display_value: 'true',
+        sysparm_limit:   '100',
+      });
+      const usedViews = new Set(sections.map(s => s.view));
+
+      return ok({
+        table,
+        views: views.map(v => ({
+          sys_id: v.sys_id,
+          name:   v.name,
+          title:  v.title || v.name,
+          has_layout_for_table: usedViews.has(v.name) || usedViews.has(v.sys_id),
+        })),
+      });
+    } catch (e) { return fail(e.message); }
+  }
+);
+
+server.tool(
+  'get_form_layout',
+  `Get the form layout (sections and fields) for a table and view (sys_ui_section + sys_ui_element).`,
+  {
+    table: z.string().describe('Table name (e.g. incident)'),
+    view:  z.string().optional().default('Default').describe('View name (e.g. Default, Mobile, Requester). Get from list_form_views.'),
+  },
+  async ({ table, view }) => {
+    try {
+      const { sn, error } = await _requireSn();
+      if (error) return error;
+
+      const sections = await sn.get('sys_ui_section', {
+        sysparm_query:   `name=${table}^view.name=${view ?? 'Default'}`,
+        sysparm_fields:  'sys_id,caption,position,columns',
+        sysparm_orderby: 'position',
+        sysparm_limit:   '50',
+      });
+
+      const layout = await Promise.all(sections.map(async sec => {
+        const elements = await sn.get('sys_ui_element', {
+          sysparm_query:   `sys_ui_section=${sec.sys_id}^active=true`,
+          sysparm_fields:  'sys_id,element,field_label,position,mandatory,read_only,type',
+          sysparm_display_value: 'true',
+          sysparm_orderby: 'position',
+          sysparm_limit:   '100',
+        });
+        return {
+          section_sys_id: sec.sys_id,
+          section:        sec.caption || '(Unnamed)',
+          columns:        sec.columns || '2',
+          position:       sec.position,
+          fields: elements.map(e => ({
+            sys_id:     e.sys_id,
+            field:      e.element,
+            label:      e.field_label,
+            position:   e.position,
+            mandatory:  e.mandatory,
+            read_only:  e.read_only,
+            type:       e.type,
+          })),
+        };
+      }));
+
+      return ok({ table, view: view ?? 'Default', section_count: layout.length, layout });
+    } catch (e) { return fail(e.message); }
+  }
+);
+
+server.tool(
+  'create_form_section',
+  `Add a new section to a form layout (sys_ui_section).`,
+  {
+    table:    z.string().describe('Table name'),
+    view:     z.string().optional().default('Default'),
+    caption:  z.string().describe('Section header label (e.g. "Additional Details")'),
+    columns:  z.enum(['1','2']).optional().default('2').describe('Number of columns in the section'),
+    position: z.number().optional().describe('Position order — leave blank to append at end'),
+  },
+  async ({ table, view, caption, columns, position }) => {
+    try {
+      const { sn, error } = await _requireSn();
+      if (error) return error;
+
+      // Resolve view sys_id
+      const viewRows = await sn.get('sys_ui_view', {
+        sysparm_query:  `name=${view ?? 'Default'}`,
+        sysparm_fields: 'sys_id,name',
+        sysparm_limit:  '1',
+      });
+      const viewSysId = viewRows[0]?.sys_id;
+      if (!viewSysId) return fail(`View not found: ${view}. Use list_form_views to see available views.`);
+
+      // Auto-position: after last section if not specified
+      let pos = position;
+      if (!pos) {
+        const existing = await sn.get('sys_ui_section', {
+          sysparm_query:  `name=${table}^view=${viewSysId}`,
+          sysparm_fields: 'position',
+          sysparm_orderby: 'position',
+          sysparm_limit:  '50',
+        });
+        pos = existing.length > 0 ? Math.max(...existing.map(s => parseInt(s.position || '0'))) + 1 : 0;
+      }
+
+      const section = await sn.post('sys_ui_section', {
+        name:    table,
+        view:    viewSysId,
+        caption,
+        columns: columns ?? '2',
+        position: String(pos),
+      });
+
+      return ok({
+        success:    true,
+        sys_id:     section.sys_id,
+        table,
+        view:       view ?? 'Default',
+        caption,
+        position:   pos,
+        url:        _snRecordUrl(sn, 'sys_ui_section', section.sys_id),
+        next_step:  'Use add_field_to_form to add fields to this section.',
+      });
+    } catch (e) { return fail(e.message); }
+  }
+);
+
+server.tool(
+  'add_field_to_form',
+  `Add a field to a form section (sys_ui_element).
+Fields are added in position order — use multiples of 100. Confirm the field exists on the table first (use explore_table).`,
+  {
+    section_sys_id: z.string().describe('sys_id of the target sys_ui_section. Get from get_form_layout.'),
+    field_name:     z.string().describe('Column name on the table (e.g. priority, assignment_group)'),
+    position:       z.number().optional().describe('Position within section (multiples of 100). Appends if omitted.'),
+    mandatory:      z.boolean().optional().default(false),
+    read_only:      z.boolean().optional().default(false),
+  },
+  async ({ section_sys_id, field_name, position, mandatory, read_only }) => {
+    try {
+      const { sn, error } = await _requireSn();
+      if (error) return error;
+
+      // Auto-position
+      let pos = position;
+      if (!pos) {
+        const existing = await sn.get('sys_ui_element', {
+          sysparm_query:  `sys_ui_section=${section_sys_id}`,
+          sysparm_fields: 'position',
+          sysparm_orderby: 'position',
+          sysparm_limit:  '100',
+        });
+        pos = existing.length > 0 ? Math.max(...existing.map(e => parseInt(e.position || '0'))) + 100 : 100;
+      }
+
+      const element = await sn.post('sys_ui_element', {
+        sys_ui_section: section_sys_id,
+        element:        field_name,
+        position:       String(pos),
+        mandatory:      mandatory  ?? false,
+        read_only:      read_only  ?? false,
+        active:         true,
+        type:           'field',
+      });
+
+      return ok({
+        success:  true,
+        sys_id:   element.sys_id,
+        field:    field_name,
+        position: pos,
+        url:      _snRecordUrl(sn, 'sys_ui_element', element.sys_id),
+      });
+    } catch (e) { return fail(e.message); }
+  }
+);
+
+server.tool(
+  'get_related_lists',
+  `Get related lists configured on a form for a table/view (sys_ui_related_list).`,
+  {
+    table: z.string().describe('Table name (e.g. incident)'),
+    view:  z.string().optional().default('Default'),
+  },
+  async ({ table, view }) => {
+    try {
+      const { sn, error } = await _requireSn();
+      if (error) return error;
+
+      const lists = await sn.get('sys_ui_related_list', {
+        sysparm_query:   `name=${table}^view.name=${view ?? 'Default'}`,
+        sysparm_fields:  'sys_id,related_list,position,active',
+        sysparm_display_value: 'true',
+        sysparm_orderby: 'position',
+        sysparm_limit:   '50',
+      });
+
+      return ok({
+        table,
+        view: view ?? 'Default',
+        count: lists.length,
+        related_lists: lists.map(l => ({
+          sys_id:       l.sys_id,
+          related_list: l.related_list,
+          position:     l.position,
+          active:       l.active,
+          url:          _snRecordUrl(sn, 'sys_ui_related_list', l.sys_id),
+        })),
+      });
+    } catch (e) { return fail(e.message); }
+  }
+);
+
+server.tool(
+  'add_related_list',
+  `Add a related list to a form (sys_ui_related_list).
+The related_list value is typically in the format TABLE.FIELD (e.g. incident_task.parent_incident).`,
+  {
+    table:        z.string().describe('Parent table name (e.g. incident)'),
+    view:         z.string().optional().default('Default'),
+    related_list: z.string().describe('Related list identifier (e.g. incident_task.parent_incident, sys_attachment.TABLE_NAME)'),
+    position:     z.number().optional().describe('Display order. Appends if omitted.'),
+  },
+  async ({ table, view, related_list, position }) => {
+    try {
+      const { sn, error } = await _requireSn();
+      if (error) return error;
+
+      const viewRows = await sn.get('sys_ui_view', {
+        sysparm_query: `name=${view ?? 'Default'}`,
+        sysparm_fields: 'sys_id',
+        sysparm_limit: '1',
+      });
+      const viewSysId = viewRows[0]?.sys_id;
+      if (!viewSysId) return fail(`View not found: ${view}`);
+
+      let pos = position;
+      if (!pos) {
+        const existing = await sn.get('sys_ui_related_list', {
+          sysparm_query:  `name=${table}^view=${viewSysId}`,
+          sysparm_fields: 'position',
+          sysparm_orderby: 'position',
+          sysparm_limit:  '50',
+        });
+        pos = existing.length > 0 ? Math.max(...existing.map(r => parseInt(r.position || '0'))) + 100 : 100;
+      }
+
+      const rl = await sn.post('sys_ui_related_list', {
+        name:         table,
+        view:         viewSysId,
+        related_list,
+        position:     String(pos),
+        active:       true,
+      });
+
+      return ok({
+        success:      true,
+        sys_id:       rl.sys_id,
+        table,
+        view:         view ?? 'Default',
+        related_list,
+        position:     pos,
+        url:          _snRecordUrl(sn, 'sys_ui_related_list', rl.sys_id),
+      });
+    } catch (e) { return fail(e.message); }
+  }
+);
+
+server.tool(
+  'get_list_layout',
+  `Get the list column layout for a table and view (sys_ui_list_element).`,
+  {
+    table: z.string().describe('Table name (e.g. incident)'),
+    view:  z.string().optional().default('Default'),
+  },
+  async ({ table, view }) => {
+    try {
+      const { sn, error } = await _requireSn();
+      if (error) return error;
+
+      // Find the list layout record first
+      const lists = await sn.get('sys_ui_list', {
+        sysparm_query:  `name=${table}^view.name=${view ?? 'Default'}`,
+        sysparm_fields: 'sys_id',
+        sysparm_limit:  '1',
+      });
+
+      if (!lists[0]) return fail(`No list layout found for ${table} / ${view}. It may be using the default column set.`);
+
+      const elements = await sn.get('sys_ui_list_element', {
+        sysparm_query:   `list_id=${lists[0].sys_id}^active=true`,
+        sysparm_fields:  'sys_id,element,field_label,position',
+        sysparm_display_value: 'true',
+        sysparm_orderby: 'position',
+        sysparm_limit:   '50',
+      });
+
+      return ok({
+        table,
+        view:   view ?? 'Default',
+        list_sys_id: lists[0].sys_id,
+        columns: elements.map(e => ({
+          sys_id:   e.sys_id,
+          field:    e.element,
+          label:    e.field_label,
+          position: e.position,
+        })),
+      });
+    } catch (e) { return fail(e.message); }
+  }
+);
+
+server.tool(
+  'update_list_columns',
+  `Add or remove columns from a list layout (sys_ui_list_element).`,
+  {
+    table:          z.string().describe('Table name'),
+    view:           z.string().optional().default('Default'),
+    add_fields:     z.array(z.string()).optional().describe('Field names to add (e.g. ["priority","assigned_to"])'),
+    remove_sys_ids: z.array(z.string()).optional().describe('sys_ids of sys_ui_list_element records to remove'),
+  },
+  async ({ table, view, add_fields, remove_sys_ids }) => {
+    try {
+      const { sn, error } = await _requireSn();
+      if (error) return error;
+
+      // Find or create the list layout
+      let listSysId;
+      const existing = await sn.get('sys_ui_list', {
+        sysparm_query:  `name=${table}^view.name=${view ?? 'Default'}`,
+        sysparm_fields: 'sys_id',
+        sysparm_limit:  '1',
+      });
+
+      if (existing[0]) {
+        listSysId = existing[0].sys_id;
+      } else {
+        const viewRows = await sn.get('sys_ui_view', { sysparm_query: `name=${view ?? 'Default'}`, sysparm_fields: 'sys_id', sysparm_limit: '1' });
+        if (!viewRows[0]) return fail(`View not found: ${view}`);
+        const newList = await sn.post('sys_ui_list', { name: table, view: viewRows[0].sys_id });
+        listSysId = newList.sys_id;
+      }
+
+      const added = [], removed = [];
+
+      // Get current max position
+      const currentElements = await sn.get('sys_ui_list_element', {
+        sysparm_query:  `list_id=${listSysId}`,
+        sysparm_fields: 'position',
+        sysparm_orderby: 'position',
+        sysparm_limit:  '100',
+      });
+      let pos = currentElements.length > 0
+        ? Math.max(...currentElements.map(e => parseInt(e.position || '0'))) + 100
+        : 100;
+
+      for (const field of (add_fields ?? [])) {
+        const el = await sn.post('sys_ui_list_element', { list_id: listSysId, element: field, position: String(pos), active: true });
+        added.push({ field, sys_id: el.sys_id, position: pos });
+        pos += 100;
+      }
+
+      for (const sys_id of (remove_sys_ids ?? [])) {
+        await sn.patch('sys_ui_list_element', sys_id, { active: false });
+        removed.push(sys_id);
+      }
+
+      return ok({
+        success: true,
+        table,
+        view:    view ?? 'Default',
+        added,
+        removed,
+        url:     _snRecordUrl(sn, 'sys_ui_list', listSysId),
+      });
+    } catch (e) { return fail(e.message); }
+  }
+);
+
+// ══════════════════════════════════════════════════════════════════════════
+// AGENT WORKSPACE  (sys_aw_workspace, sys_aw_tab, sys_aw_landing_page)
+// Best practices: one workspace per role/persona, use tab order to guide
+// focus, always set a meaningful icon and description.
+// ══════════════════════════════════════════════════════════════════════════
+
+server.tool(
+  'list_workspaces',
+  `List Agent Workspaces defined in ServiceNow (sys_aw_workspace).`,
+  {
+    search: z.string().optional().describe('Filter by name'),
+    active: z.boolean().optional().default(true),
+    limit:  z.number().optional().default(20),
+  },
+  async ({ search, active, limit }) => {
+    try {
+      const { sn, error } = await _requireSn();
+      if (error) return error;
+
+      let query = active !== undefined ? `active=${active}` : 'active=true';
+      if (search) query += `^nameLIKE${search}`;
+
+      const workspaces = await sn.get('sys_aw_workspace', {
+        sysparm_query:   query,
+        sysparm_fields:  'sys_id,name,title,description,active,roles',
+        sysparm_display_value: 'true',
+        sysparm_limit:   String(limit),
+        sysparm_orderby: 'name',
+      });
+
+      return ok({
+        count: workspaces.length,
+        workspaces: workspaces.map(w => ({
+          sys_id:      w.sys_id,
+          name:        w.name,
+          title:       w.title,
+          description: w.description || null,
+          active:      w.active,
+          roles:       w.roles || null,
+          url:         _snRecordUrl(sn, 'sys_aw_workspace', w.sys_id),
+        })),
+      });
+    } catch (e) { return fail(e.message); }
+  }
+);
+
+server.tool(
+  'create_workspace',
+  `Create an Agent Workspace in ServiceNow (sys_aw_workspace).
+Workspaces provide a role-specific UI for agents. Assign roles to control who sees this workspace.`,
+  {
+    name:        z.string().describe('Internal name (lowercase_underscores, e.g. hr_agent_workspace)'),
+    title:       z.string().describe('Display title shown in the UI (e.g. "HR Agent Workspace")'),
+    description: z.string().optional(),
+    roles:       z.array(z.string()).optional().describe('Role names that can access this workspace (e.g. ["sn_hr_core.case_writer"])'),
+    icon:        z.string().optional().describe('Icon name from the icon library (e.g. "workspace")'),
+  },
+  async ({ name, title, description, roles, icon }) => {
+    try {
+      const { sn, error } = await _requireSn();
+      if (error) return error;
+
+      const workspace = await sn.post('sys_aw_workspace', {
+        name:        name.toLowerCase().replace(/\s+/g, '_'),
+        title,
+        description: description ?? '',
+        icon:        icon ?? 'workspace',
+        active:      true,
+      });
+
+      // Assign roles
+      const assignedRoles = [];
+      for (const roleName of (roles ?? [])) {
+        const roleRows = await sn.get('sys_user_role', {
+          sysparm_query:  `name=${roleName}`,
+          sysparm_fields: 'sys_id,name',
+          sysparm_limit:  '1',
+        });
+        if (roleRows[0]) {
+          await sn.post('sys_aw_workspace_role', { workspace: workspace.sys_id, role: roleRows[0].sys_id });
+          assignedRoles.push(roleName);
+        }
+      }
+
+      return ok({
+        success:       true,
+        sys_id:        workspace.sys_id,
+        name:          workspace.name,
+        title,
+        roles_assigned: assignedRoles,
+        url:           _snRecordUrl(sn, 'sys_aw_workspace', workspace.sys_id),
+        next_step:     'Use add_workspace_tab to add tabs to this workspace.',
+      });
+    } catch (e) { return fail(e.message); }
+  }
+);
+
+server.tool(
+  'list_workspace_tabs',
+  `List tabs configured in an Agent Workspace (sys_aw_tab).`,
+  {
+    workspace_sys_id: z.string().describe('sys_id of the workspace. Get from list_workspaces.'),
+  },
+  async ({ workspace_sys_id }) => {
+    try {
+      const { sn, error } = await _requireSn();
+      if (error) return error;
+
+      const tabs = await sn.get('sys_aw_tab', {
+        sysparm_query:   `workspace=${workspace_sys_id}`,
+        sysparm_fields:  'sys_id,title,order,table,filter,active,icon',
+        sysparm_display_value: 'true',
+        sysparm_orderby: 'order',
+        sysparm_limit:   '50',
+      });
+
+      return ok({
+        workspace_sys_id,
+        count: tabs.length,
+        tabs: tabs.map(t => ({
+          sys_id:  t.sys_id,
+          title:   t.title,
+          order:   t.order,
+          table:   t.table || null,
+          filter:  t.filter || null,
+          active:  t.active,
+          icon:    t.icon || null,
+          url:     _snRecordUrl(sn, 'sys_aw_tab', t.sys_id),
+        })),
+      });
+    } catch (e) { return fail(e.message); }
+  }
+);
+
+server.tool(
+  'add_workspace_tab',
+  `Add a tab to an Agent Workspace (sys_aw_tab).
+Each tab shows a filtered list of records from a table. Use order in multiples of 100.`,
+  {
+    workspace_sys_id: z.string().describe('sys_id of the target workspace'),
+    title:            z.string().describe('Tab label (e.g. "My Open Cases")'),
+    table:            z.string().describe('Table to display in the tab (e.g. sn_hr_case)'),
+    filter:           z.string().optional().describe('Encoded query to filter records (e.g. assigned_to=javascript:gs.getUserID()^state!=3)'),
+    order:            z.number().optional().describe('Tab display order. Appends if omitted.'),
+    icon:             z.string().optional().describe('Tab icon name'),
+  },
+  async ({ workspace_sys_id, title, table, filter, order, icon }) => {
+    try {
+      const { sn, error } = await _requireSn();
+      if (error) return error;
+
+      let pos = order;
+      if (!pos) {
+        const existing = await sn.get('sys_aw_tab', {
+          sysparm_query:  `workspace=${workspace_sys_id}`,
+          sysparm_fields: 'order',
+          sysparm_orderby: 'order',
+          sysparm_limit:  '50',
+        });
+        pos = existing.length > 0 ? Math.max(...existing.map(t => parseInt(t.order || '0'))) + 100 : 100;
+      }
+
+      const tab = await sn.post('sys_aw_tab', {
+        workspace: workspace_sys_id,
+        title,
+        table,
+        filter:    filter ?? '',
+        order:     String(pos),
+        icon:      icon ?? '',
+        active:    true,
+      });
+
+      return ok({
+        success:          true,
+        sys_id:           tab.sys_id,
+        title,
+        table,
+        order:            pos,
+        workspace_sys_id,
+        url:              _snRecordUrl(sn, 'sys_aw_tab', tab.sys_id),
+      });
+    } catch (e) { return fail(e.message); }
+  }
+);
+
+server.tool(
+  'get_workspace_config',
+  `Get the full configuration of an Agent Workspace — tabs, landing pages, and roles (sys_aw_workspace).`,
+  {
+    workspace_sys_id: z.string().describe('sys_id of the workspace. Get from list_workspaces.'),
+  },
+  async ({ workspace_sys_id }) => {
+    try {
+      const { sn, error } = await _requireSn();
+      if (error) return error;
+
+      const [workspace, tabs, pages] = await Promise.all([
+        sn.getById('sys_aw_workspace', workspace_sys_id, {
+          sysparm_fields: 'sys_id,name,title,description,active,icon',
+        }),
+        sn.get('sys_aw_tab', {
+          sysparm_query:   `workspace=${workspace_sys_id}^active=true`,
+          sysparm_fields:  'sys_id,title,table,filter,order,icon',
+          sysparm_orderby: 'order',
+          sysparm_limit:   '50',
+        }),
+        sn.get('sys_aw_landing_page', {
+          sysparm_query:  `workspace=${workspace_sys_id}`,
+          sysparm_fields: 'sys_id,title,active',
+          sysparm_limit:  '10',
+        }).catch(() => []),
+      ]);
+
+      if (!workspace) return fail(`Workspace not found: ${workspace_sys_id}`);
+
+      return ok({
+        sys_id:       workspace.sys_id,
+        name:         workspace.name,
+        title:        workspace.title,
+        description:  workspace.description || null,
+        active:       workspace.active,
+        url:          _snRecordUrl(sn, 'sys_aw_workspace', workspace.sys_id),
+        tabs:         tabs.map(t => ({ sys_id: t.sys_id, title: t.title, table: t.table, order: t.order, filter: t.filter || null })),
+        landing_pages: pages.map(p => ({ sys_id: p.sys_id, title: p.title, active: p.active })),
+      });
+    } catch (e) { return fail(e.message); }
+  }
+);
+
+// ══════════════════════════════════════════════════════════════════════════
 // BUSINESS RULES  (sys_script)
 // Best practices: always scope to table, use condition field to limit
 // execution, prefer 'after' for notifications/integrations, 'before' for
