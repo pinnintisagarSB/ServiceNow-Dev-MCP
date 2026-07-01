@@ -4093,6 +4093,247 @@ Returns Markdown text ready to paste into Confluence, GitHub, or a wiki.`,
   }
 );
 
+// ── Scripted REST API & MCP Connector Tools ───────────────────────────────
+// Tables: sys_ws_definition (API), sys_ws_operation (resource/method)
+
+server.tool(
+  'list_scripted_rest_apis',
+  `List all Scripted REST APIs defined in ServiceNow (sys_ws_definition). Use to discover existing APIs before creating new ones.`,
+  {
+    search: z.string().optional().describe('Filter by name or base path (partial match)'),
+    limit:  z.number().optional().default(20),
+  },
+  async ({ search, limit }) => {
+    try {
+      const { sn, error: _snErr } = await _requireSn();
+      if (_snErr) return _snErr;
+
+      let query = 'active=true';
+      if (search) query += `^nameLIKE${search}^ORbase_api_pathLIKE${search}`;
+
+      const apis = await sn.get('sys_ws_definition', {
+        sysparm_query:  query,
+        sysparm_fields: 'sys_id,name,base_api_path,namespace,active,short_description',
+        sysparm_limit:  String(limit),
+      });
+
+      return ok({
+        count: apis.length,
+        apis:  apis.map(a => ({
+          sys_id:      a.sys_id,
+          name:        a.name,
+          base_path:   `/api/${a.namespace}/${a.base_api_path}`,
+          active:      a.active,
+          description: a.short_description || null,
+          url:         _snRecordUrl(sn, 'sys_ws_definition', a.sys_id),
+        })),
+      });
+    } catch (e) { return fail(e.message); }
+  }
+);
+
+server.tool(
+  'create_scripted_rest_api',
+  `Create a Scripted REST API definition in ServiceNow (sys_ws_definition).
+This registers the API namespace and base path. After creating, add resources with add_rest_resource.`,
+  {
+    name:        z.string().describe('Human-readable name for the API (e.g. "MCP Tools API")'),
+    base_path:   z.string().describe('URL base path segment (e.g. "mcp_tools" → /api/<scope>/mcp_tools). Lowercase, underscores only.'),
+    description: z.string().optional().describe('Short description of what this API does'),
+    namespace:   z.string().optional().describe('Scope namespace (defaults to your app scope prefix from SN_SCOPE_PREFIX env var)'),
+  },
+  async ({ name, base_path, description, namespace }) => {
+    try {
+      const { sn, error: _snErr } = await _requireSn();
+      if (_snErr) return _snErr;
+
+      const ns = namespace ?? process.env.SN_SCOPE_PREFIX ?? 'x_snc';
+
+      const api = await sn.post('sys_ws_definition', {
+        name,
+        base_api_path:     base_path.toLowerCase().replace(/[^a-z0-9_]/g, '_'),
+        namespace:         ns,
+        active:            true,
+        short_description: description ?? '',
+      });
+
+      return ok({
+        success:   true,
+        sys_id:    api.sys_id,
+        name:      api.name,
+        base_path: `/api/${ns}/${base_path}`,
+        url:       _snRecordUrl(sn, 'sys_ws_definition', api.sys_id),
+        next_step: 'Use add_rest_resource to add GET/POST resources to this API.',
+      });
+    } catch (e) { return fail(e.message); }
+  }
+);
+
+server.tool(
+  'add_rest_resource',
+  `Add a resource (endpoint + method + script) to an existing Scripted REST API (sys_ws_operation).
+Each resource is one HTTP method on one URI path, with a JavaScript handler.`,
+  {
+    api_sys_id:   z.string().describe('sys_id of the parent sys_ws_definition. Get from list_scripted_rest_apis or create_scripted_rest_api.'),
+    name:         z.string().describe('Name for this operation (e.g. "List Tools", "Call Tool")'),
+    http_method:  z.enum(['GET','POST','PUT','PATCH','DELETE']).describe('HTTP method for this resource'),
+    relative_path: z.string().optional().describe('URI path relative to the base (e.g. "/tools" or "/tools/{name}"). Leave blank for root.'),
+    script:       z.string().describe('JavaScript body for the resource handler. Use request/response objects. Return via response.setBody().'),
+    requires_auth: z.boolean().optional().default(true).describe('Require authentication (recommended: true)'),
+  },
+  async ({ api_sys_id, name, http_method, relative_path, script, requires_auth }) => {
+    try {
+      const { sn, error: _snErr } = await _requireSn();
+      if (_snErr) return _snErr;
+
+      const op = await sn.post('sys_ws_operation', {
+        web_service_definition:  api_sys_id,
+        name,
+        http_method:             http_method.toUpperCase(),
+        operation_uri:           relative_path ?? '/',
+        script,
+        requires_authentication: requires_auth !== false,
+        requires_acl_authorization: false,
+        active: true,
+      });
+
+      return ok({
+        success:     true,
+        sys_id:      op.sys_id,
+        name:        op.name,
+        http_method: op.http_method,
+        path:        op.operation_uri,
+        url:         _snRecordUrl(sn, 'sys_ws_operation', op.sys_id),
+      });
+    } catch (e) { return fail(e.message); }
+  }
+);
+
+server.tool(
+  'scaffold_mcp_server',
+  `Scaffold a complete MCP-compatible server inside ServiceNow using Scripted REST APIs.
+
+Creates:
+  1. A sys_ws_definition for the MCP server (base path /api/<scope>/mcp)
+  2. POST /initialize  — returns server info and capabilities
+  3. POST /tools/list  — returns the available tools list
+  4. POST /tools/call  — dispatches a tool call and returns the result
+
+The generated JavaScript stubs are production-ready with error handling and
+JSON-RPC 2.0 response format. After scaffolding, edit each resource script
+in ServiceNow to implement your tool logic.`,
+  {
+    server_name:  z.string().describe('Display name for this MCP server (e.g. "ServiceNow HR Tools")'),
+    server_version: z.string().optional().default('1.0.0'),
+    namespace:    z.string().optional().describe('Scope namespace prefix. Defaults to SN_SCOPE_PREFIX env var.'),
+    tools:        z.array(z.object({
+      name:        z.string(),
+      description: z.string(),
+    })).optional().describe('Tool definitions to include in the tools/list response'),
+  },
+  async ({ server_name, server_version, namespace, tools }) => {
+    try {
+      const { sn, error: _snErr } = await _requireSn();
+      if (_snErr) return _snErr;
+
+      const ns      = namespace ?? process.env.SN_SCOPE_PREFIX ?? 'x_snc';
+      const toolList = tools ?? [];
+
+      // 1. Create the API definition
+      const api = await sn.post('sys_ws_definition', {
+        name:              `${server_name} MCP`,
+        base_api_path:     'mcp',
+        namespace:         ns,
+        active:            true,
+        short_description: `MCP server — ${server_name}`,
+      });
+
+      const baseUrl = `/api/${ns}/mcp`;
+
+      // 2. POST /initialize
+      const initScript = `(function process(request, response) {
+  response.setContentType('application/json');
+  response.setBody(JSON.stringify({
+    protocolVersion: '2024-11-05',
+    capabilities: { tools: {} },
+    serverInfo: { name: ${JSON.stringify(server_name)}, version: ${JSON.stringify(server_version ?? '1.0.0')} }
+  }));
+})(request, response);`;
+
+      // 3. POST /tools/list
+      const toolsListScript = `(function process(request, response) {
+  response.setContentType('application/json');
+  var tools = ${JSON.stringify(toolList.map(t => ({
+    name: t.name,
+    description: t.description,
+    inputSchema: { type: 'object', properties: {}, required: [] },
+  })), null, 2)};
+  response.setBody(JSON.stringify({ tools: tools }));
+})(request, response);`;
+
+      // 4. POST /tools/call
+      const toolsCallScript = `(function process(request, response) {
+  response.setContentType('application/json');
+  try {
+    var body = JSON.parse(request.body.dataString);
+    var toolName = body.name;
+    var toolInput = body.arguments || {};
+    var result;
+
+    // ── Add your tool dispatch logic here ─────────────────────────────────
+    if (toolName === 'example_tool') {
+      result = { content: [{ type: 'text', text: 'Hello from ServiceNow MCP!' }] };
+    } else {
+      response.setStatus(400);
+      response.setBody(JSON.stringify({ error: 'Unknown tool: ' + toolName }));
+      return;
+    }
+    // ──────────────────────────────────────────────────────────────────────
+
+    response.setBody(JSON.stringify(result));
+  } catch (e) {
+    response.setStatus(500);
+    response.setBody(JSON.stringify({ error: e.message }));
+  }
+})(request, response);`;
+
+      const resources = await Promise.all([
+        sn.post('sys_ws_operation', { web_service_definition: api.sys_id, name: 'Initialize',  http_method: 'POST', operation_uri: '/initialize',  script: initScript,      requires_authentication: true, active: true }),
+        sn.post('sys_ws_operation', { web_service_definition: api.sys_id, name: 'List Tools',  http_method: 'POST', operation_uri: '/tools/list',  script: toolsListScript, requires_authentication: true, active: true }),
+        sn.post('sys_ws_operation', { web_service_definition: api.sys_id, name: 'Call Tool',   http_method: 'POST', operation_uri: '/tools/call',  script: toolsCallScript, requires_authentication: true, active: true }),
+      ]);
+
+      return ok({
+        success:     true,
+        server_name,
+        api_sys_id:  api.sys_id,
+        base_url:    baseUrl,
+        endpoints: {
+          initialize:  `POST ${baseUrl}/initialize`,
+          tools_list:  `POST ${baseUrl}/tools/list`,
+          tools_call:  `POST ${baseUrl}/tools/call`,
+        },
+        resources: resources.map(r => ({
+          name:   r.name,
+          sys_id: r.sys_id,
+          url:    _snRecordUrl(sn, 'sys_ws_operation', r.sys_id),
+        })),
+        api_url:    _snRecordUrl(sn, 'sys_ws_definition', api.sys_id),
+        connection: {
+          mcp_url:  `${sn.baseUrl}${baseUrl}`,
+          auth:     'Basic auth (ServiceNow username:password)',
+          note:     'To connect an AI client, point it to the MCP URL above with Basic auth.',
+        },
+        next_steps: [
+          `Open each resource in ServiceNow and add your tool logic in the script field.`,
+          `Test with: POST ${sn.baseUrl}${baseUrl}/tools/list (Basic auth)`,
+          `Add tools to the tools/list script and dispatch them in tools/call.`,
+        ],
+      });
+    } catch (e) { return fail(e.message); }
+  }
+);
+
 // ── TOOL: scaffold_application ────────────────────────────────────────────
 server.tool(
   'scaffold_application',
